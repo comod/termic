@@ -5957,6 +5957,153 @@ fn git_update_repo(cwd: &Path, mode: UpdateMode, base: &str) -> Result<UpdateRes
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct MergeToMainResult {
+    /// The task branch that was (or would be) merged.
+    branch: String,
+    /// The branch checked out in the main checkout — what we merged INTO.
+    target: String,
+    /// Main has uncommitted tracked changes and stashing was not authorized.
+    /// Nothing was touched; the UI re-invokes with `stash_if_dirty` after
+    /// asking the user, rather than this code deciding for them.
+    dirty_main: bool,
+    up_to_date: bool,
+    /// The merge hit conflicts and was ABORTED — main is back to its prior
+    /// state. Unlike git_update_repo (whose repo has a task terminal attached
+    /// to resolve in), a half-finished merge in the main checkout has no UI,
+    /// so it must never be left in progress.
+    conflicted: bool,
+    stashed: bool,
+    /// The merge landed but re-applying the autostash collided. The stash is
+    /// retained; the user must be told (see UpdateResult.stash_conflicted).
+    stash_conflicted: bool,
+    /// Commits the merge brought over; 0 for the no-op outcomes above.
+    commits: usize,
+}
+
+/// Merge a task's branch into the project's main checkout — the with-history
+/// counterpart to task_send_diff_to_main. Deliberately no conflict
+/// orchestration (docs/plans/cli.md): a conflicting merge is aborted and
+/// reported so the user updates the task from its base first (where a
+/// terminal and agent are at hand) and retries clean. Split from the command
+/// so tests can drive it against tempdir repos.
+fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool) -> Result<MergeToMainResult, String> {
+    let branch = git(&["branch", "--show-current"], worktree)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err("Task is on a detached HEAD; check out its branch first.".into());
+    }
+    // A merge moves only commits. Uncommitted tracked work in the task would
+    // be silently left behind, which reads as data loss. Refuse up front.
+    if !git(&["status", "--porcelain", "--untracked-files=no"], worktree)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .is_empty()
+    {
+        return Err(format!(
+            "'{branch}' has uncommitted changes. Commit them in the task first, a merge only carries commits."
+        ));
+    }
+    if merge_or_rebase_in_progress(main) {
+        return Err("Main checkout is in the middle of a merge or rebase. Finish or abort it there first.".into());
+    }
+    let target = git(&["branch", "--show-current"], main)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if target.is_empty() {
+        return Err("Main checkout is on a detached HEAD; check out a branch there first.".into());
+    }
+    if target == branch {
+        return Err(format!("'{branch}' is already checked out in the main checkout, nothing to merge."));
+    }
+
+    let no_op = |dirty_main: bool, up_to_date: bool, branch: &str, target: &str| MergeToMainResult {
+        branch: branch.to_string(),
+        target: target.to_string(),
+        dirty_main,
+        up_to_date,
+        conflicted: false,
+        stashed: false,
+        stash_conflicted: false,
+        commits: 0,
+    };
+
+    // Tracked-only, matching what autostash acts on (see git_update_repo).
+    let dirty = !git(&["status", "--porcelain", "--untracked-files=no"], main)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .is_empty();
+    if dirty && !stash_if_dirty {
+        return Ok(no_op(true, false, &branch, &target));
+    }
+    // Worktrees share refs, so the task branch resolves in the main checkout.
+    let commits: usize = git(&["rev-list", "--count", &format!("{target}..{branch}")], main)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    if commits == 0 {
+        return Ok(no_op(false, true, &branch, &target));
+    }
+
+    if let Err(e) = git(&["merge", "--autostash", &branch], main) {
+        if !merge_or_rebase_in_progress(main) {
+            // Nothing started (bad ref, would-overwrite, ...). Tree untouched.
+            return Err(e.to_string());
+        }
+        // Abort restores the tree AND re-applies the autostash.
+        git(&["merge", "--abort"], main).map_err(|e2| {
+            format!(
+                "merge hit conflicts and the abort failed: {e2}. Resolve manually in {}",
+                main.display()
+            )
+        })?;
+        return Ok(MergeToMainResult {
+            branch,
+            target,
+            dirty_main: false,
+            up_to_date: false,
+            conflicted: true,
+            stashed: dirty,
+            stash_conflicted: false,
+            commits: 0,
+        });
+    }
+    let stash_conflicted = dirty && has_unresolved_conflicts(main);
+    Ok(MergeToMainResult {
+        branch,
+        target,
+        dirty_main: false,
+        up_to_date: false,
+        conflicted: false,
+        stashed: dirty,
+        stash_conflicted,
+        commits,
+    })
+}
+
+/// Merge the task's branch into the project's main checkout, with history.
+#[tauri::command]
+async fn task_merge_to_main(id: String, stash_if_dirty: bool) -> Result<MergeToMainResult, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<MergeToMainResult, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
+        let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("project missing")?;
+        if w.is_main_checkout {
+            return Err("This task IS the main checkout, nothing to merge.".into());
+        }
+        let main = PathBuf::from(&p.root_path);
+        if !main.is_dir() {
+            return Err(format!("Project main checkout missing: {}", main.display()));
+        }
+        git_merge_to_main(&PathBuf::from(&w.path), &main, stash_if_dirty)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Merge / rebase a task's repo from its base, or pull it from its upstream.
 #[tauri::command]
 async fn task_git_update(id: String, dir_name: String, mode: UpdateMode) -> Result<UpdateResult, String> {
@@ -9794,7 +9941,7 @@ pub fn run() {
             task_set_right_tabs, task_set_right_tab_session_id,
             task_grep_start, task_grep_cancel,
             task_spotlight_start, task_spotlight_stop, task_spotlight_resync, task_spotlight_status,
-            task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main,
+            task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main, task_merge_to_main,
             task_changes, task_git_status, task_git_branches, project_git_branches, project_branch_context, task_git_checkout, task_git_update, task_git_update_info, task_stage, task_unstage, task_commit, task_discard,
             task_file_diff, task_file_diff_sides, task_file_read, task_file_read_base64, task_file_write, task_dir_list, task_path_stat,
             task_path_rename, task_path_delete, task_reveal_path,
@@ -11144,6 +11291,84 @@ mod tests {
         let r = git_update_repo(&wt, UpdateMode::Merge, "feature/base").unwrap();
         assert!(!r.up_to_date);
         assert!(wt.join("slashy.txt").exists(), "local slashed branch must merge, not error");
+    }
+
+    // ──────────────── git_merge_to_main ────────────────
+
+    #[test]
+    fn merge_to_main_brings_task_commits() {
+        let (_m, _w, main, wt) = update_fixture();
+        git_commit_file(&wt, "from_task.txt", "task work\n", "task work");
+
+        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        assert!(!r.dirty_main && !r.up_to_date && !r.conflicted);
+        assert_eq!(r.branch, "task");
+        assert_eq!(r.target, "main");
+        assert_eq!(r.commits, 1);
+        assert!(main.join("from_task.txt").exists(), "task commit did not land in main");
+        assert!(git_is_clean(&main), "merge must leave main clean");
+        assert_eq!(git_branch(&wt), "task", "task branch must survive the merge");
+    }
+
+    #[test]
+    fn merge_to_main_up_to_date_when_no_task_commits() {
+        let (_m, _w, main, wt) = update_fixture();
+        let before = git_head(&main);
+        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        assert!(r.up_to_date);
+        assert_eq!(r.commits, 0);
+        assert_eq!(git_head(&main), before, "up-to-date merge must not move HEAD");
+    }
+
+    #[test]
+    fn merge_to_main_dirty_main_blocks_then_stashes() {
+        let (_m, _w, main, wt) = update_fixture();
+        git_commit_file(&wt, "from_task.txt", "task work\n", "task work");
+        // Dirty main via an UNRELATED tracked file, so the stash re-applies clean.
+        git_commit_file(&main, "local.txt", "v1\n", "local file");
+        fs::write(main.join("local.txt"), "v2 uncommitted\n").unwrap();
+
+        // Without authorization: pure no-op that asks for a stash.
+        let before = git_head(&main);
+        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        assert!(r.dirty_main);
+        assert_eq!(git_head(&main), before, "dirty_main must not touch the tree");
+        assert!(!main.join("from_task.txt").exists());
+
+        // With authorization: stash, merge, re-apply.
+        let r = git_merge_to_main(&wt, &main, true).unwrap();
+        assert!(!r.dirty_main && !r.conflicted && r.stashed && !r.stash_conflicted);
+        assert!(main.join("from_task.txt").exists(), "merge did not land");
+        assert_eq!(
+            fs::read_to_string(main.join("local.txt")).unwrap(),
+            "v2 uncommitted\n",
+            "local uncommitted change must survive the autostash round-trip"
+        );
+    }
+
+    #[test]
+    fn merge_to_main_conflict_aborts_and_leaves_main_clean() {
+        let (_m, _w, main, wt) = update_fixture();
+        git_commit_file(&main, "base.txt", "main version\n", "main side");
+        git_commit_file(&wt, "base.txt", "task version\n", "task side");
+        let before = git_head(&main);
+
+        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        assert!(r.conflicted, "conflicting merge must report conflicted, not error");
+        assert!(!merge_or_rebase_in_progress(&main), "main must never be left mid-merge");
+        assert!(git_is_clean(&main), "abort must restore a clean main");
+        assert_eq!(git_head(&main), before, "abort must restore HEAD");
+    }
+
+    #[test]
+    fn merge_to_main_refuses_dirty_worktree() {
+        let (_m, _w, main, wt) = update_fixture();
+        git_commit_file(&wt, "from_task.txt", "v1\n", "task work");
+        fs::write(wt.join("from_task.txt"), "v2 uncommitted\n").unwrap();
+
+        let e = git_merge_to_main(&wt, &main, false).unwrap_err();
+        assert!(e.contains("uncommitted changes"), "unexpected error: {e}");
+        assert!(!main.join("from_task.txt").exists(), "refusal must not merge anything");
     }
 
     #[test]

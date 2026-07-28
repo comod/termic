@@ -603,6 +603,25 @@ export interface UpdateResult {
   up_to_date: boolean;
 }
 
+/** Result of merging a task's branch into the project's main checkout.
+ *  Exactly one of the no-op flags (`dirty_main`, `up_to_date`, `conflicted`)
+ *  or a successful merge (`commits` > 0) applies. `conflicted` means the
+ *  merge was ABORTED and main restored - unlike UpdateResult, main has no
+ *  attached terminal to resolve in, so it is never left mid-merge. */
+export interface MergeToMainResult {
+  branch: string;
+  target: string;
+  /** Main has uncommitted changes and stashing was not authorized; nothing
+   *  was touched. Ask the user, then retry with stashIfDirty. */
+  dirty_main: boolean;
+  up_to_date: boolean;
+  conflicted: boolean;
+  stashed: boolean;
+  /** Merge landed but the stash re-apply conflicted; stash is RETAINED. */
+  stash_conflicted: boolean;
+  commits: number;
+}
+
 /** What the update menu can offer. `upstream` is empty until the branch has
  *  been pushed (task branches are cut with --no-track). `base` is empty when
  *  unresolvable, and equals `branch` for repo-root / adopted tasks whose

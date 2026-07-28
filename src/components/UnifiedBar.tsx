@@ -13,7 +13,7 @@ import * as HoverCard from "@radix-ui/react-hover-card";
 import { Check } from "lucide-react";
 import {
   PanelLeft, PanelRight, FolderOpen, Archive,
-  Sun, Moon, Monitor, ArrowUpToLine, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
+  Sun, Moon, Monitor, GitMerge, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
   MessageSquareText, Library, Palette,
 } from "lucide-react";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
@@ -22,7 +22,7 @@ import { effectiveSandboxMode } from "@/lib/types";
 import { SandboxIcon } from "@/components/SandboxIcon";
 import { UpdaterBanner } from "@/components/UpdaterBanner";
 import { WaitingAgentsPill } from "@/components/WaitingAgentsPill";
-import { openPath, themesDir, taskSendDiffToMain } from "@/lib/ipc";
+import { openPath, themesDir, taskMergeToMain } from "@/lib/ipc";
 import { archiveAndRefresh } from "@/lib/archiveTask";
 import {
   DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator,
@@ -170,7 +170,7 @@ export function UnifiedBar() {
                 branch, worktree vs live) lives in the right-panel
                 target tabs where it actually matters. Stuffing it
                 into the breadcrumb made the bar unreadable past 2
-                members and pushed real chrome (Review / Send to main)
+                members and pushed real chrome (Review / Merge to main)
                 off-screen on narrow windows. */}
             {(task.composition?.length ?? 0) > 0 && (
               <span
@@ -221,36 +221,70 @@ export function UnifiedBar() {
               </DropdownMenu>
             </DropdownRoot>
 
-            {/* Send-to-main: only shown on actual worktrees, not the
-                repo-root pseudo-task (which IS the main checkout —
-                nothing to send). Hard-blocks on a dirty main checkout
-                rather than risk mixing change sets; the error bubbles
-                up via the alert below. */}
+            {/* Merge-to-main: only shown on actual worktrees, not the
+                repo-root pseudo-task (which IS the main checkout,
+                nothing to merge). A conflicting merge is aborted on the
+                Rust side, never left in progress; a dirty main comes
+                back as dirty_main so we can offer a stash instead of
+                deciding for the user. */}
             {!task.is_main_checkout && (
-              <Tip content="Bring this worktree's diff into the project's main checkout" side="bottom">
+              <Tip content="Merge this task's branch into the project's main checkout" side="bottom">
                 <Button size="sm" variant="ghost" className="gap-1.5"
                   onClick={async () => {
                     const ok = await useUI.getState().askConfirm({
-                      title: `Send "${task.name}" to main?`,
+                      title: `Merge "${task.name}" into main?`,
                       message:
-                        `Applies all tracked changes (committed + staged + unstaged) and copies untracked files into ${proj.root_path}. ` +
-                        `The main checkout must be clean. Commit or stash there first.`,
-                      confirmLabel: "Send to main",
+                        `Merges the task branch's commits (with history) into ${proj.root_path}. ` +
+                        `Uncommitted changes in the task are not included, commit them first.`,
+                      confirmLabel: "Merge",
                     });
                     if (!ok) return;
+                    const run = async (stashIfDirty: boolean): Promise<void> => {
+                      const r = await taskMergeToMain(task.id, stashIfDirty);
+                      if (r.dirty_main) {
+                        const stash = await useUI.getState().askConfirm({
+                          title: "Main checkout has uncommitted changes",
+                          message: "Stash them, merge, then re-apply the stash?",
+                          confirmLabel: "Stash and merge",
+                        });
+                        if (stash) await run(true);
+                        return;
+                      }
+                      if (r.conflicted) {
+                        await useUI.getState().askConfirm({
+                          title: "Merge conflicts, nothing was changed",
+                          message:
+                            `Merging ${r.branch} into ${r.target} hit conflicts, so the merge was aborted and the main checkout restored. ` +
+                            `Update the task from its base first (Git panel: Rebase onto ${r.target} or Merge ${r.target} into this branch), resolve there, then retry.`,
+                          confirmLabel: "OK",
+                          cancelLabel: "",
+                        });
+                        return;
+                      }
+                      if (r.up_to_date) {
+                        useUI.getState().pushToast(`${r.target} already contains every commit of ${r.branch}.`);
+                        return;
+                      }
+                      if (r.stash_conflicted) {
+                        useUI.getState().pushToast(
+                          `Merged ${r.branch} into ${r.target}, but re-applying main's stashed changes hit conflicts. Resolve them there; a copy is kept in git stash list.`,
+                          "error",
+                          { ttlMs: 8000 },
+                        );
+                        return;
+                      }
+                      const n = r.commits;
+                      const stashNote = r.stashed ? " Local changes were stashed and restored." : "";
+                      useUI.getState().pushToast(
+                        `Merged ${r.branch} into ${r.target}: ${n} commit${n === 1 ? "" : "s"}.${stashNote}`,
+                        "success",
+                      );
+                    };
                     try {
-                      const r = await taskSendDiffToMain(task.id);
-                      // Build a compact, human-readable summary. Quietly
-                      // omit the zero halves so it reads as a result, not
-                      // a checklist of nothings-happened.
-                      const parts: string[] = [];
-                      if (r.tracked_files)   parts.push(`${r.tracked_files} tracked diff${r.tracked_files === 1 ? "" : "s"} applied`);
-                      if (r.untracked_files) parts.push(`${r.untracked_files} untracked file${r.untracked_files === 1 ? "" : "s"} copied`);
-                      const summary = parts.length ? parts.join(", ") : "no changes to send";
-                      useUI.getState().pushToast(`Sent to main checkout: ${summary}`, "success");
+                      await run(false);
                     } catch (e) {
                       await useUI.getState().askConfirm({
-                        title: "Send to main failed",
+                        title: "Merge to main failed",
                         message: String(e),
                         confirmLabel: "OK",
                         cancelLabel: "",
@@ -258,8 +292,8 @@ export function UnifiedBar() {
                       });
                     }
                   }}>
-                  <ArrowUpToLine className="h-4 w-4" />
-                  <span>Send to main</span>
+                  <GitMerge className="h-4 w-4" />
+                  <span>Merge to main</span>
                 </Button>
               </Tip>
             )}
