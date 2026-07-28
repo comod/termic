@@ -152,3 +152,5 @@ PLAN-*.md
 
 # e2e persistent profile + fixture repo (scripts/.claude/skills/e2e)
 .e2e/
+.direnv/
+result
