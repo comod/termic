@@ -13,7 +13,7 @@ import * as HoverCard from "@radix-ui/react-hover-card";
 import { Check } from "lucide-react";
 import {
   PanelLeft, PanelRight, FolderOpen, Archive,
-  Sun, Moon, Monitor, GitMerge, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
+  Sun, Moon, Monitor, GitMerge, GitCommitHorizontal, Upload, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
   MessageSquareText, Library, Palette,
 } from "lucide-react";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
@@ -22,7 +22,9 @@ import { effectiveSandboxMode } from "@/lib/types";
 import { SandboxIcon } from "@/components/SandboxIcon";
 import { UpdaterBanner } from "@/components/UpdaterBanner";
 import { WaitingAgentsPill } from "@/components/WaitingAgentsPill";
-import { openPath, themesDir, taskMergeToMain } from "@/lib/ipc";
+import { openPath, themesDir, taskMergeToMain, taskPushMain } from "@/lib/ipc";
+import { runPrompt } from "@/lib/runPrompt";
+import type { TerminalTab } from "@/lib/types";
 import { archiveAndRefresh } from "@/lib/archiveTask";
 import {
   DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator,
@@ -48,7 +50,12 @@ export function UnifiedBar() {
   const task = useActiveTask();
   const proj = useApp(s => task ? s.projects.find(p => p.id === task.project_id) : null);
   const openSettings = useApp(s => s.openSettings);
-  const enabledPrompts = usePromptLibrary(s => s.prompts).filter(p => p.enabled);
+  const prompts = usePromptLibrary(s => s.prompts);
+  const enabledPrompts = prompts.filter(p => p.enabled);
+  // The Commit button fires the library's Commit prompt (user overrides
+  // included) straight into the current agent terminal, so the full
+  // commit / merge / push lifecycle is clickable from the bar in any project.
+  const commitPrompt = prompts.find(p => p.id === "builtin:commit");
   // Picking a prompt opens the shared destination modal (running agents +
   // new-agent CLIs) — a modal, not a submenu, which flipped to the wrong
   // side near the window edge. Shared (not local state) so the ⌥⌘P prompt
@@ -221,6 +228,32 @@ export function UnifiedBar() {
               </DropdownMenu>
             </DropdownRoot>
 
+            {/* Commit: sends the library's Commit prompt to the current agent
+                terminal (active tab if it's a live terminal, else the task's
+                default agent, else any live one). With no agent running it
+                falls back to the destination dialog, which can spawn one. */}
+            {commitPrompt && (
+              <Tip content="Send the Commit prompt to the current agent" side="bottom">
+                <Button size="sm" variant="ghost" className="gap-1.5" data-no-drag
+                  onClick={() => {
+                    const s = useApp.getState();
+                    const tabs = s.tabs[task.id] ?? [];
+                    const activeId = s.activeTab[task.id];
+                    const isLive = (t: (typeof tabs)[number]): t is TerminalTab =>
+                      t.type === "terminal" && !!t.ptyId;
+                    const target =
+                      tabs.find(t => t.id === activeId && isLive(t)) ??
+                      tabs.find(t => isLive(t) && t.is_default) ??
+                      tabs.find(isLive);
+                    if (target) runPrompt(task.id, commitPrompt, { kind: "agent", tabId: target.id });
+                    else openPromptFire(commitPrompt);
+                  }}>
+                  <GitCommitHorizontal className="h-4 w-4" />
+                  <span>Commit</span>
+                </Button>
+              </Tip>
+            )}
+
             {/* Merge-to-main: only shown on actual worktrees, not the
                 repo-root pseudo-task (which IS the main checkout,
                 nothing to merge). A conflicting merge is aborted on the
@@ -297,6 +330,37 @@ export function UnifiedBar() {
                 </Button>
               </Tip>
             )}
+
+            {/* Push: publishes the project's MAIN checkout to its remote,
+                the natural last step after Merge to main. Confirmed first,
+                it's an outward-facing action. */}
+            <Tip content="Push the project's main checkout to its remote" side="bottom">
+              <Button size="sm" variant="ghost" className="gap-1.5" data-no-drag
+                onClick={async () => {
+                  const ok = await useUI.getState().askConfirm({
+                    title: "Push main to remote?",
+                    message: `Pushes the main checkout at ${proj.root_path} to its remote (sets upstream if needed).`,
+                    confirmLabel: "Push",
+                  });
+                  if (!ok) return;
+                  try {
+                    useUI.getState().setBusy("Pushing…");
+                    const branch = await taskPushMain(task.id);
+                    useUI.getState().pushToast(`Pushed ${branch} to remote.`, "success");
+                  } catch (e) {
+                    await useUI.getState().askConfirm({
+                      title: "Push failed",
+                      message: String(e),
+                      confirmLabel: "OK",
+                      cancelLabel: "",
+                      destructive: true,
+                    });
+                  } finally { useUI.getState().setBusy(null); }
+                }}>
+                <Upload className="h-4 w-4" />
+                <span>Push</span>
+              </Button>
+            </Tip>
             {(() => {
               const sbMode = effectiveSandboxMode(task);
               const tip = sbMode === "enforce" ? "Sandbox: Enforcing"

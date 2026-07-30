@@ -319,6 +319,10 @@ export const taskSendDiffToMain = (id: string) =>
 export const taskMergeToMain = (id: string, stashIfDirty: boolean) =>
   invoke<import("@/lib/types").MergeToMainResult>("task_merge_to_main", { id, stashIfDirty });
 
+/** Push the project's main checkout to its remote. Resolves to the pushed branch name. */
+export const taskPushMain = (id: string) =>
+  invoke<string>("task_push_main", { id });
+
 // ───────────────────────────── spotlight ─────────────────────────────
 
 export const taskSpotlightStart   = (id: string) => invoke<void>("task_spotlight_start",   { id });

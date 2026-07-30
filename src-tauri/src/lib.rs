@@ -6104,6 +6104,33 @@ async fn task_merge_to_main(id: String, stash_if_dirty: bool) -> Result<MergeToM
     .map_err(|e| e.to_string())?
 }
 
+/// Push the project's main checkout to its remote. Plain `git push` first
+/// (upstream set); falls back to `-u <remote> <branch>` for a fresh branch.
+/// Returns the pushed branch name.
+#[tauri::command]
+async fn task_push_main(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
+        let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("project missing")?;
+        let main = PathBuf::from(&p.root_path);
+        if !main.is_dir() {
+            return Err(format!("Project main checkout missing: {}", main.display()));
+        }
+        let branch = git(&["branch", "--show-current"], &main)
+            .map_err(|e| e.to_string())?.trim().to_string();
+        if branch.is_empty() {
+            return Err("cannot push: main checkout is on a detached HEAD".to_string());
+        }
+        if git(&["push"], &main).is_err() {
+            let remote = detect_default_remote(&main);
+            git(&["push", "-u", &remote, &branch], &main).map_err(|e| e.to_string())?;
+        }
+        Ok(branch)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Merge / rebase a task's repo from its base, or pull it from its upstream.
 #[tauri::command]
 async fn task_git_update(id: String, dir_name: String, mode: UpdateMode) -> Result<UpdateResult, String> {
@@ -9941,7 +9968,7 @@ pub fn run() {
             task_set_right_tabs, task_set_right_tab_session_id,
             task_grep_start, task_grep_cancel,
             task_spotlight_start, task_spotlight_stop, task_spotlight_resync, task_spotlight_status,
-            task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main, task_merge_to_main,
+            task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main, task_merge_to_main, task_push_main,
             task_changes, task_git_status, task_git_branches, project_git_branches, project_branch_context, task_git_checkout, task_git_update, task_git_update_info, task_stage, task_unstage, task_commit, task_discard,
             task_file_diff, task_file_diff_sides, task_file_read, task_file_read_base64, task_file_write, task_dir_list, task_path_stat,
             task_path_rename, task_path_delete, task_reveal_path,
