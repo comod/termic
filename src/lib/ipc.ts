@@ -316,8 +316,8 @@ export const taskDiff     = (id: string) => invoke<TaskDiffSummary>("task_diff",
 export const taskSendDiffToMain = (id: string) =>
   invoke<{ tracked_files: number; untracked_files: number }>("task_send_diff_to_main", { id });
 /** Merge the task's branch into the project's main checkout (with history). */
-export const taskMergeToMain = (id: string, stashIfDirty: boolean) =>
-  invoke<import("@/lib/types").MergeToMainResult>("task_merge_to_main", { id, stashIfDirty });
+export const taskMergeToMain = (id: string, stashIfDirty: boolean, push: boolean) =>
+  invoke<import("@/lib/types").MergeToMainResult>("task_merge_to_main", { id, stashIfDirty, push });
 
 // ───────────────────────────── spotlight ─────────────────────────────
 

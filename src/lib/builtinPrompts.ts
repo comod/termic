@@ -55,29 +55,83 @@ Produce:
 
 Keep it concise and skimmable. Do not restate the obvious or pad the summary.`;
 
+// Shared commit workflow: survey ALL local changes as one set, clean junk
+// (with one structured question), group into sensible commits autonomously
+// and commit directly. The push behavior differs per variant below.
+const COMMIT_WORKFLOW = `Commit workflow: survey all local changes (staged, unstaged tracked, untracked) as one set, group them into sensible commits autonomously and commit directly. Only Cleanup (junk found) still asks.
+
+### Inspect
+
+- Run \`git status\` (without -uall) and \`git diff --stat\`.
+- Read the actual changes:
+  - \`git diff --cached\` for staged + \`git diff\` for unstaged tracked.
+  - For untracked files: list their paths and, for small ones, inspect content (\`head\`) to understand their purpose. Do NOT ask the user to pick which untracked files to include, they are part of the input.
+  - If the combined diff is over ~30k chars, fall back to \`--stat\` plus a truncated body.
+- Run \`git log --oneline -5\` once for commit message style reference.
+
+### Cleanup (junk / debug check)
+
+Do this BEFORE staging, otherwise "stage everything" silently sweeps in throwaway files.
+
+- Scan the change set for things that look like artifacts rather than intended work:
+  - untracked files with trivial / garbage content (e.g. a file containing just \`test\` or \`sdfdfg\`), scratch or debug scripts, stray \`*.log\` / \`*.tmp\`, editor backups, \`.DS_Store\`.
+  - debug leftovers inside diffs: \`console.log\` / \`print\` / \`dump\` / \`dd(\` / \`var_dump\`, commented-out blocks, \`TODO: remove\`.
+- If anything is suspicious: list the candidates (path + why) and ask ONE standalone structured question (AskUserQuestion when available): "Remove junk/debug leftovers before the commit? (remove all / pick / keep / abort)".
+  - remove all: delete the junk files / revert the debug hunks, then continue.
+  - pick: let the user choose which to remove, apply, then continue.
+  - keep: leave everything in the change set.
+  - abort: stop.
+- If nothing is suspicious, skip silently, do not ask.
+
+### Stage
+
+- Only after Cleanup is resolved, re-run \`git status\` to inspect the actual remaining state. Cleanup may have deleted or reverted files, so do not rely on the earlier snapshot.
+- All tracked changes (staged + unstaged) are part of the change set and will be committed.
+- Untracked files that survived Cleanup are part of the change set as well, no question.
+- If nothing is left to commit at all, tell the user and stop.
+
+### Plan the groups
+
+Treat staged + unstaged tracked + untracked as one set. Decide whether everything fits a single coherent commit, or whether the changes split naturally into multiple commits.
+
+Split-worthy patterns:
+- Unrelated changes across different domains (e.g. UI tweak + backend refactor)
+- Refactor + new feature mixed in the same diff
+- Several independent bug fixes
+- Formatting/lint-fix changes mixed with logic changes
+- Different bounded contexts touched independently
+
+Decide the grouping yourself, NO confirmation question. Commit the chunks the way it makes the most sense and report the resulting plan (groups + messages) in the summary afterwards.
+
+Message guidelines:
+- Focus on the "why" rather than the "what".
+- Do not add a branch prefix, a git hook handles that.
+- Do not add a Co-Authored trailer.
+- Do not mention "Claude" anywhere.
+
+### Execute
+
+- Reset staging once: \`git reset HEAD -- .\`
+- For each group in order:
+  - Stage just that group's files: \`git add <paths…>\`.
+  - Commit with the proposed message.
+  - If a pre-commit hook fails, fix the issue and create a NEW commit (never amend).`;
+
 export const COMMIT_PROMPT = `# Commit
 
-Commit the current changes.
+${COMMIT_WORKFLOW}
 
-1. Run \`git status\` and \`git diff\` (and \`git diff --staged\`) to see everything that changed.
-2. Stage the changes that belong together. If the working tree mixes unrelated changes, make separate commits rather than one catch-all.
-3. Write a Conventional Commits message: a \`type(scope): summary\` subject, where type is one of feat, fix, refactor, docs, test, chore, or perf, with an accurate scope, kept under about 72 characters, and a body that explains the why, not the what.
-4. Do not commit scratch files, debug output, secrets, or unrelated edits. Leave those out and mention them.
-5. Never pass \`--no-verify\` or \`--no-gpg-sign\`, and never amend or rewrite commits that already exist, unless explicitly told to. If a hook blocks the commit, stop and report the hook's output instead of working around it.
+### Push
 
-Finish by showing \`git log -1\` for what you committed.`;
+Do NOT push. Finish with the summary of the created commits.`;
 
 export const COMMIT_PUSH_PROMPT = `# Commit and push
 
-Commit the current changes and push the branch.
+${COMMIT_WORKFLOW}
 
-1. Run \`git status\` and \`git diff\` (and \`git diff --staged\`) to see everything that changed.
-2. Stage what belongs together; split unrelated changes into separate commits. Write Conventional Commits messages (\`type(scope): summary\`, body explains the why).
-3. Do not commit scratch files, debug output, secrets, or unrelated edits. Never pass \`--no-verify\` or \`--no-gpg-sign\`. If a hook blocks the commit, stop and report its output.
-4. Push the current branch to its remote (\`git push\`, or \`git push -u origin <branch>\` for a new branch). Never force-push, and never push to a branch other than the current one.
-5. If the push is rejected, report the exact error and stop. Do not rebase, force, or delete anything to make it go through.
+### Push
 
-Finish by showing \`git log -1\` and the push result.`;
+After all commits are created, push the current branch to its remote (\`git push\`, or \`git push -u origin <branch>\` for a new branch) without asking. Never force-push, and never push to a branch other than the current one. If the push is rejected, report the exact error and stop. Finish with the summary of the created commits and the push result.`;
 
 export const VERIFY_PROMPT = `# Verify end to end
 

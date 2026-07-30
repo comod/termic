@@ -5979,6 +5979,12 @@ pub struct MergeToMainResult {
     stash_conflicted: bool,
     /// Commits the merge brought over; 0 for the no-op outcomes above.
     commits: usize,
+    /// The post-merge push to the target's remote succeeded.
+    pushed: bool,
+    /// The merge landed but the requested push failed (no remote, auth,
+    /// diverged upstream). The merge is NOT rolled back; the user pushes
+    /// manually. Empty when no push was requested or it succeeded.
+    push_error: String,
 }
 
 /// Merge a task's branch into the project's main checkout — the with-history
@@ -5987,7 +5993,7 @@ pub struct MergeToMainResult {
 /// reported so the user updates the task from its base first (where a
 /// terminal and agent are at hand) and retries clean. Split from the command
 /// so tests can drive it against tempdir repos.
-fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool) -> Result<MergeToMainResult, String> {
+fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool, push: bool) -> Result<MergeToMainResult, String> {
     let branch = git(&["branch", "--show-current"], worktree)
         .map_err(|e| e.to_string())?
         .trim()
@@ -6029,6 +6035,8 @@ fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool) -> Resu
         stashed: false,
         stash_conflicted: false,
         commits: 0,
+        pushed: false,
+        push_error: String::new(),
     };
 
     // Tracked-only, matching what autostash acts on (see git_update_repo).
@@ -6070,9 +6078,21 @@ fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool) -> Resu
             stashed: dirty,
             stash_conflicted: false,
             commits: 0,
+            pushed: false,
+            push_error: String::new(),
         });
     }
     let stash_conflicted = dirty && has_unresolved_conflicts(main);
+    // Push AFTER the merge landed, never rolling it back on failure — a
+    // failed push (offline, auth) must not undo a good local merge.
+    let (pushed, push_error) = if push {
+        match git_push_current(main, &target) {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        }
+    } else {
+        (false, String::new())
+    };
     Ok(MergeToMainResult {
         branch,
         target,
@@ -6082,12 +6102,24 @@ fn git_merge_to_main(worktree: &Path, main: &Path, stash_if_dirty: bool) -> Resu
         stashed: dirty,
         stash_conflicted,
         commits,
+        pushed,
+        push_error,
     })
+}
+
+/// Plain `git push`, falling back to `-u <remote> <branch>` when no
+/// upstream is configured yet (same strategy as task_commit's push).
+fn git_push_current(cwd: &Path, branch: &str) -> Result<(), String> {
+    if git(&["push"], cwd).is_ok() {
+        return Ok(());
+    }
+    let remote = detect_default_remote(cwd);
+    git(&["push", "-u", &remote, branch], cwd).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Merge the task's branch into the project's main checkout, with history.
 #[tauri::command]
-async fn task_merge_to_main(id: String, stash_if_dirty: bool) -> Result<MergeToMainResult, String> {
+async fn task_merge_to_main(id: String, stash_if_dirty: bool, push: bool) -> Result<MergeToMainResult, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<MergeToMainResult, String> {
         let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
         let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("project missing")?;
@@ -6098,7 +6130,7 @@ async fn task_merge_to_main(id: String, stash_if_dirty: bool) -> Result<MergeToM
         if !main.is_dir() {
             return Err(format!("Project main checkout missing: {}", main.display()));
         }
-        git_merge_to_main(&PathBuf::from(&w.path), &main, stash_if_dirty)
+        git_merge_to_main(&PathBuf::from(&w.path), &main, stash_if_dirty, push)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -11300,7 +11332,7 @@ mod tests {
         let (_m, _w, main, wt) = update_fixture();
         git_commit_file(&wt, "from_task.txt", "task work\n", "task work");
 
-        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        let r = git_merge_to_main(&wt, &main, false, false).unwrap();
         assert!(!r.dirty_main && !r.up_to_date && !r.conflicted);
         assert_eq!(r.branch, "task");
         assert_eq!(r.target, "main");
@@ -11314,7 +11346,7 @@ mod tests {
     fn merge_to_main_up_to_date_when_no_task_commits() {
         let (_m, _w, main, wt) = update_fixture();
         let before = git_head(&main);
-        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        let r = git_merge_to_main(&wt, &main, false, false).unwrap();
         assert!(r.up_to_date);
         assert_eq!(r.commits, 0);
         assert_eq!(git_head(&main), before, "up-to-date merge must not move HEAD");
@@ -11330,13 +11362,13 @@ mod tests {
 
         // Without authorization: pure no-op that asks for a stash.
         let before = git_head(&main);
-        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        let r = git_merge_to_main(&wt, &main, false, false).unwrap();
         assert!(r.dirty_main);
         assert_eq!(git_head(&main), before, "dirty_main must not touch the tree");
         assert!(!main.join("from_task.txt").exists());
 
         // With authorization: stash, merge, re-apply.
-        let r = git_merge_to_main(&wt, &main, true).unwrap();
+        let r = git_merge_to_main(&wt, &main, true, false).unwrap();
         assert!(!r.dirty_main && !r.conflicted && r.stashed && !r.stash_conflicted);
         assert!(main.join("from_task.txt").exists(), "merge did not land");
         assert_eq!(
@@ -11353,11 +11385,41 @@ mod tests {
         git_commit_file(&wt, "base.txt", "task version\n", "task side");
         let before = git_head(&main);
 
-        let r = git_merge_to_main(&wt, &main, false).unwrap();
+        let r = git_merge_to_main(&wt, &main, false, false).unwrap();
         assert!(r.conflicted, "conflicting merge must report conflicted, not error");
         assert!(!merge_or_rebase_in_progress(&main), "main must never be left mid-merge");
         assert!(git_is_clean(&main), "abort must restore a clean main");
         assert_eq!(git_head(&main), before, "abort must restore HEAD");
+    }
+
+    #[test]
+    fn merge_to_main_pushes_target_when_asked() {
+        let (_m, _w, main, wt) = update_fixture();
+        // Bare remote so the post-merge push has somewhere to land.
+        let bare = tempfile::tempdir().unwrap();
+        git_run(bare.path(), &["init", "-q", "--bare"]);
+        git_run(&main, &["remote", "add", "origin", bare.path().to_str().unwrap()]);
+        git_commit_file(&wt, "from_task.txt", "task work\n", "task work");
+
+        let r = git_merge_to_main(&wt, &main, false, true).unwrap();
+        assert!(!r.conflicted && r.commits == 1);
+        assert!(r.pushed, "push to the configured remote must succeed: {}", r.push_error);
+        assert!(r.push_error.is_empty());
+        let remote_head = git(&["rev-parse", "main"], bare.path()).unwrap();
+        assert_eq!(remote_head.trim(), git_head(&main), "remote main must match the merged main");
+    }
+
+    #[test]
+    fn merge_to_main_push_failure_keeps_the_merge() {
+        let (_m, _w, main, wt) = update_fixture();
+        // No remote configured: the push must fail but never roll back the merge.
+        git_commit_file(&wt, "from_task.txt", "task work\n", "task work");
+
+        let r = git_merge_to_main(&wt, &main, false, true).unwrap();
+        assert!(!r.conflicted && r.commits == 1);
+        assert!(!r.pushed);
+        assert!(!r.push_error.is_empty(), "a failed push must surface its error");
+        assert!(main.join("from_task.txt").exists(), "merge must survive a failed push");
     }
 
     #[test]
@@ -11366,7 +11428,7 @@ mod tests {
         git_commit_file(&wt, "from_task.txt", "v1\n", "task work");
         fs::write(wt.join("from_task.txt"), "v2 uncommitted\n").unwrap();
 
-        let e = git_merge_to_main(&wt, &main, false).unwrap_err();
+        let e = git_merge_to_main(&wt, &main, false, false).unwrap_err();
         assert!(e.contains("uncommitted changes"), "unexpected error: {e}");
         assert!(!main.join("from_task.txt").exists(), "refusal must not merge anything");
     }

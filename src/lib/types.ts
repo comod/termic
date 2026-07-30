@@ -620,6 +620,10 @@ export interface MergeToMainResult {
   /** Merge landed but the stash re-apply conflicted; stash is RETAINED. */
   stash_conflicted: boolean;
   commits: number;
+  /** The post-merge push to the target's remote succeeded. */
+  pushed: boolean;
+  /** Push was requested and failed; the merge is NOT rolled back. */
+  push_error: string;
 }
 
 /** What the update menu can offer. `upstream` is empty until the branch has
