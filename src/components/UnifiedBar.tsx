@@ -13,7 +13,7 @@ import * as HoverCard from "@radix-ui/react-hover-card";
 import { Check } from "lucide-react";
 import {
   PanelLeft, PanelRight, FolderOpen, Archive,
-  Sun, Moon, Monitor, GitMerge, GitCommitHorizontal, Upload, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
+  Sun, Moon, Monitor, GitMerge, GitCommitHorizontal, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
   MessageSquareText, Library, Palette,
 } from "lucide-react";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
@@ -22,14 +22,14 @@ import { effectiveSandboxMode } from "@/lib/types";
 import { SandboxIcon } from "@/components/SandboxIcon";
 import { UpdaterBanner } from "@/components/UpdaterBanner";
 import { WaitingAgentsPill } from "@/components/WaitingAgentsPill";
-import { openPath, themesDir, taskMergeToMain, taskPushMain } from "@/lib/ipc";
-import { runPrompt } from "@/lib/runPrompt";
-import type { TerminalTab } from "@/lib/types";
+import { openPath, themesDir, taskMergeToMain } from "@/lib/ipc";
 import { archiveAndRefresh } from "@/lib/archiveTask";
 import {
   DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator,
 } from "@/components/ui/Dropdown";
 import { usePromptLibrary } from "@/store/prompts";
+import { getLiveAgentTabs } from "@/lib/promptFire";
+import { runPrompt } from "@/lib/runPrompt";
 import { useUI } from "@/store/ui";
 import { usePrefs, resolveTheme } from "@/store/prefs";
 import { useIsFullscreen } from "@/hooks/useIsFullscreen";
@@ -50,21 +50,15 @@ export function UnifiedBar() {
   const task = useActiveTask();
   const proj = useApp(s => task ? s.projects.find(p => p.id === task.project_id) : null);
   const openSettings = useApp(s => s.openSettings);
-  const prompts = usePromptLibrary(s => s.prompts);
-  const enabledPrompts = prompts.filter(p => p.enabled);
-  // The Commit button fires the library's Commit prompt (user overrides
-  // included) straight into the current agent terminal, so the full
-  // commit / merge / push lifecycle is clickable from the bar in any project.
-  // It honors the Git panel's push checkbox (gitPushDefault): checked sends
-  // the Commit-and-push prompt, unchecked the push-free Commit prompt.
-  // Read at click time (not render) so a toggle in the panel applies
-  // immediately without a re-render dependency.
-  const pickCommitPrompt = () => {
-    const wantPush = localStorage.getItem("gitPushDefault") === "1";
-    return prompts.find(p => p.id === (wantPush ? "builtin:commit-push" : "builtin:commit"))
-      ?? prompts.find(p => p.id === "builtin:commit" || p.id === "builtin:commit-push");
-  };
-  const hasCommitPrompt = prompts.some(p => p.id === "builtin:commit" || p.id === "builtin:commit-push");
+  const enabledPrompts = usePromptLibrary(s => s.prompts).filter(p => p.enabled);
+  // Direct-fire toolbar shortcuts for the ship cycle. The Push checkbox
+  // arms BOTH actions (Commit prompt + Merge to main) and is one-shot:
+  // unchecking applies to the next click only, then it snaps back on.
+  const commitPrompt = usePromptLibrary(s => s.prompts).find(p => p.id === "builtin:commit");
+  const commitPushPrompt = usePromptLibrary(s => s.prompts).find(p => p.id === "builtin:commit-push");
+  const [pushArmed, setPushArmed] = useState(true);
+  /** Read the arm state for an action and immediately re-arm (one-shot opt-out). */
+  const consumePush = () => { const v = pushArmed; setPushArmed(true); return v; };
   // Picking a prompt opens the shared destination modal (running agents +
   // new-agent CLIs) — a modal, not a submenu, which flipped to the wrong
   // side near the window edge. Shared (not local state) so the ⌥⌘P prompt
@@ -237,27 +231,49 @@ export function UnifiedBar() {
               </DropdownMenu>
             </DropdownRoot>
 
-            {/* Commit: sends the library's Commit prompt to the current agent
-                terminal (active tab if it's a live terminal, else the task's
-                default agent, else any live one). With no agent running it
-                falls back to the destination dialog, which can spawn one. */}
-            {hasCommitPrompt && (
-              <Tip content="Send the Commit prompt to the current agent (Git panel's push checkbox decides commit-only vs commit-and-push)" side="bottom">
+            {/* ── Git segment: Push arm + Commit + Merge to main ── */}
+            <div className="mx-1 h-4 w-px bg-[var(--color-border-soft)]" />
+            <span className="select-none px-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-faint)]">
+              Git
+            </span>
+
+            {/* The shared, one-shot Push arm. Checked (default): Commit
+                fires the commit-and-push prompt, Merge to main pushes the
+                target afterwards. Unchecked: the NEXT action skips the
+                push, then the box re-checks itself. */}
+            <Tip content="Push after the next Commit or Merge to main. Unchecking applies once" side="bottom">
+              <label
+                data-no-drag
+                className="flex cursor-pointer select-none items-center gap-1.5 rounded px-1.5 py-1 text-[13px] text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)]"
+              >
+                <input
+                  type="checkbox"
+                  checked={pushArmed}
+                  onChange={(e) => setPushArmed(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+                />
+                <span>Push</span>
+              </label>
+            </Tip>
+
+            {/* One-click Commit prompt: fires the built-in "Commit" or
+                "Commit and push" prompt (per the Push checkbox) through the
+                shared destination modal (pick a running agent or spawn a
+                new one). Hidden when both built-ins were deleted. */}
+            {(commitPrompt || commitPushPrompt) && (
+              <Tip content="Ask an agent to commit the current changes" side="bottom">
                 <Button size="sm" variant="ghost" className="gap-1.5" data-no-drag
                   onClick={() => {
-                    const commitPrompt = pickCommitPrompt();
-                    if (!commitPrompt) return;
-                    const s = useApp.getState();
-                    const tabs = s.tabs[task.id] ?? [];
-                    const activeId = s.activeTab[task.id];
-                    const isLive = (t: (typeof tabs)[number]): t is TerminalTab =>
-                      t.type === "terminal" && !!t.ptyId;
-                    const target =
-                      tabs.find(t => t.id === activeId && isLive(t)) ??
-                      tabs.find(t => isLive(t) && t.is_default) ??
-                      tabs.find(isLive);
-                    if (target) runPrompt(task.id, commitPrompt, { kind: "agent", tabId: target.id });
-                    else openPromptFire(commitPrompt);
+                    const wantPush = consumePush();
+                    // Fall back to whichever built-in still exists.
+                    const p = (wantPush ? commitPushPrompt : commitPrompt)
+                      ?? commitPrompt ?? commitPushPrompt;
+                    if (!p) return;
+                    // Exactly one live agent in this task: no ambiguity, send
+                    // straight to it. Otherwise the destination picker.
+                    const live = getLiveAgentTabs(task.id);
+                    if (live.length === 1) runPrompt(task.id, p, { kind: "agent", tabId: live[0].id });
+                    else openPromptFire(p);
                   }}>
                   <GitCommitHorizontal className="h-4 w-4" />
                   <span>Commit</span>
@@ -275,23 +291,20 @@ export function UnifiedBar() {
               <Tip content="Merge this task's branch into the project's main checkout" side="bottom">
                 <Button size="sm" variant="ghost" className="gap-1.5"
                   onClick={async () => {
-                    const ok = await useUI.getState().askConfirm({
-                      title: `Merge "${task.name}" into main?`,
-                      message:
-                        `Merges the task branch's commits (with history) into ${proj.root_path}. ` +
-                        `Uncommitted changes in the task are not included, commit them first.`,
-                      confirmLabel: "Merge",
-                    });
-                    if (!ok) return;
-                    const run = async (stashIfDirty: boolean): Promise<void> => {
-                      const r = await taskMergeToMain(task.id, stashIfDirty);
+                    // No upfront confirmation: the merge either works or
+                    // reports a specific problem. Consume the one-shot Push
+                    // arm at click time so the checkbox snaps back on.
+                    const wantPush = consumePush();
+                    const run = async (): Promise<void> => {
+                      const r = await taskMergeToMain(task.id, false, wantPush);
                       if (r.dirty_main) {
-                        const stash = await useUI.getState().askConfirm({
-                          title: "Main checkout has uncommitted changes",
-                          message: "Stash them, merge, then re-apply the stash?",
-                          confirmLabel: "Stash and merge",
-                        });
-                        if (stash) await run(true);
+                        // Deliberately no stash offer: a dirty main is the
+                        // user's call to resolve, the merge just bails.
+                        useUI.getState().pushToast(
+                          `${r.target} has uncommitted changes. Commit or stash them there first, nothing was merged.`,
+                          "error",
+                          { ttlMs: 8000 },
+                        );
                         return;
                       }
                       if (r.conflicted) {
@@ -319,13 +332,22 @@ export function UnifiedBar() {
                       }
                       const n = r.commits;
                       const stashNote = r.stashed ? " Local changes were stashed and restored." : "";
+                      if (wantPush && !r.pushed) {
+                        useUI.getState().pushToast(
+                          `Merged ${r.branch} into ${r.target}: ${n} commit${n === 1 ? "" : "s"}, but the push failed: ${r.push_error}`,
+                          "error",
+                          { ttlMs: 8000 },
+                        );
+                        return;
+                      }
+                      const pushNote = r.pushed ? " Pushed." : "";
                       useUI.getState().pushToast(
-                        `Merged ${r.branch} into ${r.target}: ${n} commit${n === 1 ? "" : "s"}.${stashNote}`,
+                        `Merged ${r.branch} into ${r.target}: ${n} commit${n === 1 ? "" : "s"}.${stashNote}${pushNote}`,
                         "success",
                       );
                     };
                     try {
-                      await run(false);
+                      await run();
                     } catch (e) {
                       await useUI.getState().askConfirm({
                         title: "Merge to main failed",
@@ -341,37 +363,8 @@ export function UnifiedBar() {
                 </Button>
               </Tip>
             )}
-
-            {/* Push: publishes the project's MAIN checkout to its remote,
-                the natural last step after Merge to main. Confirmed first,
-                it's an outward-facing action. */}
-            <Tip content="Push the project's main checkout to its remote" side="bottom">
-              <Button size="sm" variant="ghost" className="gap-1.5" data-no-drag
-                onClick={async () => {
-                  const ok = await useUI.getState().askConfirm({
-                    title: "Push main to remote?",
-                    message: `Pushes the main checkout at ${proj.root_path} to its remote (sets upstream if needed).`,
-                    confirmLabel: "Push",
-                  });
-                  if (!ok) return;
-                  try {
-                    useUI.getState().setBusy("Pushing…");
-                    const branch = await taskPushMain(task.id);
-                    useUI.getState().pushToast(`Pushed ${branch} to remote.`, "success");
-                  } catch (e) {
-                    await useUI.getState().askConfirm({
-                      title: "Push failed",
-                      message: String(e),
-                      confirmLabel: "OK",
-                      cancelLabel: "",
-                      destructive: true,
-                    });
-                  } finally { useUI.getState().setBusy(null); }
-                }}>
-                <Upload className="h-4 w-4" />
-                <span>Push</span>
-              </Button>
-            </Tip>
+            {/* ── end Git segment ── */}
+            <div className="mx-1 h-4 w-px bg-[var(--color-border-soft)]" />
             {(() => {
               const sbMode = effectiveSandboxMode(task);
               const tip = sbMode === "enforce" ? "Sandbox: Enforcing"

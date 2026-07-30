@@ -55,60 +55,10 @@ Produce:
 
 Keep it concise and skimmable. Do not restate the obvious or pad the summary.`;
 
-export const COMMIT_PROMPT = `# Commit
-
-Commit workflow: survey all local changes (staged, unstaged tracked, untracked) as one set, group them into sensible commits autonomously and commit directly. Only Cleanup (junk found) still asks.
-
-## Inspect
-
-- Run \`git status\` (without -uall) and \`git diff --stat\`.
-- Read the actual changes:
-  - \`git diff --cached\` for staged + \`git diff\` for unstaged tracked.
-  - For untracked files: list their paths and, for small ones, inspect content (\`head\`) to understand their purpose. Do NOT ask which untracked files to include, they are part of the input.
-  - If the combined diff is over ~30k chars, fall back to \`--stat\` plus a truncated body.
-- Run \`git log --oneline -5\` once for commit message style reference.
-
-## Cleanup (junk / debug check)
-
-Do this BEFORE planning commits, otherwise throwaway files get swept in silently.
-
-- Scan the change set for things that look like artifacts rather than intended work:
-  - untracked files with trivial / garbage content, scratch or debug scripts, stray *.log / *.tmp, editor backups, .DS_Store.
-  - debug leftovers inside diffs: console.log / print / dump / dd( / var_dump, commented-out blocks, "TODO: remove".
-- If anything is suspicious, list the candidates (path + why) and ask ONE standalone question via AskUserQuestion: "Remove junk/debug leftovers before committing? (remove all / pick / keep / abort)". Apply the answer, then continue (abort stops).
-- If nothing is suspicious, skip silently. Do not ask.
-
-## Stage
-
-- After Cleanup, re-run \`git status\` to inspect the actual remaining state (Cleanup may have deleted or reverted files).
-- All tracked changes (staged + unstaged) are part of the change set and will be committed. Untracked files that survived Cleanup as well, no question.
-- If nothing is left to commit, say so and stop.
-
-## Plan the groups
-
-Treat staged + unstaged tracked + untracked as one set. Decide whether everything fits a single coherent commit, or whether the changes split naturally into multiple commits.
-
-Split-worthy patterns: unrelated changes across domains, refactor + feature mixed, several independent bug fixes, formatting mixed with logic changes, different bounded contexts.
-
-Decide the grouping yourself, NO confirmation question. Commit the chunks the way it makes the most sense and report the resulting plan (groups + messages) in the summary afterwards.
-
-Message guidelines:
-- Focus on the "why" rather than the "what".
-- Do not add a branch prefix, a git hook handles that.
-- Do not add a "Co-Authored" trailer.
-- Do not mention "Claude" anywhere.
-
-## Execute
-
-- Reset staging once: \`git reset HEAD -- .\`
-- For each group in order: stage just that group's files (\`git add <paths>\`), commit with the proposed message.
-- If a pre-commit hook fails, fix the issue and create a NEW commit (never amend).
-
-Do NOT push. Finish with a summary of the commits made (\`git log --oneline\` of the new commits).`;
-
-export const COMMIT_PUSH_PROMPT = `# Commit and push
-
-Commit workflow: survey all local changes (staged, unstaged tracked, untracked) as one set, group them into sensible commits autonomously and commit directly. Only Cleanup (junk found) still asks.
+// Shared commit workflow: survey ALL local changes as one set, clean junk
+// (with one structured question), group into sensible commits autonomously
+// and commit directly. The push behavior differs per variant below.
+const COMMIT_WORKFLOW = `Commit workflow: survey all local changes (staged, unstaged tracked, untracked) as one set, group them into sensible commits autonomously and commit directly. Only Cleanup (junk found) still asks.
 
 ### Inspect
 
@@ -165,7 +115,19 @@ Message guidelines:
 - For each group in order:
   - Stage just that group's files: \`git add <paths…>\`.
   - Commit with the proposed message.
-  - If a pre-commit hook fails, fix the issue and create a NEW commit (never amend).
+  - If a pre-commit hook fails, fix the issue and create a NEW commit (never amend).`;
+
+export const COMMIT_PROMPT = `# Commit
+
+${COMMIT_WORKFLOW}
+
+### Push
+
+Do NOT push. Finish with the summary of the created commits.`;
+
+export const COMMIT_PUSH_PROMPT = `# Commit and push
+
+${COMMIT_WORKFLOW}
 
 ### Push
 
