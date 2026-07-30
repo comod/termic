@@ -10,7 +10,7 @@ import { useApp, useActiveTask } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { AppDialog } from "@/components/ui/Dialog";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
-import { visibleCliIds, isTerminalEntry, tabLabel } from "@/lib/agents";
+import { visibleCliIds, isTerminalEntry, isTerminalCli, tabLabel } from "@/lib/agents";
 import { findLeaf } from "@/lib/splitTree";
 import { runPrompt } from "@/lib/runPrompt";
 import type { TerminalTab } from "@/lib/types";
@@ -25,8 +25,12 @@ export function PromptDestinationDialog() {
   const detectedClis = useApp(s => s.detectedClis);
   const task = useActiveTask();
   const taskTabs = useApp(s => (task ? s.tabs[task.id] : undefined));
+  // Same rule as getLiveAgentTabs: only agent TUIs are destinations, plain
+  // shells / custom commands / kind:"terminal" entries are not.
   const liveAgents = (taskTabs ?? []).filter(
-    (t): t is TerminalTab => t.type === "terminal" && !!t.ptyId && !(t as TerminalTab).runTab,
+    (t): t is TerminalTab =>
+      t.type === "terminal" && !!t.ptyId && !(t as TerminalTab).runTab
+      && !isTerminalCli((t as TerminalTab).cli),
   );
   const focusedAgentId = useApp(s => {
     if (!task) return undefined;

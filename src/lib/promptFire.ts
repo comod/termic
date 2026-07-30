@@ -7,6 +7,7 @@
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { findLeaf } from "@/lib/splitTree";
+import { isTerminalCli } from "@/lib/agents";
 import { runPrompt } from "@/lib/runPrompt";
 import type { TerminalTab } from "@/lib/types";
 import type { Prompt } from "@/store/prompts";
@@ -26,11 +27,15 @@ export function getFocusedTabId(wsId: string): string | undefined {
 
 /** Live agent-terminal tabs in a workspace — prompt fire destinations. Run
  *  tabs are terminals with a live PTY too, but a dev server isn't a prompt
- *  destination, so they're excluded (matches UnifiedBar's `liveAgents`). */
+ *  destination, so they're excluded, and so are terminal-style tabs (plain
+ *  shells, custom commands, kind:"terminal" entries): a prompt goes to an
+ *  agent TUI, not a shell prompt. */
 export function getLiveAgentTabs(wsId: string): TerminalTab[] {
   const tabs = useApp.getState().tabs[wsId] ?? [];
   return tabs.filter(
-    (t): t is TerminalTab => t.type === "terminal" && !!t.ptyId && !(t as TerminalTab).runTab,
+    (t): t is TerminalTab =>
+      t.type === "terminal" && !!t.ptyId && !(t as TerminalTab).runTab
+      && !isTerminalCli((t as TerminalTab).cli),
   );
 }
 
