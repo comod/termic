@@ -55,7 +55,16 @@ export function UnifiedBar() {
   // The Commit button fires the library's Commit prompt (user overrides
   // included) straight into the current agent terminal, so the full
   // commit / merge / push lifecycle is clickable from the bar in any project.
-  const commitPrompt = prompts.find(p => p.id === "builtin:commit");
+  // It honors the Git panel's push checkbox (gitPushDefault): checked sends
+  // the Commit-and-push prompt, unchecked the push-free Commit prompt.
+  // Read at click time (not render) so a toggle in the panel applies
+  // immediately without a re-render dependency.
+  const pickCommitPrompt = () => {
+    const wantPush = localStorage.getItem("gitPushDefault") === "1";
+    return prompts.find(p => p.id === (wantPush ? "builtin:commit-push" : "builtin:commit"))
+      ?? prompts.find(p => p.id === "builtin:commit" || p.id === "builtin:commit-push");
+  };
+  const hasCommitPrompt = prompts.some(p => p.id === "builtin:commit" || p.id === "builtin:commit-push");
   // Picking a prompt opens the shared destination modal (running agents +
   // new-agent CLIs) — a modal, not a submenu, which flipped to the wrong
   // side near the window edge. Shared (not local state) so the ⌥⌘P prompt
@@ -232,10 +241,12 @@ export function UnifiedBar() {
                 terminal (active tab if it's a live terminal, else the task's
                 default agent, else any live one). With no agent running it
                 falls back to the destination dialog, which can spawn one. */}
-            {commitPrompt && (
-              <Tip content="Send the Commit prompt to the current agent" side="bottom">
+            {hasCommitPrompt && (
+              <Tip content="Send the Commit prompt to the current agent (Git panel's push checkbox decides commit-only vs commit-and-push)" side="bottom">
                 <Button size="sm" variant="ghost" className="gap-1.5" data-no-drag
                   onClick={() => {
+                    const commitPrompt = pickCommitPrompt();
+                    if (!commitPrompt) return;
                     const s = useApp.getState();
                     const tabs = s.tabs[task.id] ?? [];
                     const activeId = s.activeTab[task.id];
