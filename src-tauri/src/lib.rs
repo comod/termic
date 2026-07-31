@@ -8561,6 +8561,23 @@ pub struct Settings {
     /// Landing). Re-read per request, so flipping it applies live.
     #[serde(default)]
     pub cli_enabled: bool,
+    /// What the window's close button does: "ask" (default) | "menubar" |
+    /// "quit". "ask" shows the close prompt whose "Don't ask again" checkbox
+    /// writes the chosen one back here. Stored rather than inferred so the
+    /// answer survives restarts, and re-read per close so Settings applies
+    /// live. Unknown values are treated as "ask" - a corrupt settings file
+    /// must not silently start quitting on people with agents running.
+    #[serde(default)]
+    pub close_action: Option<String>,
+    /// Whether the menu-bar item (Show/Quit Termic, the attention dropdown)
+    /// is shown at all. `None`/absent means on, matching `fetch_before_create`'s
+    /// tri-state — only an explicit `Some(false)` turns it off, so upgraders
+    /// keep it. Re-read on every settings save so toggling it applies live
+    /// without a restart (`settings_save`), and on entering windowless mode
+    /// (`enter_windowless`'s `_tray_up` check): a user who disabled it still
+    /// gets the dock icon as their way back instead of losing both.
+    #[serde(default)]
+    pub tray_enabled: Option<bool>,
     /// Repo-root config dirs symlinked into each NEW worktree task (when the
     /// checkout didn't already provide them). `.claude/` and friends hold a
     /// project's subagents / skills / commands, which are commonly gitignored
@@ -8577,6 +8594,21 @@ pub struct Settings {
 /// explicit `Some(false)` in settings disables it.
 fn fetch_before_create_enabled() -> bool {
     load_settings_inner().fetch_before_create != Some(false)
+}
+
+/// Whether the menu-bar item should be shown, per `Settings.tray_enabled`.
+/// Default-on: only an explicit `Some(false)` disables it. Takes an already-
+/// loaded `Settings` so callers that just saved one (`settings_save`) don't
+/// re-read it from disk a beat later.
+fn tray_enabled_pref(s: &Settings) -> bool {
+    s.tray_enabled != Some(false)
+}
+
+/// Same as `tray_enabled_pref`, loading settings from disk. For call sites
+/// (`build_tray`, `enter_windowless`) that don't already have a `Settings`
+/// in hand.
+fn tray_enabled() -> bool {
+    tray_enabled_pref(&load_settings_inner())
 }
 
 /// Current on-disk schema version. Bump when adding a migration and gate it
@@ -9195,9 +9227,22 @@ fn run_capture_command(cmd: String, cwd: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn settings_save(s: Settings) -> Result<(), String> {
+fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
+    let tray_on = tray_enabled_pref(&s);
+    save_settings_inner(&s)?;
+    // Applies live: flipping the toggle in Settings shouldn't need a restart
+    // to show/hide the menu-bar item, matching close_action/cli_enabled's
+    // "re-read per use" behavior.
+    let _ = set_tray_visible(&app, tray_on);
+    Ok(())
+}
+
+/// The single settings writer. Extracted so Rust-side toggles (the menu-bar
+/// item, the close-button choice) persist through exactly the same path the
+/// Settings UI does, instead of growing a second encoder that could drift.
+pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
     let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?)
+    fs::write(f, serde_json::to_string_pretty(s).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
 
@@ -9221,7 +9266,7 @@ fn discovery_dismiss(path: String, dismissed: bool) -> Result<(), String> {
     } else {
         s.discovery_dismissed.retain(|p| p != &canon);
     }
-    settings_save(s)
+    save_settings_inner(&s)
 }
 
 /// Replace just the agents list, preserving the rest of settings (repos_dir,
@@ -9692,6 +9737,526 @@ fn set_dev_dock_icon() {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ───────────────────────── windowless mode ─────────────────
+//
+// Standard macOS app semantics, which Termic did not have before:
+//
+//   Close (⌘W / red button) → BACKGROUND. The window goes away, agents keep
+//     working, and a menu-bar item is the way back.
+//   Quit  (⌘Q / menu-bar Quit) → the only thing that tears the app down
+//     (RunEvent::Exit → cleanup_children SIGKILLs every PTY).
+//
+// This CHANGES an existing behavior, it does not fix a bug: before this,
+// closing the last window QUIT the app (tao destroys the window -> Tauri
+// fires ExitRequested -> nothing prevented it -> ControlFlow::Exit), taking
+// every running agent with it. Verified empirically, because lib.rs's own
+// teardown comment claims the opposite and is wrong. So the product question
+// this answers is "should closing the window kill your agents", and the
+// answer here is no.
+//
+// The CLI rides the same state: `termic new` from a shell auto-launches with
+// `--headless`, which boots STRAIGHT into windowless mode so a shell command never
+// steals a window or a dock icon (docs/plans/cli.md Phase 3).
+//
+// COST NOTE, measured, and the reason `termic://windowless` exists: hiding the
+// WINDOW does not pause xterm's renderers. They key on ZERO GEOMETRY, which
+// `display: none` produces and a hidden NSWindow does NOT — a windowless
+// window still reports full layout (measured 1368×1190 with 7 live canvases).
+// Without telling the webview to collapse the panes, a windowless Termic keeps
+// running WebGL draws for a window nobody can see. docs/performance.md bear
+// trap 2, at window scope.
+static WINDOWLESS: AtomicBool = AtomicBool::new(false);
+/// Whether a window has ever been on screen this process. A `--headless`
+/// launch that has never shown one stays `Accessory` (no dock icon) — a shell
+/// command must not put Termic in the dock. Once the user has actually seen a
+/// window we keep the dock icon for the rest of the process lifetime, because
+/// close-keeps-the-dock-icon is the macOS convention (Mail, Messages).
+static SHOWN_ONCE: AtomicBool = AtomicBool::new(false);
+/// Set by `close_prompt_ack` when the webview confirms it received a close
+/// request. Guards the fallback below - see the CloseAction::Ask arm.
+static CLOSE_PROMPT_ACKED: AtomicBool = AtomicBool::new(false);
+/// How long to wait for that ack. Generous: it only has to beat a human
+/// reaching for the mouse, and firing early would steal a dismissal.
+const CLOSE_PROMPT_ACK_GRACE: Duration = Duration::from_secs(5);
+
+/// Paints the pixelated "T" mark (from icons/icon.svg, minus the squircle)
+/// into a W×W RGBA buffer, in the given color. Shared geometry between the
+/// plain template icon and the colored badge variant below, so the two
+/// can't silently drift apart.
+///
+/// Master geometry: crossbar 6 cells × 2, stem 2 cells × 5, stem centered.
+/// Each cell leaves a 1px gap on its right/bottom edge so the mark reads as
+/// the same dotted/segmented grid as icons/icon.svg, not a solid block.
+///
+/// CELL=4 puts the 6×7 grid at 24×28 inside 32×32 (4px side / 2px top-bottom
+/// padding, ~34% ink). That is deliberately heavier than icons/icon.svg's
+/// ~25% padding and heavier than the inset system items next to it, and it
+/// was CHECKED in a real menu bar and preferred. Don't "fix" it to 3 on
+/// theory alone: 3 renders the same mark at 18×21 and reads thinner than
+/// intended. Verify in an actual menu bar before changing it.
+fn paint_t_mark(rgba: &mut [u8], w: usize, color: [u8; 4]) {
+    const CELL: usize = 4;
+    let x0 = (w - 6 * CELL) / 2;
+    let y0 = (w - 7 * CELL) / 2;
+    let mut fill = |cx: usize, cy: usize| {
+        for y in y0 + cy * CELL..y0 + (cy + 1) * CELL - 1 {
+            for x in x0 + cx * CELL..x0 + (cx + 1) * CELL - 1 {
+                let i = (y * w + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&color);
+            }
+        }
+    };
+    for cx in 0..6 { fill(cx, 0); fill(cx, 1); }        // crossbar
+    for cy in 2..7 { fill(2, cy); fill(3, cy); }        // stem
+}
+
+/// 32×32 template image of the app mark. macOS recolors template images
+/// itself, so only alpha matters; color is black + opaque wherever the mark
+/// is painted.
+fn tray_icon_image() -> tauri::image::Image<'static> {
+    const W: usize = 32;
+    let mut rgba = vec![0u8; W * W * 4];
+    paint_t_mark(&mut rgba, W, [0, 0, 0, 255]);
+    tauri::image::Image::new_owned(rgba, W as u32, W as u32)
+}
+
+fn fill_circle(rgba: &mut [u8], w: usize, cx: i32, cy: i32, r: i32, color: [u8; 4]) {
+    for y in (cy - r).max(0)..=(cy + r).min(w as i32 - 1) {
+        for x in (cx - r).max(0)..=(cx + r).min(w as i32 - 1) {
+            let (dx, dy) = (x - cx, y - cy);
+            if dx * dx + dy * dy <= r * r {
+                let i = (y as usize * w + x as usize) * 4;
+                rgba[i..i + 4].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+/// Whether the system menu bar/status-item appearance is currently dark.
+/// Best-effort: off macOS, or if AppKit can't be reached, assume dark (this
+/// app's own default theme, and the common case). `tray_row_icon`'s colors
+/// aren't template-recolored by macOS the way the plain "T" mark is (they're
+/// full-color, not alpha-only), so they need to pick their own light/dark
+/// variant instead of getting it for free.
+fn menu_bar_is_dark() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+
+        let Some(mtm) = MainThreadMarker::new() else { return true };
+        let name = NSApplication::sharedApplication(mtm).effectiveAppearance().name();
+        return name.to_string().contains("Dark");
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// Icon dropped into a task row's `IconMenuItem`: a solid dot, amber for
+/// "wants input" and blue for "done" (Sidebar.tsx's TabBadge colors).
+/// A hand-drawn bell (rectangles/circles at menu-icon scale) went through
+/// four rounds — blob, triangle, umbrella — without ever reading as a bell;
+/// a dot in a different color carries the same "these two differ" signal
+/// reliably, so use that instead of a fifth guess. macOS forces every
+/// `IconMenuItem` image into a fixed 18pt-tall frame (muda's icon.rs calls
+/// `to_nsimage(Some(18.))`) and always renders it leading — there is no
+/// public way to ask for a different size or the trailing side of the
+/// label.
+fn tray_row_icon(state: &str) -> tauri::image::Image<'static> {
+    // 128px source for an 18pt destination (~7x downsample) so the circle's
+    // edge gets smoothed away rather than surviving the resize as jaggies.
+    const W: usize = 128;
+    let dark = menu_bar_is_dark();
+    let mut rgba = vec![0u8; W * W * 4];
+    let color: [u8; 4] = if state == "waiting" {
+        // --color-warn (Sidebar.tsx's TabBadge), darkened ~25% on a light
+        // menu bar for legibility — these are full-color icons, not
+        // template-recolored, so unlike the plain "T" mark they need an
+        // explicit light-mode variant.
+        if dark { [240, 177, 58, 255] } else { [178, 133, 43, 255] }
+    } else {
+        // --color-info (Sidebar.tsx's TabBadge), darkened ~25% to match.
+        if dark { [74, 163, 255, 255] } else { [55, 122, 191, 255] }
+    };
+    fill_circle(&mut rgba, W, W as i32 / 2, W as i32 / 2, 28, color);
+    tauri::image::Image::new_owned(rgba, W as u32, W as u32)
+}
+
+/// 3×5 bitmap digits 0-9, one row per byte, bit 2/1/0 = leftmost/middle/
+/// rightmost column. Just enough to stamp a badge count onto an icon
+/// without pulling in a font rasterizer.
+const DIGIT_ROWS: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b010, 0b010, 0b010], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+];
+
+/// Draws one digit (0-9), scaled, centered at (cx, cy).
+fn draw_digit(rgba: &mut [u8], w: usize, cx: i32, cy: i32, digit: usize, scale: i32, color: [u8; 4]) {
+    let rows = DIGIT_ROWS[digit.min(9)];
+    let (gw, gh) = (3 * scale, 5 * scale);
+    let (x0, y0) = (cx - gw / 2, cy - gh / 2);
+    for (row, bits) in rows.iter().enumerate() {
+        for col in 0..3 {
+            if (bits >> (2 - col)) & 1 == 0 { continue; }
+            let (px0, py0) = (x0 + col as i32 * scale, y0 + row as i32 * scale);
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let (x, y) = (px0 + dx, py0 + dy);
+                    if x < 0 || y < 0 || x >= w as i32 || y >= w as i32 { continue; }
+                    let i = (y as usize * w + x as usize) * 4;
+                    rgba[i..i + 4].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+}
+
+/// 32×32 colored app mark (accent "T", icons/icon.svg's #d97757, no
+/// squircle backing so it sits directly on the menu bar like the plain
+/// template icon does) with a small numeral badge in the bottom-right
+/// corner. Used instead of the plain template icon whenever something
+/// needs attention, so the count reads as a badge over the logo rather
+/// than menu-bar text next to it. Counts above 9 still show "9" — a
+/// two-digit badge doesn't fit legibly at this size.
+fn tray_icon_image_badge(count: usize) -> tauri::image::Image<'static> {
+    const W: usize = 32;
+    const ACCENT: [u8; 4] = [217, 119, 87, 255]; // #d97757
+    const BADGE: [u8; 4] = [255, 59, 48, 255]; // alert red
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+    let mut rgba = vec![0u8; W * W * 4];
+    paint_t_mark(&mut rgba, W, ACCENT);
+
+    let (bcx, bcy, br) = (W as i32 - 9, W as i32 - 9, 9);
+    fill_circle(&mut rgba, W, bcx, bcy, br, BADGE);
+    draw_digit(&mut rgba, W, bcx, bcy, count, 2, WHITE);
+
+    tauri::image::Image::new_owned(rgba, W as u32, W as u32)
+}
+
+
+/// One task worth surfacing in the tray dropdown: either blocked on the user
+/// or finished its last turn. Pushed from the webview (`trayAttention.ts`),
+/// pre-sorted by project name then attention-before-done then task name —
+/// `build_tray_menu` trusts that order rather than re-sorting.
+#[derive(serde::Deserialize)]
+struct TrayAttentionItem {
+    task_id: String,
+    task_name: String,
+    project_name: String,
+    /// "waiting" (blocked on the user) or "done" (finished a turn).
+    state: String,
+}
+
+/// Menu rows before Show/Quit are truncated past this count, so a runaway
+/// project fleet can't grow the native menu unbounded.
+const TRAY_ATTENTION_CAP: usize = 40;
+
+/// Build the tray dropdown: an optional attention section (grouped by
+/// project, one disabled header row per project) followed by the constant
+/// Show Termic / Quit Termic pair. Shared by the initial build and every
+/// later `tray_set_attention` push so both stay in lockstep.
+fn build_tray_menu(
+    app: &AppHandle,
+    items: &[TrayAttentionItem],
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{IconMenuItem, Menu, MenuItem, PredefinedMenuItem};
+
+    let mut entries: Vec<Box<dyn tauri::menu::IsMenuItem<tauri::Wry>>> = Vec::new();
+    if !items.is_empty() {
+        let shown = &items[..items.len().min(TRAY_ATTENTION_CAP)];
+        let mut last_project: Option<&str> = None;
+        for it in shown {
+            if last_project != Some(it.project_name.as_str()) {
+                let header = MenuItem::with_id(
+                    app,
+                    format!("tray_header_{}", it.project_name),
+                    &it.project_name,
+                    false,
+                    None::<&str>,
+                )?;
+                entries.push(Box::new(header));
+                last_project = Some(it.project_name.as_str());
+            }
+            // Icon carries the state (amber dot / blue dot, tray_row_icon)
+            // — no text prefix/suffix needed. (Emoji was tried in between:
+            // crisp, but rendered far larger than the menu text — Apple
+            // Color Emoji doesn't shrink to match a surrounding font the
+            // way a raster icon can be sized.)
+            let task = IconMenuItem::with_id(
+                app,
+                format!("tray_task_{}", it.task_id),
+                &it.task_name,
+                true,
+                Some(tray_row_icon(&it.state)),
+                None::<&str>,
+            )?;
+            entries.push(Box::new(task));
+        }
+        if items.len() > shown.len() {
+            let more = MenuItem::with_id(
+                app,
+                "tray_more",
+                format!("+{} more", items.len() - shown.len()),
+                false,
+                None::<&str>,
+            )?;
+            entries.push(Box::new(more));
+        }
+        entries.push(Box::new(PredefinedMenuItem::separator(app)?));
+    }
+
+    let show = MenuItem::with_id(app, "tray_show", "Show Termic", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "tray_quit", "Quit Termic", true, None::<&str>)?;
+    entries.push(Box::new(show));
+    entries.push(Box::new(sep));
+    // Separator so Quit is not one slip away from Show: this Quit kills every
+    // running agent, and it is the item people reach for by muscle memory.
+    entries.push(Box::new(quit));
+
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        entries.iter().map(|e| e.as_ref()).collect();
+    Menu::with_items(app, &refs)
+}
+
+/// Build the menu-bar item. Created once, visible for the app's whole life:
+/// it is permanent chrome (Show Termic / Quit Termic, plus whatever tasks
+/// currently need attention), not something tied to windowless state.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::tray::TrayIconBuilder;
+
+    let menu = build_tray_menu(app, &[])?;
+
+    let tray = TrayIconBuilder::with_id("main")
+        .icon(tray_icon_image())
+        .icon_as_template(true)
+        .tooltip("Termic")
+        .menu(&menu)
+        // Clicking the icon opens the MENU (either button), so both actions
+        // are always one predictable gesture away. No bare left-click
+        // shortcut: "click = show" would make Quit reachable only by
+        // right-click, which is undiscoverable for the one action that stops
+        // your agents.
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| {
+            let id = event.id().as_ref();
+            if let Some(task_id) = id.strip_prefix("tray_task_") {
+                // Bring the window forward first (works even if it was
+                // already visible, just backgrounded), then route to the
+                // task the user clicked.
+                leave_windowless(app);
+                let _ = app.emit("termic://focus-task", task_id.to_string());
+                return;
+            }
+            match id {
+                "tray_show" => leave_windowless(app),
+                // The user-facing quit besides ⌘Q. app.exit drives
+                // RunEvent::Exit → cleanup_children, so PTYs die with us.
+                "tray_quit" => app.exit(0),
+                _ => {}
+            }
+        })
+        .build(app)?;
+    // Permanent chrome by default, not a windowless-only affordance, unless
+    // the user turned it off in Settings > General.
+    let _ = tray.set_visible(tray_enabled());
+    Ok(())
+}
+
+/// Rebuild the tray dropdown and icon from the webview's current attention
+/// list (`trayAttention.ts`). A no-op push (empty list) clears both back to
+/// the bare Show/Quit menu and the plain template mark.
+#[tauri::command]
+fn tray_set_attention(app: AppHandle, items: Vec<TrayAttentionItem>) -> Result<(), String> {
+    let menu = build_tray_menu(&app, &items).map_err(|e| e.to_string())?;
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_menu(Some(menu));
+        // Atomic icon+template swap: setting them separately visibly
+        // flickers on macOS (Tauri's own doc note on set_icon_with_as_template).
+        let (icon, is_template) = if items.is_empty() {
+            (tray_icon_image(), true)
+        } else {
+            (tray_icon_image_badge(items.len()), false)
+        };
+        let _ = tray.set_icon_with_as_template(Some(icon), is_template);
+    }
+    Ok(())
+}
+
+/// Current windowless state, for the webview to read at boot. A `--headless`
+/// launch calls enter_windowless() from setup(), long before main.tsx has run
+/// listen(), so that first edge is emitted into the void - Tauri has no event
+/// replay. Without this the flag would sit false for the whole life of a
+/// headless instance, which quietly re-breaks BOTH pane collapse (bear trap
+/// 2b) and the windowless-means-nothing-is-focused rule that lets a finished
+/// agent still notify.
+#[tauri::command]
+fn window_is_windowless() -> bool {
+    WINDOWLESS.load(Ordering::SeqCst)
+}
+
+/// The webview confirming it got `termic://close-requested`. Presence of an
+/// ack is the only thing distinguishing "no listener" from "user is thinking".
+#[tauri::command]
+fn close_prompt_ack() {
+    CLOSE_PROMPT_ACKED.store(true, Ordering::SeqCst);
+}
+
+/// What the close button should do, given the stored setting. Split out and
+/// pure so the "unknown value must not quit" rule is unit-testable: a corrupt
+/// or future settings file falls back to ASKING, never to destroying agents.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CloseAction {
+    Ask,
+    MenuBar,
+    Quit,
+}
+
+pub(crate) fn close_action_from(setting: Option<&str>) -> CloseAction {
+    match setting {
+        Some("menubar") => CloseAction::MenuBar,
+        Some("quit") => CloseAction::Quit,
+        _ => CloseAction::Ask,
+    }
+}
+
+/// Clicking "Keep in Menu Bar" is an explicit ask for the tray as the way
+/// back, even if it was previously turned off in Settings > General — a
+/// button that says "menu bar" should not leave the menu bar item off.
+/// Pure so the condition is unit-testable without an AppHandle.
+fn should_reenable_tray(action: &str, tray_enabled: Option<bool>) -> bool {
+    action == "menubar" && tray_enabled == Some(false)
+}
+
+/// Persisted by the close prompt's "Don't ask again" checkbox, and by the
+/// Settings control.
+#[tauri::command]
+fn window_close_choice(app: AppHandle, action: String, remember: bool) -> Result<(), String> {
+    if remember || action == "menubar" {
+        let mut s = load_settings_inner();
+        let mut changed = false;
+        if remember {
+            s.close_action = Some(action.clone());
+            changed = true;
+        }
+        // enter_windowless() re-reads tray_enabled() right after this, so
+        // clearing it here alone is enough to bring the tray up live.
+        if should_reenable_tray(&action, s.tray_enabled) {
+            s.tray_enabled = None;
+            changed = true;
+        }
+        if changed {
+            save_settings_inner(&s).map_err(|e| e.to_string())?;
+        }
+    }
+    match action.as_str() {
+        "menubar" => enter_windowless(&app),
+        // The user asked for teardown: RunEvent::Exit -> cleanup_children
+        // SIGKILLs every PTY, so agents do not outlive the app.
+        "quit" => app.exit(0),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Returns whether the menu-bar item is actually there. Load-bearing: it is
+/// the ONLY way back from an Accessory (dock-iconless) windowless state, so
+/// `enter_windowless` refuses to drop the dock icon without it.
+fn set_tray_visible(app: &AppHandle, visible: bool) -> bool {
+    match app.tray_by_id("main") {
+        Some(tray) => tray.set_visible(visible).is_ok(),
+        None => false,
+    }
+}
+
+/// Hide the window and go windowless. Idempotent.
+pub(crate) fn enter_windowless(app: &AppHandle) {
+    use tauri::Manager;
+    if WINDOWLESS.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        // Hiding a NATIVE FULLSCREEN window is orderOut: on a window that owns
+        // a Space - it orphans that Space and can restore into it later. Leave
+        // fullscreen first; harmless when not in it.
+        if win.is_fullscreen().unwrap_or(false) {
+            let _ = win.set_fullscreen(false);
+        }
+        // Order matters: flag AFTER the hide is dispatched. Setting it first
+        // meant a failed hide() left us flagged windowless with a visible
+        // window, and every later close early-returned - the red button became
+        // a permanent silent no-op. Caveat: Tauri's hide() returns Ok once the
+        // message is SENT, not once the window is off screen, so this catches a
+        // dead dispatcher and nothing subtler.
+        if win.hide().is_err() {
+            dlog("[windowless] hide failed; staying foreground");
+            return;
+        }
+    }
+    WINDOWLESS.store(true, Ordering::SeqCst);
+    dlog("[windowless] entered (window hidden, agents keep running)");
+    // Underscore-prefixed: only READ under the macOS gate below, and an
+    // unused-variable warning off macOS would be noise, not signal. Respects
+    // the user's tray_enabled setting rather than forcing it on: someone who
+    // turned the menu-bar item off should keep the dock icon as their way
+    // back, not have it silently reappear the moment they close to windowless.
+    let _tray_up = set_tray_visible(app, tray_enabled());
+    // Collapse the panes so xterm's renderers actually pause (see the cost
+    // note above). The webview stays alive and fully functional — it owns
+    // PTY lifetime and every work-state signal the CLI's `--wait` rides.
+    let _ = app.emit("termic://windowless", true);
+    // A shell-launched instance that has never shown a window keeps no dock
+    // icon; one the user has already seen behaves like a normal macOS app.
+    //
+    // Only ever drop the dock icon when the menu-bar item is actually up:
+    // Accessory + no window + no tray would be an app with NO way back short
+    // of `termic open`. Keeping the dock icon is the safe degradation.
+    #[cfg(target_os = "macos")]
+    if !SHOWN_ONCE.load(Ordering::SeqCst) {
+        if _tray_up {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        } else {
+            dlog("[windowless] no menu-bar item; keeping the dock icon as the way back");
+        }
+    }
+}
+
+/// Bring the UI back. Drives the menu-bar item, dock-icon clicks
+/// (RunEvent::Reopen), and the CLI's `raise` verb. Idempotent.
+pub(crate) fn leave_windowless(app: &AppHandle) {
+    use tauri::Manager;
+    let was = WINDOWLESS.swap(false, Ordering::SeqCst);
+    SHOWN_ONCE.store(true, Ordering::SeqCst);
+    if was {
+        dlog("[windowless] left (window restored)");
+    }
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    // Ask for geometry back BEFORE showing. This is ordering-by-intent, not a
+    // guarantee: the emit is fire-and-forget and a still-clamped webview can
+    // commit up to ~1s later, so a brief empty frame on restore is possible.
+    // The zero→non-zero edge is also what repairs xterm's viewport scroller
+    // (lib/xtermViewportSync).
+    let _ = app.emit("termic://windowless", false);
+    if let Some(win) = app.get_webview_window("main") {
+        // Unminimize here, not at the call sites: the tray's "Show Termic" and
+        // RunEvent::Reopen used to skip it while `raise` did it, so the three
+        // entry points disagreed.
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
 pub fn run() {
     // WebKitGTK 2.42+ defaults to its DMA-BUF renderer. It's the FAST path on
     // AMD/Intel (X11 and Wayland) and MUST stay on there: disabling it drops
@@ -9932,7 +10497,85 @@ pub fn run() {
                 }
                 let _ = position_on_cursor_monitor(&win);
             }
-            let _ = win.show();
+            // The menu-bar item exists from boot but stays hidden until we
+            // windowless, so a normal windowed session gains nothing visible.
+            if let Err(e) = build_tray(app.handle()) {
+                dlog(&format!("[tray] build failed: {e}"));
+            }
+
+            // `--headless` (how the CLI auto-launches us) boots straight into
+            // windowless mode: no window, no dock icon, agents still spawnable.
+            // Everything else launches normally.
+            let headless = std::env::args().any(|a| a == "--headless");
+            if headless {
+                dlog("[windowless] booting --headless (no window, no dock icon)");
+                enter_windowless(app.handle());
+            } else {
+                let _ = win.show();
+                SHOWN_ONCE.store(true, Ordering::SeqCst);
+            }
+
+            // Close (red button) sends us windowless instead of
+            // quitting. ⌘Q and the menu-bar Quit become the only teardown
+            // paths, so closing the window no longer kills running agents.
+            //
+            // macOS ONLY, deliberately. Close-keeps-the-app-running is a mac
+            // convention (Mail, Messages); on Windows and most Linux desktops
+            // closing the window is expected to QUIT, and silently turning that
+            // into minimize-to-tray is the kind of default people hate. Those
+            // platforms keep Tauri's native close. `--headless` still
+            // goes windowless everywhere, because there the user asked for no
+            // window. See docs/plans/windows.md.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        // ALWAYS prevent first, then decide. Letting the close
+                        // through and going windowless afterwards would race the
+                        // window's own teardown, and "ask" needs the window
+                        // alive to show the prompt in it.
+                        api.prevent_close();
+                        // KNOWN EXCEPTION to "no sync IO on the event-loop
+                        // thread" (docs/ipc.md): load_settings_inner() reads +
+                        // parses settings.json here. Once per click of a button
+                        // a human pressed, on a file we just wrote, so it is
+                        // bounded and unmeasurable - but it IS the rule being
+                        // bent, and re-reading is what makes a Settings change
+                        // apply without a restart.
+                        match close_action_from(load_settings_inner().close_action.as_deref()) {
+                            CloseAction::MenuBar => enter_windowless(&handle),
+                            CloseAction::Quit => handle.exit(0),
+                            // The webview owns the prompt (CloseDialog, whose
+                            // dismissal cancels the close outright); it answers
+                            // via window_close_choice.
+                            CloseAction::Ask => {
+                                let _ = handle.emit("termic://close-requested", ());
+                                // The emit is fire-and-forget, so a webview that
+                                // never wired its listener (initWindowlessMode
+                                // rejected, or the click landed mid-boot) would
+                                // leave the red button a silent no-op with only
+                                // Cmd-Q left. The webview ACKs the request the
+                                // moment it receives it; no ack means no
+                                // listener, so fall back to the NON-destructive
+                                // outcome. Keyed on the ack rather than on a
+                                // choice, because a user who DISMISSES the
+                                // prompt is cancelling the close on purpose and
+                                // must not be overridden.
+                                CLOSE_PROMPT_ACKED.store(false, Ordering::SeqCst);
+                                let fb = handle.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(CLOSE_PROMPT_ACK_GRACE);
+                                    if !CLOSE_PROMPT_ACKED.load(Ordering::SeqCst) {
+                                        dlog("[windowless] no close-prompt ack; going windowless");
+                                        enter_windowless(&fb);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                });
+            }
 
             // Dev-only automation bridge (no-op unless debug build AND
             // TERMIC_AUTOMATION=1) - lets an agent drive this instance
@@ -9942,7 +10585,9 @@ pub fn run() {
             // verbs stay behind the "Enable CLI" setting + per-boot
             // token). See cli_server.rs + docs/plans/cli.md.
             cli_server::start(app.handle().clone());
-            let _ = win.set_focus();
+            if !headless {
+                let _ = win.set_focus();
+            }
             #[cfg(target_os = "macos")]
             {
                 round_window_corners_for_tahoe(&win);
@@ -9991,6 +10636,8 @@ pub fn run() {
             cli_server::cli_prompt_report,
             cli_server::cli_install_symlink,
             cli_server::cli_install_status,
+            window_close_choice, window_is_windowless, close_prompt_ack,
+            tray_set_attention,
             list_monospace_fonts, list_font_families,
             themes_list, themes_dir,
         ])
@@ -10012,8 +10659,11 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Ready) {
                 set_dev_dock_icon();
             }
-            // App-level teardown: when Tauri tears down (last window
-            // closed on macOS doesn't fire this, but Cmd-Q does) make
+            // App-level teardown. (An older comment here claimed a last-window
+            // close does not fire this; that was wrong - it did, which is why
+            // closing used to kill every agent. Close is now intercepted, so
+            // the practical triggers are Cmd-Q, the menu-bar Quit, and the
+            // close prompt's Quit.) Make
             // sure we don't orphan any child we spawned. That means
             // both the streaming script process groups
             // (RUNNING_SCRIPTS) AND every live PTY (agent terminals,
@@ -10021,6 +10671,18 @@ pub fn run() {
             // our way out the door — no time for graceful SIGTERMs.
             if matches!(event, tauri::RunEvent::Exit) {
                 cleanup_children(app);
+            }
+            // Dock-icon click on a windowless app (applicationShouldHandle-
+            // Reopen). Unhandled before, but moot then: closing the window
+            // quit the app outright, so there was nothing to reopen.
+            // macOS-only in Tauri
+            // (the variant does not exist elsewhere - naming it unconditionally
+            // fails to compile on the Linux CI runner).
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    leave_windowless(app);
+                }
             }
         });
 }
@@ -10290,6 +10952,42 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // The close button routes on a STRING from settings.json. Anything the
+    // app does not recognise must fall back to ASKING: quitting kills every
+    // running agent, so a corrupt, hand-edited, or future-version settings
+    // file must never be able to pick the destructive branch by accident.
+    #[test]
+    fn close_action_defaults_to_ask_and_never_to_quit() {
+        assert_eq!(close_action_from(Some("menubar")), CloseAction::MenuBar);
+        assert_eq!(close_action_from(Some("quit")), CloseAction::Quit);
+        // Unset (fresh install / upgrade from a build without the field).
+        assert_eq!(close_action_from(None), CloseAction::Ask);
+        assert_eq!(close_action_from(Some("ask")), CloseAction::Ask);
+        // Junk, case variants, and a hypothetical future value all ask.
+        for junk in ["", "Quit", "QUIT", "menu bar", "background", "nonsense"] {
+            assert_eq!(
+                close_action_from(Some(junk)),
+                CloseAction::Ask,
+                "unrecognised close_action {junk:?} must ask, not act",
+            );
+        }
+    }
+
+    #[test]
+    fn keep_in_menu_bar_reenables_a_disabled_tray() {
+        // The one case that matters: tray was off, user explicitly asked to
+        // keep Termic in the menu bar.
+        assert!(should_reenable_tray("menubar", Some(false)));
+        // Already on (None = default-on, or explicit true): nothing to do.
+        assert!(!should_reenable_tray("menubar", None));
+        assert!(!should_reenable_tray("menubar", Some(true)));
+        // A disabled tray must stay disabled for any OTHER close action —
+        // this is specifically about the "menu bar" button, not a general
+        // "any close re-enables it" rule.
+        assert!(!should_reenable_tray("quit", Some(false)));
+        assert!(!should_reenable_tray("ask", Some(false)));
+    }
 
     #[test]
     fn pty_ring_caps_and_reports_truncation() {

@@ -454,6 +454,15 @@ export interface Settings {
    *  disabled CLI fails fast with a clear error rather than a launch
    *  timeout. See docs/plans/cli.md. */
   cli_enabled?: boolean;
+  /** What the window's close button does. Absent/"ask" = show the close
+   *  prompt (whose "Don't ask again" checkbox writes the choice back here);
+   *  "menubar" = close to the menu bar, agents keep running; "quit" = quit
+   *  Termic and kill every agent. */
+  close_action?: "ask" | "menubar" | "quit";
+  /** Whether the menu-bar item (Show/Quit Termic, the attention dropdown of
+   *  tasks that need input or just finished) is shown at all. Absent/true =
+   *  shown; only an explicit false turns it off. Applies live on save. */
+  tray_enabled?: boolean;
   /** Canonical repo paths hidden from the Add Project discovery list.
    *  Discovery still finds them; the picker filters them out until restored. */
   discovery_dismissed?: string[];
