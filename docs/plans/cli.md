@@ -11,10 +11,22 @@ advertisement (protocol v2). Phase 2 implemented on top - `send`
 (+`--shell`, backlog replay, detach keys, opt-in `--resize`), `apply`
 (exit 10 goes live), `diff`, `path`, and the result readers `logs`
 (per-PTY ring buffer) and `result` (claude transcript reader), protocol
-v3. Phase 3 in progress - windowless mode landed; Homebrew and
-`termic events --json` still pending. `termic mcp` stays parked under
-discussion and NOT approved (see Phasing). Sections below note where the
-implementation refined the original design.
+v5. Phase 3 in progress - windowless mode landed, `termic quit` landed;
+tab management (GH #138) landed in full: part 1 (`termic tab` + stable
+tab ids) and part 2 (`--tab <n|id|title>` targeting on
+send/wait/attach/logs, tabs listed in `status`, `tab -p`), protocol v6.
+`rename` (GH #153, label only; branch + dir keep their names) lands on
+top, protocol v7; `--from`/`--resume` (GH #169) on top of that,
+protocol v8. Phase 4 implemented - prompt library access (`termic
+prompts [show]`, `-P/--library` on new/send/tab, the `list_prompts`
+webview RPC + Rust-side `resolve_prompt_selector`), protocol v9 (see
+Phasing).
+Homebrew
+is settled, not pending: the cask ships, a CLI-only formula is a non-goal
+(see Distribution). `termic events --json` is SEQUENCED BEHIND hooks, not
+merely deferred: see Phasing.
+Sections below note where the implementation refined the
+original design.
 
 A `termic` command that creates tasks, lists them with live agent state, focuses
 the GUI, injects prompts, and attaches a real TTY to an agent's PTY, from any
@@ -210,17 +222,32 @@ scope until the surface stabilizes. Completions (`termic completions zsh`,
 clap-generated) complete task names dynamically over the socket.
 
 ```
-termic new <name> [-p|--prompt <text>] [--agent claude|gemini|codex|<custom>]
+termic new [name] [-p|--prompt <text>] [-P|--library <sel>]
+           [--agent claude|gemini|codex|<custom>]
            [--worktree|--main] [--base <branch>] [--sandbox off|monitor|enforce|enforce-fs]
            [--yolo] [--project <name>] [--open] [--wait]   # a new --attach flag stayed unbuilt:
-                                                           # `termic new x && termic attach x`
+           [--from <path>] [--resume <session-id>]         # `termic new x && termic attach x`
                                                            # composes, so the flag is deferred
                                                            # until someone misses it
+                                                           # --from (GH #169, protocol v8) ADOPTS an
+                                                           # existing registered worktree instead of
+                                                           # creating one (name optional: defaults to
+                                                           # its branch; excludes mode/--base; no setup
+                                                           # script; project resolved from the
+                                                           # worktree's repo). --resume seeds the agent's
+                                                           # first spawn with a session id via the
+                                                           # registry's resume_id_args (id-resume-capable
+                                                           # agents only; valid on any create, best where
+                                                           # the task dir matches the session's); `tab`
+                                                           # takes the same --resume for a NEW tab
 termic list [--project <name>] [-q]           # tasks + workState + diff stat (alias: ls; -q = ids only)
 termic open [<task>]                          # raise window, select task (cwd-aware)
 termic status <task>                          # one task in depth: agent state, branch,
                                               # dirty file count, session count
-termic send <task>|--here -p <text> [--wait]  # prompt the RUNNING agent; if it is mid-turn
+termic send <task>|--here [-p <text>]         # prompt the RUNNING agent; --tab <n|id|title>
+           [-P|--library <sel>] [--wait]      # (-p and/or -P, Phase 4 composition)
+           [--tab <sel>]                      # targets one strip tab (agent tabs only);
+                                              # if the target is mid-turn
                                               # this QUEUES (runPrompt.ts:42 already queues
                                               # on workState "working"), not an error -
                                               # but ONLY for work-done-capable agents:
@@ -238,6 +265,7 @@ termic send <task>|--here -p <text> [--wait]  # prompt the RUNNING agent; if it 
                                               # own explicit error pointing at --fresh,
                                               # never a silent fall-through
 termic wait <task> [--timeout <dur>]          # block until the agent is QUIESCENT:
+           [--tab <sel>]                      # (--tab narrows to ONE tab's state+queue)
                                               # settled AND its message queue is empty.
                                               # Settle alone races send's queueing (turn 1
                                               # settles -> wait returns -> only then does
@@ -249,7 +277,8 @@ termic wait <task> [--timeout <dur>]          # block until the agent is QUIESCE
                                               # their OWN prompt (delivered + the turn it
                                               # started settled), not just any quiet.
 termic attach <task> [--detach-keys <seq>]    # raw TTY <-> agent PTY; --shell targets the
-           [--resize] [--shell]               # aux terminal instead; interactive but
+           [--resize] [--shell|--tab <sel>]   # aux terminal, --tab one strip tab
+                                              # (agent tabs only); interactive but
                                               # NON-resizing by default (the GUI pane owns
                                               # the PTY size; resizing under it is tmux's
                                               # smallest-client problem). --resize opts in.
@@ -270,6 +299,17 @@ termic apply <task> [--yes]                   # the GUI's "send diff to main"
                                               # which leaves conflict markers IN MAIN and
                                               # must say so explicitly ("main checkout
                                               # left conflicted, resolve or reset")
+termic rename [<task>] <name>                 # GH #153. Retitle a task: the LABEL only,
+                                              # branch + worktree dir keep their
+                                              # creation-time names (pushed branches,
+                                              # live PTY cwds). Without <task> targets
+                                              # $TERMIC_TASK_ID (the caller's own task),
+                                              # then cwd like `open`. Same-project live
+                                              # duplicate -> Conflict (mirrors `new`'s
+                                              # collision rule; task_rename enforces it
+                                              # too, so the GUI shares the guard). Routed
+                                              # through the rename_task webview RPC so
+                                              # the sidebar updates live
 termic archive <task> [--yes]                 # kills the task's live PTYs FIRST (the
                                               # task_set_sandbox SIGKILL precedent;
                                               # today NEITHER lib.rs task_archive nor
@@ -282,6 +322,38 @@ termic archive <task> [--yes]                 # kills the task's live PTYs FIRST
 termic project add|list|remove                # rare admin ops, namespaced; `project add .`
                                               # is the non-interactive registration path
                                               # scripts need (the y/N prompt is TTY-only)
+termic quit [--yes]                           # the only shell-side teardown for a
+                                              # windowless app. Kills every PTY, script
+                                              # group, grep AND reverts active spotlight
+                                              # sessions (force-checkout of MAIN), so the
+                                              # confirmation names what dies. Never
+                                              # launches; exits 0 if not running
+termic agents                                 # what --agent / --terminal accept:
+                                              # id, kind, enabled, installed, usable.
+                                              # The registry is per-user and editable,
+                                              # so static help cannot carry it
+termic prompts [show <sel>] [--json]          # Phase 4: what -P/--library accepts
+                                              # (id, title, builtin/custom, enabled,
+                                              # modified; the library is per-user and
+                                              # editable, the agents argument again).
+                                              # `show` prints one prompt's body and
+                                              # nothing else, so it pipes
+termic tab <task> [--agent <id>|--terminal <id>|--shell]      # GH #138. A tab INSIDE a
+           [-p <text>|-P <sel> [--wait]]      # running task: the "+" menu as a verb, and
+                                              # like that menu it distinguishes agent /
+                                              # custom-terminal / aux-shell kinds, because
+                                              # they differ in sandbox, resume and YOLO.
+                                              # -p injects into the NEW tab (agent kinds
+                                              # only) via send_prompt targeted at its id
+termic tab close [<task>] --tab <sel> [--yes]  # GH #185. The strip's close button as a
+                                              # verb: kill THIS tab's PTY, drop the tab,
+                                              # leave the task and its other tabs alone.
+                                              # Same selectors as send/wait/attach, but
+                                              # reaches EVERY strip tab, shells included
+                                              # (closing is not driving). --yes is
+                                              # required for the DEFAULT tab, live or
+                                              # not: it is what an unqualified verb
+                                              # resolves to
 ```
 
 Two structural rules the surface depends on. First, task creation
@@ -340,6 +412,259 @@ anything back: once `task_create` has committed, interrupting only stops
 watching ("task continues in Termic"), it does not cancel the task. Copy rule applies to all CLI output and help text:
 no em dashes.
 
+## Tabs inside a running task (GH #138)
+
+Everything above targets a TASK. A task is not one agent though: it is a tab
+strip, and the GUI's "+" menu opens more agent tabs beside the first plus an
+uncaged shell. The CLI cannot see any of that. Today the entire surface is one
+boolean, `attach --shell`, and every other verb silently means "the default
+agent tab" (`PtyRole.is_default`, already the target `attach`/`logs` resolve
+to). So a second claude tab is unreachable, and `status` reports a `sessions`
+COUNT with no way to ask what those sessions are.
+
+Adopted into Phase 3, landed in two parts. **Part 1:** `termic tab`
+plus `PtyRole.tab_id`, i.e. creating tabs and having a stable name for them.
+**Part 2:** `--tab <n|id|title>` on send/wait/attach/logs, tabs
+listed in `status`, and `tab -p` (protocol v6). Split because part 2 depended
+on the selector decision and part 1 did not.
+
+**`tab_id` is covered end to end** (the risk part 2 was told to close first):
+`e2e/specs/cli.e2e.ts` drives the real socket and asserts a tab opened by
+`termic tab` is addressable by the id that command returned (`logs --tab`,
+`send --tab`, `tab -p` delivery, `status` listing), so dropping or miswiring
+`PtyRole.tab_id` in TerminalPane's spawn call goes red there instead of
+surfacing as a mystery in a user's script.
+
+**How part 2 resolves selectors.** The webview's pushed snapshot
+(cliAgentState.ts) carries per-tab entries (`tab_states`: id, kind, cli,
+title, per-tab work state, queue, liveness, defaultness) in strip order; one
+Rust resolver (`resolve_tab_selector`) serves send, wait, attach and logs
+from it: exact id first, then 1-based index (the numbering `status` prints;
+editor tabs are not listed and do not shift it), then case-insensitive
+title/cli match. The STRIP is the whole surface, by decision: pane-split
+leaves and right-panel split agents are not listed and no selector reaches
+them (a right-split agent still counts in `sessions`). They become
+addressable only if they are ever folded into the strip model; listing them
+would break the "row n of status = `--tab n`" contract. Ambiguity errors listing the candidates. Only agent tabs
+resolve (the write-only rule below). With no snapshot yet, an EXACT persisted
+id still resolves so scripts keep working; index/title honestly error.
+`attach`/`logs` then map the id to the tab's own PTY via `PtyRole.tab_id`
+(`find_tab_pty`, no default-tab fallback); `send` passes the resolved id to
+`send_prompt`, where the store re-validates it (the cache can trail a
+just-closed tab); `wait --tab` narrows `watch_agent` to that tab's entry, so
+a sibling tab can neither satisfy nor stall it. `send --tab --wait` still
+does NOT trust a pre-existing done as its own turn settling: per-tab state
+removes sibling pollution but not the cache-trails-the-store race on the
+target itself, and the tab you target is often exactly the one wearing a
+stale done badge (pinned by send_tab_wait_ignores_the_targets_stale_done).
+`tab -p` is
+`new_tab` followed by `send_prompt` targeted at the returned id with a
+spawn-pending flag (wait for the racing PTY, don't refuse it): one delivery
+recipe, exactly the reuse the TabData note demanded.
+
+**Picking what to open is the hard part, and it is not a binary.** The GUI's
+"+" menu already offers three distinct things and gates them: `kind: "agent"`
+registry entries (filtered by `visibleCliIds` to enabled AND detected-installed),
+`kind: "terminal"` custom entries (#27, which never resume and never take YOLO
+args, `isTerminalCli`), and the task's aux shell. A `--agent | --shell` binary
+would model none of that. So:
+
+- **`termic tab <task> --agent <id>`** resolves `<id>` against the registry and
+  fails if it is unknown, `disabled`, or not detected on PATH. The GUI simply
+  hides those; the CLI must say why rather than spawn a PTY that dies on exec.
+  The error lists the ids that WOULD work, since an agent driving this has no
+  menu to look at. `help --json` cannot carry the list (the registry is
+  per-user and mutable), so `status`/`list` are where it becomes discoverable.
+- **`--terminal <id>`** for `kind: "terminal"` entries, kept separate from
+  `--agent` for the same reason `--shell` is: the kinds differ in resume, YOLO
+  and sandbox behaviour, so one `--kind <string>` flag would let a typo land
+  you in the wrong semantics silently.
+- **`--shell`** opens a plain login shell tab in the strip. NOTE this is not
+  the aux terminal `attach --shell` resolves; that is a separate pane.
+
+**Terminal tabs are write-only from the CLI, and that is accepted.** `--shell`
+and `--terminal` tabs open and are fully usable in the window, but `attach`
+and `logs` cannot reach them and no output ring is kept, because only agent
+tabs carry a `PtyRole` and that is what both resolve against. Everything else
+that separates the kinds follows from the same place: no work-done detection
+(so `--wait` means nothing for them), no resume, no YOLO args, and shells are
+not persisted across a restart. SANDBOXING IS A SEPARATE SWITCH, keyed on
+`pty_spawn`'s `task_id` argument rather than on the role: terminal tabs are
+deliberately never caged, which is what makes them usable for git and ssh
+(#32). Giving them a role would make them addressable without
+caging them, but that is the wrong way round: it would put an UNCAGED PTY on
+the control socket where it can be driven remotely. Not an escalation (a caged
+agent cannot reach the socket, and `attach --shell` already drives the uncaged
+aux terminal), but it widens the socket's reach for no use case we have. The
+retained-output ring per shell is the smaller cost. Part 2 kept the rule (its
+selectors refuse non-agent tabs); revisit only if a real need to drive a
+shell from a script turns up.
+- **Omitted** = the task's own `cli`, i.e. "another one of what this task
+  already runs", which is the common case and matches what the `+` button
+  does before you pick anything.
+
+Sandbox follows kind, not flag: an agent tab inherits the task's sandbox pin,
+`terminal`/`shell` tabs are uncaged exactly as the GUI's are (only the agent
+CLI PTY is the threat model, docs/sandbox.md). That asymmetry is the whole
+reason the kinds are separate flags.
+
+Then the targeting half (landed):
+
+- **`--tab <n|id|title>` on `send` / `wait` / `attach` / `logs`.** Absent =
+  the default agent tab, so every existing invocation keeps its meaning.
+- **`status` lists tabs**: index, kind, agent, title, per-tab work state,
+  queue depth, liveness, defaultness. Additive fields on `TaskStatus`
+  (`tabs: Option<Vec<TabStatus>>`; `None` = the webview has not answered,
+  which must not render as an empty strip).
+
+Decisions, settled and shipped:
+
+- **Selector stability: tab ids are the identity.** Index shifts
+  when a tab closes and titles are agent-authored and change mid-turn (the
+  same OSC stream the work-done classifier reads, lib/terminalTitle.ts), so
+  neither can be the identity. The webview already minted a uuid per tab; it
+  is carried on `PtyRole.tab_id`, so Rust resolves a selector without a
+  webview round-trip. `termic tab` prints it. Index and title are human
+  conveniences that resolve to it.
+- **Ambiguity is an error, not a guess.** Two tabs titled `claude` fail
+  with both selectors printed, the same shape as the existing ambiguous-task
+  error, rather than picking the lower index.
+- **`attach --shell` stays** as the alias for "the aux terminal" (it is
+  shipped surface and the aux pane is not a strip tab, so `--tab` cannot
+  reach it); the two flags conflict rather than quietly overlapping.
+- **Resuming a closed tab.** The `+` menu offers it (`closedTabs`), and the
+  CLI has no equivalent at any level. Out of scope here, but it is the obvious
+  next ask once tabs are addressable, and `--tab` selectors are what it would
+  hang off. `tab close` (below) made it the NEXT ask rather than a
+  hypothetical one: the CLI can now produce `closedTabs` entries it cannot
+  reopen.
+- **`tab -p` landed WITH targeting, not before.** `send_prompt` is the
+  confirmed delivery route, and it used to pick only from a task's sendable
+  agent tabs; `-p` is `new_tab` followed by `send_prompt` targeted at the id
+  it returned. Writing a second injection recipe instead would have
+  reintroduced exactly the silently-dropped prompt Phase 1 exists to prevent.
+
+Protocol impact was additive (optional fields end to end), landing as the
+v5 -> v6 bump, not a breaking change.
+
+### Closing a tab (GH #185, protocol v10)
+
+Part 1 and 2 made tabs creatable and addressable but not removable, so
+anything opening tabs programmatically littered the strip. The reported case:
+an agent orchestrating reviews opened two claude tabs and had no way to clean
+up. `send --tab -p "/exit"` is a request, not a close (claude answered with
+its exit-confirm menu, and the result was two EXITED tabs still in the strip);
+task-level `archive` is the wrong hammer, it takes every tab including the
+orchestrator's own session.
+
+`termic tab close [<task>] --tab <sel> [--yes]`. Shaped as a subcommand of
+`tab` rather than a flat verb so the strip's operations stay together and the
+sibling resume verb has somewhere to land. The one cost: a task literally
+named `close` cannot be `tab`'s bare first positional, because clap matches
+the subcommand first. Leading with a flag (`termic tab --agent claude close`)
+still reaches it; pinned in `tab_close_parses_without_shadowing_the_tab_verb`.
+
+Decisions worth keeping:
+
+- **Selectors are `resolve_tab_selector`, with the agent gate lifted.** Same
+  id / index / title precedence and the same ambiguity error, but `tab close`
+  passes `TabReach::AnyStripTab` where every other verb passes `AgentsOnly`.
+  The write-only rule exists because driving an uncaged PTY remotely is a
+  real risk, and closing is not driving: nothing goes in, nothing comes out.
+  `termic tab --shell` can OPEN a shell tab, so refusing to close one would
+  leave litter with no way to sweep it, which is the whole complaint in #185.
+  Pane-split tabs stay unreachable (both resolver paths filter them) and the
+  webview refuses one anyway, because `closePaneTab` is the correct action
+  for those and `closeTab` is not.
+- **The tab is dropped BEFORE anything dies**, and this ordering is the whole
+  ballgame. The first cut did the reverse (SIGTERM the agent, wait out a
+  1.5s grace so it could flush its session transcript, then close the tab),
+  reasoning that a closed tab is the one most likely to be resumed. Review
+  killed it, correctly: that window leaves `TerminalPane` MOUNTED over a
+  dying agent, and its exit handler cannot tell an induced death from a
+  voluntary one. It raises an "agent exited" attention, which becomes a
+  desktop notification because `isUserWatching` is false for a CLI caller by
+  definition; and within `RESUME_FAILURE_MS` of a resume it takes the
+  failed-resume branch and clears the tab's `session_id` in memory AND on
+  disk, so `closeTab` then snapshots `sessionId: ""` into `closedTabs`. The
+  grace meant to protect the session pointer was destroying it. Dropping the
+  tab first unmounts the pane and the exit becomes nobody's business, which
+  is exactly why the window's close button never had either problem. Net
+  effect: identical to that button, which is what GH #185 asked for.
+- **The server still sweeps the tab's PTY afterwards.** The webview's kill is
+  fire-and-forget (`ipc.ptyKill(...).catch(() => {})`), so the sweep is what
+  makes termination a guarantee by the time the verb answers rather than a
+  hope. It normally finds nothing, and only agent tabs carry the `PtyRole` it
+  resolves, so `killed_pty` is OR-ed with a `killedPty` flag the webview
+  returns: for a roleless tab the store is the only side that knows a process
+  was running.
+- **Closing the LAST strip tab notifies the whole task.** That close puts the
+  task to sleep, unmounting its `TaskView` and taking the aux shell and any
+  split-pane agent with it. Those carry their own attach sessions that no
+  per-tab notify reaches, so they would get a bare disconnect; one tab left
+  on the strip means `notify_detach` fires too. With siblings still open it
+  deliberately does NOT, since telling every attached sibling its session is
+  ending is the blast radius this verb exists to avoid.
+- **The resolver now returns what it already knew** (cli, title, defaultness)
+  instead of just the id. Re-reading the snapshot to answer "is this the
+  default?" would let it shift between resolving and deciding.
+- **The default tab needs `--yes`, live or not.** It is what every
+  unqualified `send`/`wait`/`attach` resolves to, so closing it silently
+  changes what the caller's other commands talk to. Deliberately NOT relaxed
+  for an exited default tab: liveness is not the question, and the default tab
+  is durable, so "it looked dead" is not evidence that closing it is free. A
+  hard refusal, not a TTY prompt: unlike `archive`, the common case (a
+  secondary tab) needs no confirmation at all, and the audience is scripts.
+- **SIGTERM then SIGKILL, not the GUI's outright kill.** The `×` does a bare
+  `pty_kill`; the CLI path takes the `stop_task_ptys` grace instead (GH #185
+  reuses the reasoning from the archive fix). An agent killed on the first
+  signal never flushes its session transcript, and a closed tab is precisely
+  the one someone plans to come back to: the `closedTabs` entry stores its
+  session id, and only a flushed transcript makes that id resumable. Still no
+  `/exit` negotiation, and termination is still guaranteed. **The GUI's `×`
+  keeps the abrupt kill** and should probably adopt the grace too; out of
+  scope here.
+- **Attached clients get the in-band reason first**, the archive precedent,
+  via a per-TAB `notify_tab_detach` (reason `"closed"`, exit 11). Task-scoped
+  `notify_task_detach` would have told every attached sibling that its
+  session was ending, which is exactly the blast radius `tab close` exists to
+  avoid.
+- **The webview refuses a task that is not mounted**, symmetric with `termic
+  tab`, which refuses a stopped task because mounting it would respawn every
+  agent. Measured behaviour behind that, since the reasoning is easy to get
+  wrong: `closeTab` always ends in `syncDurableTabs`, which rebuilds
+  `persisted_tabs` from whatever tabs the STORE holds. Three cases, checked
+  against the real store rather than argued from the code:
+  - Task never opened this session (store holds no tabs): it writes back the
+    default tab ALONE, so every secondary agent's session id is gone from
+    disk, and nothing was closed. Real loss.
+  - Stopped task (GH #119 evicts it from `mountedTasks` but KEEPS its tabs):
+    closes correctly and forgets exactly the tab asked for.
+  - Mounted task, unknown tab id: durable set untouched.
+
+  So the hazard is the first case only, and it is **fixed at the source**:
+  `closeTab` now re-syncs the durable set only when a tab actually went (the
+  `reorderTab` pattern, three lines), so the store cannot be talked into that
+  write by any caller. `app.test.ts` pins it. The two refusals in the handler
+  stay as layers over it: unknown-tab is what a bad id hits, and the mounted
+  check exists for the MESSAGE, so a caller hears "the task is not open"
+  instead of a baffling "that tab no longer exists" about a tab `termic
+  status` is listing. The mounted check is deliberately stricter than the
+  hazard, refusing the stopped case too, which would have worked; it keeps
+  open and close symmetric, since `termic tab` refuses a stopped task as well.
+
+  Worth stating plainly: no GUI path ever passed `closeTab` an id it was not
+  rendering, so this was a hazard the CLI would have INTRODUCED, not a bug
+  main was carrying. It is the one thing this feature changed outside its own
+  surface.
+- **`close_tab` calls the store's `closeTab`, not `requestCloseTab`.** The
+  latter is the confirm gate, and a modal in a windowless app driven by a
+  script would hang the socket until the read timeout.
+
+Protocol went v9 -> v10. Additive in shape, but a new `cmd` value is what a v9
+server rejects as malformed, which is the skew the version gate exists to turn
+into "Termic updated, rerun your command".
+
 ## Agents as users (discoverability)
 
 The CLI's second audience is the agents themselves, and an agent only uses a
@@ -360,13 +685,10 @@ tool it can discover. Two pieces, cheap because the mechanisms exist:
   parsing prose; under future scoped tokens it reflects the caller's
   effective scope, so a scoped agent learns exactly what it may do.
 
-This is the path to #59's workflow with no MCP required: the agent sees
+This is the path to #59's workflow: the agent sees
 `TERMIC_CLI` in its env, runs `termic help`, and calls
-`termic new fix-auth -p "..."` directly. That is the whole of #59, which is
-why the `termic mcp` shim it was written against is now parked under
-discussion rather than scheduled (see Phasing): it was the MCP-native upgrade
-for orchestrators that want tools instead of a shell, and no such orchestrator
-exists here yet. Env advertisement and the help conventions land with Phase 1,
+`termic new fix-auth -p "..."` directly. That is the whole of #59, and it
+was closed on that basis. Env advertisement and the help conventions land with Phase 1,
 when the verbs an agent needs exist.
 
 Two conventions field testing settled (Phase 1):
@@ -395,9 +717,8 @@ Two conventions field testing settled (Phase 1):
   `CLAUDE.md`, or any agent's instruction channel. A vendor-specific
   skill wrapper was considered and rejected: Claude-only distribution
   is not worth maintaining a second copy. Phase 2 adds an install
-  action for the block. `termic mcp` would supersede all of it for
-  MCP-native orchestrators, but it is parked under discussion (see
-  Phasing), so the instructions block is the distribution story.
+  action for the block; the instructions block is the distribution
+  story.
 
 ## Security: the socket is a sandbox boundary
 
@@ -566,9 +887,26 @@ The CLI's `--version` reports the APP version, not the crate version: it is
 injected at build time via `TERMIC_APP_VERSION` (set by `src-tauri/build.rs`
 and `scripts/build-cli.mjs`, read through `option_env!` with the crate version
 as the dev fallback), so a bundled CLI is always versioned with the app it
-ships in. The hello handshake carries a protocol version anyway, so a later
-Homebrew formula (CLI-only installs, version skew becomes real) needs no
-protocol change.
+ships in. The hello handshake carries a protocol version anyway, so a
+CLI-only Homebrew formula would need no protocol change. It is still not
+being built (see below).
+
+### Homebrew
+
+- **Cask: done.** `brew install --cask simion/termic/termic` ships the app;
+  `release.yml` bumps its version + sha256 in the tap on every release.
+- **CLI-only formula: not doing it.** `brew install termic` would hand you a
+  client with no server. The app IS the daemon, so a standalone CLI has
+  nothing to talk to and cannot even auto-launch one. It would also break
+  `--version` reporting the app version, and reintroduce the version skew
+  this design avoids by bundling.
+- **Not a cask `binary` stanza either.** That would put `termic` on PATH for
+  everyone, which Landing rules out: the binary stays off PATH until the user
+  runs the install action.
+
+If CLI-first distribution is ever wanted, it means the rejected pattern-2
+architecture (standalone CLI over a shared core), not a formula wrapping a
+client whose server is missing.
 
 ## Phasing
 
@@ -691,12 +1029,52 @@ protocol change.
   - The "install the instructions block" Settings action stayed
     unbuilt; docs/cli-agent-instructions.md remains paste-your-own.
 - **Phase 3**: windowless daemon mode (activation policy + run without a
-  window), Homebrew formula, `termic events --json` (standing subscription:
-  one JSON line per task event - done, waiting, created - fed by the same
-  settle signal as `--wait`). The event stream is also what would make
-  app-side hooks ("on task done, run this command" in settings) trivial
-  later; hooks themselves are a separate future feature, not part of this
-  plan.
+  window), `termic quit`, tab management inside a running task (GH #138, see
+  "Tabs inside a running task").
+
+  `termic events --json` (a standing subscription: one JSON line per task
+  event, done / waiting / created) is SEQUENCED BEHIND agent hooks rather
+  than deferred indefinitely. The order is the whole point. Termic's settle
+  detection is heuristic by product design (PTY-native, so done-ness is
+  inferred from title signals and output scans), and `--wait` carries that
+  caveat in --help because its blast radius is one command with a human
+  watching. An event stream is a VERSIONED PUBLIC API consumed by scripts
+  with nobody watching, so publishing `{"event":"done"}` on a guess means
+  owning those semantics forever. Installing Claude Code Stop/Notification
+  hooks into spawned agents replaces the guess with exact push-based
+  signals; build the stream on that. So the work item is HOOKS FIRST, then
+  the stream, Claude-only at first, with the heuristic staying as the
+  fallback for agents that have no hook surface. Neither is scheduled yet;
+  what is settled is that the stream does not ship before the hooks.
+
+  `termic quit` (protocol v4): the only shell-side teardown for a
+  windowless instance, since the menu-bar Quit is otherwise the sole
+  affordance and a user who picked "Keep in Menu Bar" plus don't-ask-again
+  needs one that does not involve the mouse. Notes:
+  - Authenticated, like every destructive verb. Caged agents cannot reach
+    it at all (seatbelt denies the socket), same as `archive`.
+  - Two-step: `preview` reports what WOULD die so the confirmation can
+    name it, then the commit. The preview must never tear anything down.
+  - Confirms on a TTY unless `--yes`, with the reconnect-after-confirm
+    `archive` uses (a human outlasts the 30s idle timeout).
+  - The server replies BEFORE exiting, and the teardown is triggered by
+    the connection thread AFTER its write returns, not by a fixed grace.
+    A timer cannot be sized: the serving thread can be descheduled past
+    any constant on a machine busy running agents, and a successful quit
+    would then be reported as CONNECTION_LOST. The flag is thread-local,
+    since one thread per connection means a global would let a concurrent
+    request consume it and quit before the quitting client's reply lands.
+  - Never auto-launches, and exits 0 when Termic is not running ON THE
+    DEFAULT SOCKET: starting the app to stop it is absurd, and a teardown
+    script should not need `|| true`. With TERMIC_SOCKET set explicitly a
+    missing socket is a misconfiguration and still exits 4 - reporting
+    success there would tell a script it had stopped agents that are in
+    fact still running.
+  - Live-agent counts come from the PTY map (ground truth for what gets
+    SIGKILLed), filtered to agent-kind roles so the aux shell and
+    setup/run script tabs are not counted as agents. The working count is
+    per TASK (the work-state cache aggregates that way), reports 0 when
+    stale, and is clamped to the task count.
 
   Windowless mode implemented, where measurement refined the sketch:
   - The trap's "keep the webview alive hidden" branch WON on evidence, so
@@ -733,32 +1111,72 @@ protocol change.
     user has seen one, the dock icon persists for the process lifetime,
     matching Mail/Messages.
 
-### `termic mcp`: under discussion, NOT approved
+### Phase 4: prompt library
 
-A stdio<->socket shim (~a day) that would make termic drivable by any MCP
-client - an outer Claude Code session orchestrating termic tasks - with the
-same auth and policy, no new surface. The converged pattern in the space
-(vibe-kanban, container-use).
+Implemented; protocol v9. The prompt library (builtins + custom
+prompts) was GUI-only; Phase 4 puts it on the CLI so scripts and
+agents can fire curated prompts without pasting bodies around.
 
-Parked 2026-07-24, the day 0.24.0 shipped the CLI. Not rejected on the merits:
-it is an overcomplication for the users that exist today. #59 is the use case
-it was meant to serve, and Phase 1's CLI closes that issue on its own (the
-agent reads `$TERMIC_CLI` from its env and runs `termic new`), so building it
-now means maintaining a second surface for nobody. #59 was closed saying as
-much.
+- **`termic prompts [--json]`** (plural, matching `agents`) lists id,
+  title, builtin/custom, enabled, modified. `termic prompts show <sel>`
+  prints the body, pipe-friendly.
+- **`-P/--library <sel>` on `new`, `send`, and `tab`**; `-p/--prompt`
+  stays literal text. The two COMPOSE: `-P` + `-p` delivers the library
+  body, a blank line, then the text, and `-p -` still reads stdin. That
+  composition is the cross-agent handoff enabler:
+  `termic result plan | termic new review --agent codex -P
+  builtin:review -p -`.
+- **Selectors mirror `resolve_tab_selector`'s identity philosophy**
+  (the stable id is the identity, the title is a convenience): exact id
+  first (`builtin:review`, custom UUID), then case-insensitive exact
+  title; ambiguity errors listing the candidates with ids, no match
+  errors pointing at `termic prompts`. Deleted builtins do not exist.
+  DISABLED prompts are fireable by explicit selector: disabled means
+  hidden from the dropdown, not dead. Documented contract: pin ids in
+  scripts, use titles interactively.
+- **Resolution happens in the webview at fire time** against the live
+  prompt store (`computePrompts`, src/store/prompts.ts), so user
+  overrides/renames/deletions are always current and unedited builtins
+  keep tracking shipped defaults.
+- **Plumbing**: a new read-only webview RPC `list_prompts` (the
+  cliRpc.ts registry); a Rust-side `resolve_prompt_selector` in
+  cli_server.rs substitutes the body into the existing confirmed
+  `prompt` path; the proto gains a `Prompts` command and an optional
+  `prompt_ref` on `New`/`Send`/`Tab`. `-P` errors resolve BEFORE task
+  creation or spawn (fail fast). Windowless mode works (the webview
+  runs). Sandbox posture unchanged: caged agents get no CLI surface,
+  listing included.
+- Phase 4 stays clear of `events --json`, which stays sequenced behind
+  hooks.
 
-What would reopen it: an MCP client with NO shell tool that someone actually
-wants to orchestrate termic from (Claude Desktop, an IDE plugin without a
-terminal). Nothing running inside Termic qualifies - every agent there has a
-PTY, which is the whole point of the app - so the case has to come from
-outside. The context-window objection that killed it the first time (an MCP
-tool definition costs tokens in every session; a CLI costs nothing until it
-runs, @MHohlios on #59) applies to that client too, so "someone asked" is not
-sufficient on its own.
+Implementation notes, where reality refined the sketch:
 
-If it is ever built, the design constraint stands: keep the tool count minimal
-and GENERATE the tool definitions from the same `help --json` metadata, so the
-CLI and MCP surfaces cannot drift.
+- `prompts show` is not a second wire verb: one `Prompts { selector }`
+  command either lists (no bodies) or resolves one entry (body
+  included), so the two CLI forms cannot drift.
+- `send.prompt` became optional on the wire (serde default) so `-P`
+  stands alone; the server rejects a request where both are empty.
+- Composition normalizes the body's trailing newlines, so the seam is
+  exactly one blank line however the prompt was authored. A prompt
+  with an EMPTY body is refused by name (the empty `-p` rule: an empty
+  prompt would mint a delivery id nothing ever reports on).
+- `help --json` renders a parent verb with an OPTIONAL subcommand
+  (`prompts` beside `prompts show`); the old loop emitted nested
+  entries only, which would have hidden the bare list form from the
+  machine surface.
+- With `-P`, `-p -` tolerates EMPTY stdin (it means "no extra text"):
+  the handoff pipe must not die when the upstream produced nothing.
+  Without `-P`, empty stdin stays a hard error, since there would be
+  nothing to send at all.
+- The list form fetches no bodies over the webview RPC (`bodies:
+  false`; the builtins alone are ~16 KB per call). Wire budgets follow
+  the logs/diff rule but with a twist: `prompts show` trims an
+  oversized body and flags it `truncated` plus a stderr warning, never
+  marker text inside the body, because `show` pipes into agents and a
+  marker would arrive as instructions. Titles (user-authored, no length
+  cap in Settings) are clipped for the wire, and the COMPOSED prompt
+  re-checks the CLI's 900 KB gate server-side, since `-P` substitutes
+  the body after that gate ran on the literal alone.
 
 ## Testing
 

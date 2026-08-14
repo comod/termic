@@ -34,6 +34,11 @@ export interface Project {
   id: string;
   name: string;
   root_path: string;
+  /** Per-project OVERRIDE of the global `Settings.default_tasks_path`. Empty
+   *  (the normal case) means "follow the global setting", which the Repository
+   *  page surfaces as the field's placeholder. Absolute values are the
+   *  project's worktree root verbatim; relative ones resolve against
+   *  `root_path`. */
   tasks_path: string;
   /** The ref new worktree tasks are branched from. Written by both the project
    *  `+` menu's "Branch from" picker and Settings → Repository. */
@@ -167,6 +172,11 @@ export interface Task {
   created: string;
   archived: boolean;
   archived_at?: string;
+  /** Manual sidebar position within the project, written by drag-to-reorder
+   *  (`taskReorder`). Undefined on tasks the user has never dragged, which
+   *  sort AFTER any ordered sibling — so untouched projects stay in creation
+   *  order and a newly created task appends at the bottom. */
+  order?: number;
   /** True when this task points at the project's main repo checkout
    *  (no git worktree). The UI shows a distinct icon and archive only
    *  removes the entry — the repo on disk is untouched. */
@@ -312,6 +322,9 @@ export interface CreateTaskArgs {
    *  "Custom command" in worktree mode). The default tab runs this through a
    *  login shell instead of an agent binary. Null/undefined for agent/shell. */
   custom_command?: string | null;
+  /** Externally-started session id the agent resumes on its first spawn
+   *  (GH #169): seeds `agent_session_ids[cli]`, same as an import. */
+  resume_session_id?: string;
 }
 
 export interface Agent {
@@ -454,6 +467,11 @@ export interface Settings {
    *  disabled CLI fails fast with a clear error rather than a launch
    *  timeout. See docs/plans/cli.md. */
   cli_enabled?: boolean;
+  /** One-time marker for the "CLI graduated, turn it on" migration (lib.rs,
+   *  `migrate_cli_enabled_default`). Backend-owned: the UI never writes it,
+   *  but it has to round-trip through the settings object the UI saves, or
+   *  the migration would re-fire and undo a user's opt-out. */
+  cli_default_migrated?: boolean;
   /** What the window's close button does. Absent/"ask" = show the close
    *  prompt (whose "Don't ask again" checkbox writes the choice back here);
    *  "menubar" = close to the menu bar, agents keep running; "quit" = quit
@@ -471,6 +489,15 @@ export interface Settings {
    *  omits it). Pre-filled with the common agent dirs; an empty list disables
    *  the linking. Absent = the pre-filled defaults, not off. */
   worktree_symlink_paths?: string[];
+  /** Where new task worktrees are created, for every project that doesn't
+   *  override it in Settings → Repository → Tasks path. An absolute value
+   *  (`/vol/work`, `~/code/worktrees`) collects every project under it, one
+   *  subdir per project folder name; a relative value (`worktrees`,
+   *  `../tasks`) resolves against each project's own directory instead.
+   *  Required: seeded with `~/termic/tasks` rather than left blank, so the
+   *  field shows a real value. Optional here only because older profiles
+   *  predate it; the backend fills it in on load. */
+  default_tasks_path?: string;
 }
 
 /** Install state of the bundled CLI on PATH (cli_install_status). */
@@ -656,7 +683,7 @@ export type { SplitDir, SplitNode, PaneLeaf, SplitTree } from "@/lib/splitTree";
 
 // ───────────────────────────── tab model (frontend only) ─────────────────────────────
 
-export type TabType = "terminal" | "diff" | "edit";
+export type TabType = "terminal" | "diff" | "edit" | "dir";
 
 export interface BaseTab {
   id: string;
@@ -874,7 +901,30 @@ export interface EditTab extends BaseTab {
   remoteImagesUnblocked?: boolean;
 }
 
-export type Tab = TerminalTab | DiffTab | EditTab;
+/** GitHub-style folder view (issue #151): the file/folder listing a
+ *  directory link in a markdown preview opens, plus that folder's README
+ *  rendered underneath. Has no buffer and is never dirty, so it needs
+ *  none of EditTab's save/reveal machinery. */
+export interface DirTab extends BaseTab {
+  type: "dir";
+  /** Task-root-relative directory path. "" is the task root itself. */
+  path: string;
+  /** Folders visited in THIS tab, oldest first, driving ⌘[ / ⌘]. Browser
+   *  semantics: navigating after going back truncates everything ahead.
+   *  Reset when the preview slot recycles to a different target, so a
+   *  previous occupant's trail is never walkable from the new one. */
+  dirHistory?: string[];
+  /** Cursor into `dirHistory`. At either end the shortcut declines the key
+   *  and lets it fall through to previous/next task, so ⌘[ only diverts
+   *  from task switching when it actually has somewhere to go. */
+  dirHistoryIndex?: number;
+  /** Per-document remote-image unblock for the rendered README, exactly
+   *  as on EditTab (issue #69). Session-only; cleared when the preview
+   *  tab slot recycles to another target. */
+  remoteImagesUnblocked?: boolean;
+}
+
+export type Tab = TerminalTab | DiffTab | EditTab | DirTab;
 
 /** Mirror of `repo_config::RepoConfig` (src-tauri/src/repo_config.rs).
  *  Parsed from the repo-root `.termic.yaml` — committed, team-shared

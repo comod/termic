@@ -56,7 +56,8 @@ export type ShortcutId =
   | "zoom-out"
   | "zoom-reset"
   | "stage-file"
-  | "discard-file";
+  | "discard-file"
+  | "add-selection-to-agent";
 
 export type ShortcutGroup = "Navigation" | "Tabs" | "Terminal" | "Git" | "General";
 
@@ -84,8 +85,10 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
   { id: "sidebar-next", group: "Navigation", label: "Next sidebar row",
     hint: "Task or expanded tab below", defaultBinding: B("ArrowDown", { alt: true }) },
   { id: "task-prev", group: "Navigation", label: "Previous task",
+    hint: "In a folder listing with somewhere to go back to, this is back instead.",
     defaultBinding: B("[", { cmd: true }) },
   { id: "task-next", group: "Navigation", label: "Next task",
+    hint: "In a folder listing with somewhere to go forward to, this is forward instead.",
     defaultBinding: B("]", { cmd: true }) },
   { id: "task-prev-arrow", group: "Navigation", label: "Pane up / previous task",
     hint: "With a horizontal split: focus the pane above. Otherwise: go to the previous task.",
@@ -171,6 +174,15 @@ export const SHORTCUT_DEFS: ShortcutDef[] = [
     hint: "Scale the whole app down", defaultBinding: B("-", { cmd: true }) },
   { id: "zoom-reset", group: "General", label: "Reset zoom",
     hint: "Return the app to 100%", defaultBinding: B("0", { cmd: true }) },
+  // Contextual (editor): handled in EditorPane, not the global switch, and
+  // only when that editor holds focus AND has a non-empty selection. Any
+  // other time the key falls through untouched. ⇧⌘L is the convention every
+  // agent-first editor landed on for this (Cursor's "Add selection to Chat",
+  // VS Code Copilot's "Add Selection to Chat"), and it sits next to termic's
+  // own ⌘L "focus main agent".
+  { id: "add-selection-to-agent", group: "General", label: "Add selection to agent",
+    hint: "Opens a comment on the selected lines. Comments queue up and go to the agent as one batch, so you can mark several places before sending.",
+    defaultBinding: B("l", { cmd: true, shift: true }) },
 
   // Git — contextual: these act on the file selected in the Git panel and
   // are handled there (GitPanel), not the global handler. The discard

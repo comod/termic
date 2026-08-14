@@ -302,7 +302,11 @@ function TreeNode({ taskId, entry, depth, rel, root, expanded, children_, toggle
   // deleted (the entry itself, or anything beneath it when it's a folder).
   function closeStaleTabs(p: string) {
     for (const t of tabs) {
-      if ((t.type === "edit" || t.type === "diff") && (t.path === p || t.path.startsWith(`${p}/`))) {
+      // "dir" included (issue #151): a folder listing is just as stale as an
+      // editor once its folder is renamed or deleted, and leaving it open
+      // parks the tab on a path that no longer resolves.
+      if ((t.type === "edit" || t.type === "diff" || t.type === "dir")
+          && (t.path === p || t.path.startsWith(`${p}/`))) {
         closeTab(taskId, t.id);
       }
     }
@@ -383,6 +387,10 @@ function TreeNode({ taskId, entry, depth, rel, root, expanded, children_, toggle
     }
   }
 
+  // Double-click pins the preview tab, the Sublime/VS Code/JetBrains gesture
+  // (single click = temporary preview, double = keep). Opening the file in its
+  // OS default app lives in the right-click menu instead (CopyPathItems), where
+  // every one of those editors also puts it. See the discussion on GH #147.
   function onDoubleClick() {
     if (entry.is_dir) return;
     const existing = tabs.find(t => t.type === "edit" && t.path === rel);

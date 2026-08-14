@@ -23,12 +23,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
@@ -53,10 +53,18 @@ pub struct Project {
     /// the shared CLAUDE.md / AGENTS.md / .claude/ and acts as the
     /// task wrapper when a multi-repo task is created.
     pub root_path: String,
-    /// Root dir under which this project's worktree tasks are created
-    /// (`<worktrees_base>/<slug>`). `alias = "workspaces_path"` reads
-    /// projects.json written before the workspace->task rename; without it
-    /// the field loads empty and new worktrees get a relative path.
+    /// Per-project OVERRIDE of the global `Settings.default_tasks_path`: the
+    /// root dir under which this project's worktree tasks are created
+    /// (`<tasks_path>/<task slug>`). Empty (the normal case) means "follow the
+    /// global setting"; an absolute value is that root verbatim and a relative
+    /// one resolves against `root_path`. See `project_tasks_root`, the single
+    /// resolver, and `normalize_default_task_paths`, which reads a value that
+    /// only restates the built-in default as the empty it means.
+    ///
+    /// `alias = "workspaces_path"` reads projects.json written before the
+    /// workspace->task rename; without it the field loads empty, which since
+    /// this became an override is silently the DEFAULT location rather than a
+    /// visibly broken relative path.
     #[serde(alias = "workspaces_path")]
     pub tasks_path: String,
     pub base_branch: String,
@@ -362,6 +370,14 @@ pub struct Task {
     /// Persisted so relaunch can restore the split configuration.
     #[serde(default)]
     pub split_layout: Option<String>,
+    /// Manual sidebar position within the task's project, assigned by
+    /// `task_reorder` on drag-and-drop. `None` on every task the user has
+    /// never reordered, and that is the point: `load_tasks` sorts `None`
+    /// AFTER any `Some`, so untouched projects keep pure creation order
+    /// (the pre-drag behavior) and a task created after a reorder still
+    /// appends at the bottom instead of jumping to the top.
+    #[serde(default)]
+    pub order: Option<u32>,
 }
 
 /// One durable agent tab. `session_id` is termic's own per-tab session
@@ -539,6 +555,11 @@ pub struct CreateTaskArgs {
     /// Mirrors the repo-root custom-command path in `task_open_repo`.
     #[serde(default)]
     pub custom_command: Option<String>,
+    /// Externally-started session id the agent resumes on its first spawn
+    /// (GH #169): seeds `agent_session_ids[cli]`, same as an import. The id
+    /// is unvalidated by design; the agent owns "session not found".
+    #[serde(default)]
+    pub resume_session_id: Option<String>,
 }
 
 // ───────────────────────────── paths ─────────────────────────────
@@ -578,10 +599,171 @@ fn tasks_dir() -> Result<PathBuf> {
     fs::create_dir_all(&p)?;
     Ok(p)
 }
-fn worktrees_base() -> Result<PathBuf> {
-    let p = dirs::home_dir().ok_or_else(|| anyhow!("no home"))?.join(APP_DIR).join("tasks");
-    fs::create_dir_all(&p)?;
-    Ok(p)
+/// The built-in "Default tasks path", as the literal `~/<APP_DIR>/tasks`
+/// string the setting is SEEDED with (the field is required, so it carries a
+/// real value rather than an empty "unset"). Kept tilde-form: it's what the
+/// user sees in Settings, and `expand_home` resolves it at use time.
+fn builtin_tasks_path() -> String {
+    format!("~/{APP_DIR}/tasks")
+}
+
+/// The same built-in as an expanded absolute path. Used by the migration and
+/// as the last-resort fallback if the stored value is somehow blank (a
+/// hand-edited settings.json must not break task creation). Infallible: a
+/// machine with no home dir would already be unusable.
+fn default_worktrees_base() -> PathBuf {
+    PathBuf::from(expand_tilde(&builtin_tasks_path()))
+}
+
+/// Resolve `.` and `..` segments LEXICALLY, without touching the filesystem
+/// (the path need not exist yet, and we must not follow symlinks).
+///
+/// This is load-bearing, not cosmetic. A relative tasks path like `../wt`
+/// resolves to `<repo>/../wt`, and `task_create` decides whether a directory
+/// it finds is a live worktree or a deletable orphan by comparing that string
+/// against `git worktree list --porcelain` — which reports CANONICAL paths.
+/// An unresolved `..` never matches, so a live worktree full of the user's
+/// uncommitted work would be classified as garbage and `remove_dir_all`ed.
+/// Normalizing here keeps the comparison honest (and keeps the path the UI
+/// shows readable).
+fn lexically_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            // Only a real segment can be popped; a `..` above the root falls
+            // through to the push arm and is kept rather than escaping.
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Reject a tasks root that would make worktrees land on top of the repo's
+/// own content. A relative tasks path of `.` resolves to the repo root
+/// itself, so a task named after any existing directory (`src`, `docs`)
+/// would take `task_create`'s orphan-cleanup branch and `remove_dir_all`
+/// tracked source. Same for an override pointing at the repo or any ancestor
+/// of it. `<repo>/worktrees` and `../wt` are unaffected — neither contains
+/// the repo.
+fn check_tasks_root(root: &Path, repo: &Path) -> Result<(), String> {
+    if repo.starts_with(root) {
+        return Err(format!(
+            "tasks path {} contains the repository itself, so new tasks would be \
+             created on top of your working tree. Pick a directory outside the repo, \
+             or a subdirectory of it.",
+            root.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// Does the repo track anything at `path`? `check_tasks_root` stops a tasks
+/// root that CONTAINS the repo, but a root nested INSIDE it (a relative
+/// default like `tasks`) can still collide with tracked content: a repo with
+/// a committed `tasks/migrate/` plus a task named "migrate" would hand
+/// `task_create`'s orphan cleanup a directory full of the user's source.
+/// Nothing outside the working tree is tracked, so a git error reads as
+/// "not tracked".
+fn git_tracks_path(repo: &Path, path: &Path) -> bool {
+    let arg = path.to_string_lossy().into_owned();
+    git(&["ls-files", "--", &arg], repo).map(|o| !o.trim().is_empty()).unwrap_or(false)
+}
+
+/// Does this tasks path name a fixed place on disk (`/…`, `~`, `~/…`), as
+/// opposed to somewhere relative to a project's own directory (`worktrees`,
+/// `./wt`, `../siblings`)? Both levels of the setting branch on exactly this.
+fn is_absolute_location(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('/') || t == "~" || t.starts_with("~/")
+}
+
+/// Per-project subdirectory under an ABSOLUTE tasks path, so projects sharing
+/// one root don't collide. Derived from `root_path`, which is immutable, NOT
+/// from `name`: the path is now resolved on every read rather than frozen at
+/// add time, so keying it on a renameable field would silently relocate a
+/// project's future worktrees the moment someone renamed it.
+///
+/// This matches what `project_add` baked into `tasks_path`, and matches
+/// `project_add_multi` too for the hosts it auto-creates (at
+/// `~/APP_DIR/projects/<slug>`, whose basename IS that slug). A multi-repo
+/// host pointed at a pre-existing directory whose basename differs from the
+/// slug simply fails the normalization compare and keeps its stored path, so
+/// those projects stay exactly where they are.
+///
+/// Not unique: two repos with the same folder name under one root collide.
+/// That predates this change (`project_add` had the same rule and no
+/// uniquing) and is left alone here.
+fn project_dir_name(p: &Project) -> String {
+    if let Some(name) = Path::new(&p.root_path).file_name().and_then(|s| s.to_str()) {
+        return name.to_string();
+    }
+    // Only a root-ish or empty root_path gets here.
+    let slug = slugify(&p.name);
+    if slug.is_empty() { "project".to_string() } else { slug }
+}
+
+/// Apply the GLOBAL "Default tasks path" rule to one project:
+///   - absolute  → `<default>/<project dir>`, so several projects can share
+///                 one root without colliding
+///   - relative  → `<project root>/<default>`, already project-scoped, so
+///                 nothing is appended
+///   - blank     → `~/<APP_DIR>/tasks/<project dir>`. The UI requires a value,
+///                 so this only catches a hand-edited settings.json.
+/// Pure (no settings IO) so the rule itself is testable; the callers below
+/// supply the stored value.
+fn tasks_root_from_default(default_path: &str, p: &Project) -> PathBuf {
+    let loc = default_path.trim();
+    let joined = if loc.is_empty() {
+        default_worktrees_base().join(project_dir_name(p))
+    } else if is_absolute_location(loc) {
+        PathBuf::from(expand_tilde(loc)).join(project_dir_name(p))
+    } else {
+        PathBuf::from(&p.root_path).join(loc)
+    };
+    lexically_normalize(&joined)
+}
+
+/// Full precedence: the project's own `tasks_path` override → `default_path`
+/// (the global setting) → `~/<APP_DIR>/tasks`. The absolute/relative rule
+/// applies at both levels; the one difference is that a project-level
+/// absolute path already names a single project's worktree root, so the
+/// project dir name is NOT appended to it. Pure, for the same reason as above.
+fn project_tasks_root_with(default_path: &str, p: &Project) -> PathBuf {
+    let over = p.tasks_path.trim();
+    if over.is_empty() {
+        return tasks_root_from_default(default_path, p);
+    }
+    let joined = if is_absolute_location(over) {
+        PathBuf::from(expand_tilde(over))
+    } else {
+        PathBuf::from(&p.root_path).join(over)
+    };
+    lexically_normalize(&joined)
+}
+
+/// Where a project's task worktrees land with NO project-level override, per
+/// the stored global setting. This is the value Settings → Repository shows as
+/// the "Tasks path" placeholder.
+fn project_tasks_root_default(p: &Project) -> PathBuf {
+    tasks_root_from_default(&load_settings_inner().default_tasks_path, p)
+}
+
+/// THE answer to "where do this project's worktree tasks go". Every
+/// worktree-creating path goes through this, and the safety check lives
+/// INSIDE it rather than at the call sites so a future third caller cannot
+/// obtain a root that swallows the repo and re-arm `task_create`'s
+/// `remove_dir_all` orphan branch. Takes the already-loaded global so a
+/// create doesn't re-read settings.json just for this.
+fn project_tasks_root(default_path: &str, p: &Project) -> Result<PathBuf, String> {
+    let root = project_tasks_root_with(default_path, p);
+    check_tasks_root(&root, Path::new(&p.root_path))?;
+    Ok(root)
 }
 
 // ───────────────────────────── projects IO ─────────────────────────────
@@ -601,6 +783,9 @@ fn load_projects() -> Vec<Project> {
     // something actually changed (load_projects runs on nearly every IPC).
     let mut dirty = migrate_legacy_members(&mut list);
     dirty |= repoint_task_bases(&mut list);
+    // Normalization, not a migration: never dirties the list on its own, but
+    // runs BEFORE the save so a write triggered above carries it for free.
+    normalize_default_task_paths(&mut list);
     if dirty {
         let _ = save_projects(&list);
     }
@@ -619,7 +804,7 @@ fn repoint_task_bases(list: &mut [Project]) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
     let sep = std::path::MAIN_SEPARATOR;
     let old_root = format!("{}{sep}", home.join(APP_DIR).join("workspaces").to_string_lossy());
-    let new_root = format!("{}{sep}", home.join(APP_DIR).join("tasks").to_string_lossy());
+    let new_root = format!("{}{sep}", default_worktrees_base().to_string_lossy());
     let mut changed = false;
     for p in list.iter_mut() {
         if let Some(rest) = p.tasks_path.strip_prefix(&old_root) {
@@ -628,6 +813,36 @@ fn repoint_task_bases(list: &mut [Project]) -> bool {
         }
     }
     changed
+}
+
+/// THE normalization point for `Project.tasks_path`, in the spirit of
+/// `groupOf()` for group labels: a stored path that merely restates the
+/// built-in default (`~/<APP_DIR>/tasks/<project dir>`) is not an override,
+/// so it reads as the empty "follow the global setting" it means.
+///
+/// `project_add` used to write that resolved default into every project, so
+/// without this every pre-existing project would pin itself and the global
+/// "Default tasks path" would be a no-op for it. A path that differs in any
+/// way is a real customization and is left alone.
+///
+/// In-memory only: it deliberately does NOT mark the list dirty. Every read
+/// of projects.json goes through `load_projects`, so normalizing here is
+/// enough, and forcing a write on every load to persist a value we can derive
+/// would be churn. Saves triggered by anything else pick the normalized form
+/// up for free, since they serialize this same list.
+fn normalize_default_task_paths(list: &mut [Project]) {
+    let base = default_worktrees_base();
+    for p in list.iter_mut() {
+        // Cheap skip, not a correctness guard: the compare below can never
+        // match an empty value, but this runs on nearly every IPC so it is
+        // worth dodging the per-project allocation.
+        if p.tasks_path.is_empty() {
+            continue;
+        }
+        if base.join(project_dir_name(p)).as_path() == Path::new(&p.tasks_path) {
+            p.tasks_path.clear();
+        }
+    }
 }
 
 /// Migrate pre-inline multi-repo members (which referenced a Project by
@@ -681,13 +896,16 @@ fn migrate_legacy_members(list: &mut [Project]) -> bool {
 /// Expand a leading `~/` to the user's home dir; otherwise return as-is.
 fn expand_tilde(path: &str) -> String {
     let trimmed = path.trim();
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|h| h.join(rest).to_string_lossy().into_owned())
-            .unwrap_or_else(|| trimmed.to_string())
-    } else {
-        trimmed.to_string()
-    }
+    // `~` and `~/…` only — NOT `~user` or `~work`, which name no home we can
+    // resolve. `is_absolute_location` draws the same line, and the tasks-path
+    // UI mirrors it, so all three must agree on what a tilde means.
+    let Some(rest) = trimmed.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/'))
+    else {
+        return trimmed.to_string();
+    };
+    dirs::home_dir()
+        .map(|h| format!("{}{rest}", h.to_string_lossy()))
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 /// Normalize an inbound inline member: expand + canonicalize its path,
@@ -735,8 +953,21 @@ fn load_tasks() -> Vec<Task> {
             }
         }
     }
-    out.sort_by(|a, b| a.created.cmp(&b.created));
+    sort_tasks(&mut out);
     out
+}
+
+/// Sidebar order: manual position first, creation time as the tiebreak.
+/// Tasks the user has never dragged carry `order: None`, which sorts last,
+/// so a project nobody has reordered comes back in pure creation order and
+/// newly created tasks land at the bottom of a reordered one.
+fn sort_tasks(list: &mut [Task]) {
+    list.sort_by(|a, b| {
+        a.order
+            .unwrap_or(u32::MAX)
+            .cmp(&b.order.unwrap_or(u32::MAX))
+            .then_with(|| a.created.cmp(&b.created))
+    });
 }
 fn save_task(w: &Task) -> Result<()> {
     let f = tasks_dir()?.join(format!("{}.json", w.id));
@@ -893,6 +1124,38 @@ fn stamp_schema_version() {
     }
 }
 
+/// One-time flip of `cli_enabled` to true for profiles that predate the CLI
+/// graduating out of experimental (0.26.0).
+///
+/// Changing the serde default is not enough on its own: `save_settings_inner`
+/// writes the whole struct, so every profile that has ever opened Settings has
+/// an explicit `cli_enabled: false` on disk, and a default only applies to a
+/// missing field. This rewrites the value once and stamps
+/// `cli_default_migrated` so it never fires again, which is what makes turning
+/// the CLI back off stick.
+///
+/// Best-effort by design: a failed write leaves the marker unstamped and the
+/// migration simply retries next launch. Nothing here can fail in a way that
+/// should block startup.
+fn migrate_cli_enabled_default() {
+    let mut s = settings_load();
+    if apply_cli_default_migration(&mut s) {
+        let _ = save_settings_inner(&s);
+    }
+}
+
+/// Pure half of the migration, so the rule can be tested without a settings
+/// file (`TERMIC_DATA_DIR` is process-global and would race parallel tests).
+/// Returns whether `s` changed and therefore needs writing.
+fn apply_cli_default_migration(s: &mut Settings) -> bool {
+    if s.cli_default_migrated {
+        return false;
+    }
+    s.cli_enabled = true;
+    s.cli_default_migrated = true;
+    true
+}
+
 /// Exclusive migration lock, released on drop. Guards against two concurrent
 /// launches migrating the same data dir at once (the app is single-instance in
 /// practice, but nothing enforces it — a double-click or a stray second dev
@@ -995,7 +1258,7 @@ fn migrate_workspaces_to_tasks() {
     // recent session BY WORKING DIRECTORY, so relocating a worktree would
     // silently orphan its history. Existing worktrees stay put under
     // ~/APP_DIR/workspaces/...; NEW worktrees are created under ~/APP_DIR/tasks/
-    // (see worktrees_base). The two roots coexist and the old one empties out
+    // (see default_worktrees_base). The two roots coexist and the old one empties out
     // naturally as the user archives and recreates tasks. The metadata dir is
     // NOT a working directory and is never passed to an agent, so renaming it
     // is safe.
@@ -1076,7 +1339,9 @@ fn migrate_workspaces_to_tasks() {
 
 // ───────────────────────────── git ─────────────────────────────
 
-fn git(args: &[&str], cwd: &Path) -> Result<String> {
+/// Raw stdout, for callers that read blobs (`git show HEAD:some.png`) where
+/// a lossy UTF-8 decode would destroy the bytes.
+fn git_bytes(args: &[&str], cwd: &Path) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(cwd);
     // Run with the user's login-shell environment, same as the PTY (see
@@ -1084,16 +1349,21 @@ fn git(args: &[&str], cwd: &Path) -> Result<String> {
     // git hooks (pre-commit, etc.) can't find node/bun/python/etc. and exported
     // vars (direnv, tokens) the user's rc sets are missing — so a commit that
     // works in the embedded terminal would fail from the Git panel. The
-    // resolved env is cached (OnceLock), so this is cheap per call.
-    cmd.env("PATH", shell_env::resolved_path());
-    for (k, v) in shell_env::login_env() {
+    // resolved env is cached once the probe lands, so this is cheap per call.
+    let (path, inject) = shell_env::spawn_env();
+    cmd.env("PATH", path);
+    for (k, v) in inject {
         cmd.env(k, v);
     }
     let out = cmd.output().with_context(|| format!("git {:?}", args))?;
     if !out.status.success() {
         return Err(anyhow!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr)));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
+}
+
+fn git(args: &[&str], cwd: &Path) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_bytes(args, cwd)?).into_owned())
 }
 
 /// Time-bounded fetch of a single ref. `remote_ref` is like "origin/develop":
@@ -1127,8 +1397,9 @@ fn fetch_ref(repo: &Path, remote_ref: &str) -> std::result::Result<(), String> {
     cmd.args(["fetch", "--no-tags", remote, refname]).current_dir(repo);
     // Same login-shell env as git() so credential helpers / SSH config resolve
     // from a GUI-launched .app (bare launchd PATH otherwise).
-    cmd.env("PATH", shell_env::resolved_path());
-    for (k, v) in shell_env::login_env() {
+    let (path, inject) = shell_env::spawn_env();
+    cmd.env("PATH", path);
+    for (k, v) in inject {
         cmd.env(k, v);
     }
     // Fail fast rather than block on a credential/passphrase prompt or a dead
@@ -1348,6 +1619,18 @@ fn next_pty_seq() -> u64 {
 #[derive(Clone, Debug, Deserialize)]
 pub struct PtyRole {
     pub task_id: String,
+    /// The webview's tab id (a uuid minted when the tab is created). The
+    /// STABLE selector `--tab` resolves to: index shifts when a tab closes
+    /// and titles are agent-authored and change mid-turn, so neither can be
+    /// the identity. Optional for back-compat with PTYs spawned before this
+    /// field existed; those simply cannot be addressed by id.
+    ///
+    /// `default` only: PtyRole is Deserialize-only (it arrives from the
+    /// webview and is never sent back), so a `skip_serializing_if` here
+    /// would be inert and would imply a serialization path that does not
+    /// exist.
+    #[serde(default)]
+    pub tab_id: Option<String>,
     /// "agent" (an agent CLI tab) or "aux" (the task's aux terminal).
     pub kind: String,
     /// The task's default agent tab: `attach`/`logs`' default target.
@@ -1527,6 +1810,30 @@ pub(crate) fn find_role_pty(
     }
 }
 
+/// Resolve a SPECIFIC tab's live agent PTY by the tab's stable id
+/// (`PtyRole.tab_id`, the identity `--tab` selectors resolve to,
+/// GH #138 part 2). Only agent tabs carry a role, so a shell or custom
+/// terminal tab (or a dead agent tab) lands in the Err: those are
+/// write-only from the CLI by design (docs/plans/cli.md).
+pub(crate) fn find_tab_pty(
+    manager: &PtyManager,
+    task_id: &str,
+    tab_id: &str,
+) -> Result<String, String> {
+    let map = manager.inner.lock();
+    // Newest wins, the find_role_pty rule: a respawn briefly leaves the
+    // killed slot in the map next to its replacement.
+    map.iter()
+        .filter(|(_, slot)| {
+            slot.role.as_ref().is_some_and(|r| {
+                r.task_id == task_id && r.tab_id.as_deref() == Some(tab_id)
+            })
+        })
+        .max_by_key(|(_, s)| s.seq)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| "no agent is running in that tab".into())
+}
+
 /// Subscribe an attach session to a PTY's output. Fails when the PTY
 /// died between resolution and here, or carries no feed.
 pub(crate) fn pty_subscribe(manager: &PtyManager, pty_id: &str) -> Result<PtyAttachment, String> {
@@ -1561,6 +1868,33 @@ pub(crate) fn notify_task_detach(manager: &PtyManager, task_id: &str, reason: &s
         let map = manager.inner.lock();
         map.values()
             .filter(|s| s.role.as_ref().is_some_and(|r| r.task_id == task_id))
+            .filter_map(|s| s.feed.clone())
+            .collect()
+    };
+    for feed in feeds {
+        feed.send_detach(reason);
+    }
+}
+
+/// Per-TAB counterpart of `notify_task_detach` (`tab close`, GH #185).
+/// Same contract, narrower blast radius: only sessions attached to THIS
+/// tab are told, because only this tab's PTY is about to go. The task's
+/// other agents, and anyone attached to them, are untouched, which is
+/// the whole reason `tab close` exists next to `archive`.
+pub(crate) fn notify_tab_detach(
+    manager: &PtyManager,
+    task_id: &str,
+    tab_id: &str,
+    reason: &str,
+) {
+    let feeds: Vec<Arc<PtyFeed>> = {
+        let map = manager.inner.lock();
+        map.values()
+            .filter(|s| {
+                s.role
+                    .as_ref()
+                    .is_some_and(|r| r.task_id == task_id && r.tab_id.as_deref() == Some(tab_id))
+            })
             .filter_map(|s| s.feed.clone())
             .collect()
     };
@@ -1869,7 +2203,8 @@ fn pty_spawn(
     // this, `claude` / `codex` / `gemini` installed in ~/.local/bin,
     // ~/.bun/bin, /opt/homebrew/bin, or under nvm aren't found. See
     // shell_env.rs.
-    cmd.env("PATH", shell_env::resolved_path());
+    let (resolved_path, login_inject) = shell_env::spawn_env();
+    cmd.env("PATH", resolved_path);
     // Inject the rest of the user's login-shell environment (EDITOR, VISUAL,
     // LANG, GPG_TTY, ...) — but ONLY for UNSANDBOXED spawns. The sandboxed
     // agent is the threat model (CLAUDE.md), and this rc delta can carry
@@ -1882,7 +2217,7 @@ fn pty_spawn(
     // this it would miss $EDITOR etc. (#17). The per-spawn overlay below
     // still wins, so explicit overrides hold.
     if sandbox_bundle.is_none() {
-        for (k, v) in shell_env::login_env() {
+        for (k, v) in login_inject {
             cmd.env(k, v);
         }
     }
@@ -1934,7 +2269,7 @@ fn pty_spawn(
             // file. Keep it to the two rules agents get wrong.
             cmd.env(
                 "TERMIC_CLI_HELP",
-                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. To create a task that returns a result: `\"$TERMIC_CLI\" new <name> --sandbox enforce --wait -p \"<task>; write your findings to RESULT.md\"`, then read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\" --wait`. Branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused).",
+                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. To create a task that returns a result: `\"$TERMIC_CLI\" new <name> --sandbox enforce --wait -p \"<task>; write your findings to RESULT.md\"`, then read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\" --wait`. Branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names).",
             );
         }
     }
@@ -2238,13 +2573,14 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
     // first: the base is read from that remote's own HEAD alias.
     let remote = if non_git { String::new() } else { detect_default_remote(&canon) };
     let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
-    let ws_path = worktrees_base().map_err(|e| e.to_string())?
-        .join(&name).to_string_lossy().into_owned();
     let p = Project {
         id: Uuid::new_v4().to_string(),
         name,
         root_path: canon.to_string_lossy().into_owned(),
-        tasks_path: ws_path,
+        // Empty = follow the global "Default tasks path" setting. Writing the
+        // resolved path here instead would pin the project the moment it's
+        // added and make that setting a no-op for it (see project_tasks_root).
+        tasks_path: String::new(),
         // Non-git folders have no remote-tracking base ref; leave it
         // empty so nothing downstream tries to branch off "/".
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
@@ -2437,14 +2773,14 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
 
     let remote = if non_git { String::new() } else { detect_default_remote(&canon) };
     let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
-    let ws_path = worktrees_base().map_err(|e| e.to_string())?
-        .join(&slug).to_string_lossy().into_owned();
     let name = trimmed_name.to_string();
     let p = Project {
         id: Uuid::new_v4().to_string(),
         name,
         root_path: canon.to_string_lossy().into_owned(),
-        tasks_path: ws_path,
+        // Empty = follow the global "Default tasks path" setting; the host's
+        // per-project subdir is derived from the name (project_dir_name).
+        tasks_path: String::new(),
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
         remote,
         preview_url: String::new(),
@@ -2593,9 +2929,31 @@ async fn project_remove(id: String) -> Result<(), String> {
 #[tauri::command]
 fn tasks_list() -> Vec<Task> { load_tasks() }
 
+/// GH #169: normalize an externally-started session id and seed it as the
+/// per-cli session, so the default tab's first spawn composes the agent's
+/// `resume_id_args` instead of minting a fresh session. The id is
+/// unvalidated by design; the agent owns "session not found" (the
+/// resume_override stance), and a rapid exit falls back to a fresh spawn.
+fn seeded_session_ids(
+    cli: &str,
+    resume_session_id: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut ids = std::collections::HashMap::new();
+    if let Some(sid) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        ids.insert(cli.to_string(), sid.to_string());
+    }
+    ids
+}
+
 /// Open the project's main repo checkout as a task (no git worktree).
-/// Idempotent: if one already exists for this project (and isn't archived),
-/// returns it; otherwise seeds a new one pointing at `project.root_path`.
+/// NOT idempotent: several repo-root sessions may share one checkout, so
+/// every call seeds a new task pointing at `project.root_path`. A
+/// caller-typed name colliding with a live same-project task is refused
+/// (task_rename's rule, GH #153): worktree creates are de-facto
+/// name-guarded by their directory, repo-root tasks have no such dir and
+/// could mint twins. A DERIVED name (no name passed, falls back to the
+/// branch) is auto-bumped past live twins instead ("main-2"), so the
+/// second unnamed quick Terminal stays possible.
 /// Branch is read from `git symbolic-ref` so the UI shows whichever branch
 /// the user has checked out in the actual repo.
 #[tauri::command]
@@ -2608,6 +2966,7 @@ fn task_open_repo(
     sandbox_mode: Option<SandboxMode>,
     sandbox_rw_paths: Option<Vec<String>>,
     sandbox_allowed_hosts: Option<Vec<String>>,
+    resume_session_id: Option<String>,
 ) -> Result<Task, String> {
     let proj = load_projects().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
@@ -2687,12 +3046,27 @@ fn task_open_repo(
         let _ = ensure_multirepo_gitignore(host_dir, &dir_names);
     }
 
-    let ws_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
+    let explicit_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let derived = explicit_name.is_none();
+    let ws_name = explicit_name
         // Branch is the natural fallback for a git repo; non-git folders
         // have no branch, so fall back to the project name there.
         .unwrap_or_else(|| if branch.is_empty() { proj.name.clone() } else { branch.clone() });
+    // Same-project live duplicate (GH #153): twins make CLI name
+    // resolution ambiguous with no name-based way out. A name the caller
+    // TYPED is refused, the task_rename rule; a derived fallback (quick
+    // "Terminal" passes no name, so every unnamed session lands on the
+    // branch name) is auto-bumped past the twins instead, or the second
+    // unnamed session would be impossible.
+    let tasks_now = load_tasks();
+    let ws_name = if derived {
+        unique_task_name(&ws_name, &tasks_now, &proj.id)
+    } else {
+        if task_name_conflict(&tasks_now, &proj.id, &ws_name, None).is_some() {
+            return Err(format!("a task named \"{ws_name}\" already exists in this project"));
+        }
+        ws_name
+    };
     // Only "custom" tasks carry a launch command; agent/shell
     // tasks resolve their command from the registry at spawn.
     let custom_command = if cli == "custom" {
@@ -2712,6 +3086,13 @@ fn task_open_repo(
     let sandbox_enabled = sandbox_mode != SandboxMode::Off;
     let sandbox_rw_paths = sandbox_rw_paths.unwrap_or_default();
     let sandbox_allowed_hosts = sandbox_allowed_hosts.unwrap_or_default();
+    // Externally-started session to attach (GH #169): the natural fit
+    // here, since the main checkout shares its cwd with sessions the user
+    // started in the repo directly. NOTE has_resumable_history stays
+    // false: the seed is PER-CLI, while that flag is task-wide and would
+    // make the first tab of every OTHER agent cwd-resume an unrelated
+    // session; the seeded resume rides agent_session_ids alone.
+    let agent_session_ids = seeded_session_ids(&cli, resume_session_id.as_deref());
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
@@ -2730,7 +3111,7 @@ fn task_open_repo(
         is_main_checkout: true,
         spawn_count: 0,
         has_resumable_history: false,
-        agent_session_ids: std::collections::HashMap::new(),
+        agent_session_ids,
         // Off by default (see the resolution above); the advanced dialog can
         // opt a main-checkout task into a cage at create, and the shield
         // button still changes it later. Seatbelt + proxy work identically
@@ -2746,6 +3127,9 @@ fn task_open_repo(
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
+        // New tasks are unordered: they append below any manually
+        // ordered sibling (see sort_tasks).
+        order: None,
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
@@ -2840,6 +3224,8 @@ fn task_import_worktree(
     sandbox_mode: Option<SandboxMode>,
     sandbox_rw_paths: Option<Vec<String>>,
     sandbox_allowed_hosts: Option<Vec<String>>,
+    resume_session_id: Option<String>,
+    yolo: Option<bool>,
 ) -> Result<Task, String> {
     let proj = load_projects().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
@@ -2863,7 +3249,11 @@ fn task_import_worktree(
     if wt_canon == canon_str(&proj.root_path) {
         return Err("that's the repo's main checkout — use \"Run in repo\" instead".into());
     }
-    if load_tasks().iter().any(|w| canon_str(&w.path) == wt_canon) {
+    // LIVE tasks only: an archived task keeps its old path on the record
+    // (the dir is gone), and counting it would refuse re-adopting that
+    // path forever with a wrong message.
+    let existing_tasks = load_tasks();
+    if existing_tasks.iter().any(|w| !w.archived && canon_str(&w.path) == wt_canon) {
         return Err("this worktree is already open as a task".into());
     }
 
@@ -2871,13 +3261,24 @@ fn task_import_worktree(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let cli = cli.unwrap_or_else(|| proj.default_cli.clone());
-    let port = 18100 + (load_tasks().len() as u16);
-    let ws_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
+    let port = 18100 + (existing_tasks.len() as u16);
+    let explicit_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let derived = explicit_name.is_none();
+    let ws_name = explicit_name
         .unwrap_or_else(|| if branch.is_empty() {
             wt.file_name().and_then(|s| s.to_str()).unwrap_or("worktree").to_string()
         } else { branch.clone() });
+    // Same-project live duplicate (GH #153): a caller-TYPED name is
+    // refused, the task_rename rule; a derived fallback (branch / dir
+    // name) is auto-bumped past live twins, the task_open_repo rule.
+    let ws_name = if derived {
+        unique_task_name(&ws_name, &existing_tasks, &proj.id)
+    } else {
+        if task_name_conflict(&existing_tasks, &proj.id, &ws_name, None).is_some() {
+            return Err(format!("a task named \"{ws_name}\" already exists in this project"));
+        }
+        ws_name
+    };
 
     // Sandbox: honor the dialog's explicit choice when provided, else
     // fall back to the project default + the merged default lists (same
@@ -2902,6 +3303,10 @@ fn task_import_worktree(
     let sandbox_allowed_hosts = sandbox_allowed_hosts
         .unwrap_or_else(|| merge(&globals.sandbox_default_allowed_hosts, &proj.sandbox_allowed_hosts));
 
+    // GH #169 seed; has_resumable_history stays false deliberately, see
+    // seeded_session_ids and the task_open_repo note (per-cli seed vs
+    // task-wide flag).
+    let agent_session_ids = seeded_session_ids(&cli, resume_session_id.as_deref());
     let task = Task {
         id: Uuid::new_v4().to_string(),
         project_id: proj.id.clone(),
@@ -2919,10 +3324,10 @@ fn task_import_worktree(
         is_main_checkout: false,
         spawn_count: 0,
         has_resumable_history: false,
-        agent_session_ids: std::collections::HashMap::new(),
+        agent_session_ids,
         sandbox_enabled,
         sandbox_mode: Some(sandbox_mode),
-        yolo: false,
+        yolo: yolo.unwrap_or(false),
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         composition: Vec::new(),
@@ -2931,6 +3336,9 @@ fn task_import_worktree(
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
+        // New tasks are unordered: they append below any manually
+        // ordered sibling (see sort_tasks).
+        order: None,
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
@@ -2977,7 +3385,10 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
     // git can branch off "origin/master" directly.
     let base_full = task_base_branch(&proj.base_branch, args.base_branch.as_deref());
 
-    let wt_root = PathBuf::from(&proj.tasks_path);
+    // Personal settings, loaded ONCE here and reused for the tasks root and
+    // the sandbox defaults further down.
+    let globals = load_settings_inner();
+    let wt_root = project_tasks_root(&globals.default_tasks_path, &proj)?;
     fs::create_dir_all(&wt_root).map_err(|e| e.to_string())?;
     let wt_path = wt_root.join(&slug);
 
@@ -2998,6 +3409,15 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
             return Err(format!(
                 "a worktree already lives at {} — pick a different name.",
                 wt_path.display()
+            ));
+        }
+        // NEVER delete something git tracks. Reached when the tasks root sits
+        // inside the repo and a task slug collides with a committed directory.
+        if git_tracks_path(&repo, &wt_path) {
+            return Err(format!(
+                "{} holds files tracked by git, so it is not a leftover this can clear. \
+                 Pick a different task name, or move the tasks path outside the repo.",
+                wt_path.display(),
             ));
         }
         fs::remove_dir_all(&wt_path).map_err(|e|
@@ -3113,8 +3533,6 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         copy_matching(&repo, &wt_path, pat);
     }
 
-    // Personal settings, loaded once and reused for the sandbox defaults below.
-    let globals = load_settings_inner();
     // Link the project's agent config dirs (`.claude/` and friends) into the
     // worktree so agents spawned here keep their project subagents / skills /
     // commands instead of failing to fan out. The list is user-configurable
@@ -3172,6 +3590,10 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         .unwrap_or_else(|| merge(&globals.sandbox_default_rw_paths, &proj.sandbox_rw_paths));
     let sandbox_allowed_hosts = args.sandbox_allowed_hosts
         .unwrap_or_else(|| merge(&globals.sandbox_default_allowed_hosts, &proj.sandbox_allowed_hosts));
+    // GH #169 seed; has_resumable_history stays false deliberately, see
+    // seeded_session_ids and the task_open_repo note (per-cli seed vs
+    // task-wide flag).
+    let agent_session_ids = seeded_session_ids(&cli, args.resume_session_id.as_deref());
     let task = Task {
         id: args.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         project_id: proj.id.clone(),
@@ -3186,7 +3608,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         is_main_checkout: false,
         spawn_count: 0,
         has_resumable_history: false,
-        agent_session_ids: std::collections::HashMap::new(),
+        agent_session_ids,
         sandbox_enabled,
         sandbox_mode: Some(sandbox_mode),
         yolo: false,
@@ -3204,6 +3626,9 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
+        // New tasks are unordered: they append below any manually
+        // ordered sibling (see sort_tasks).
+        order: None,
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
@@ -3325,9 +3750,11 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         frozen.push((hm, m.clone(), dir_name));
     }
 
-    // Wrapper dir = `<tasks_root>/<host-slug>/<wsname>/`. The
-    // host's existing tasks_path already encodes that pattern.
-    let wrapper = PathBuf::from(&host.tasks_path).join(&slug);
+    // Wrapper dir = `<tasks_root>/<host-slug>/<wsname>/`. The host's
+    // resolved tasks root already encodes the `<...>/<host-slug>` half.
+    // Settings loaded ONCE here, reused for the sandbox defaults further down.
+    let globals = load_settings_inner();
+    let wrapper = project_tasks_root(&globals.default_tasks_path, &host)?.join(&slug);
     if wrapper.exists() {
         return Err(format!("a task already exists at {}", wrapper.display()));
     }
@@ -3527,8 +3954,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     }
 
     // Sandbox: same union/merge logic as single-repo create, but the
-    // base set unions across every member project too.
-    let globals = load_settings_inner();
+    // base set unions across every member project too (`globals` above).
     let sandbox_enabled = args.sandbox_enabled.unwrap_or(host.default_sandbox);
     let sandbox_mode = args.sandbox_mode.or(host.default_sandbox_mode)
         .unwrap_or(if sandbox_enabled { SandboxMode::Enforce } else { SandboxMode::Off });
@@ -3580,6 +4006,9 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
+        // New tasks are unordered: they append below any manually
+        // ordered sibling (see sort_tasks).
+        order: None,
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
@@ -3641,16 +4070,17 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 let _ = app2.emit(&format!("setup-output://{}", ws_id),
                     serde_json::json!({ "line": format!("[{label}] $ {script}") }));
                 let mut cmd = Command::new("bash");
+                // Real login-shell env so setup finds bun/nvm/etc. and
+                // sees the user's $EDITOR; `bash -l` alone misses what the
+                // user set in their actual shell (fish/zsh rc) (#16, #17).
+                let (path, inject) = shell_env::spawn_env();
                 cmd.arg("-lc").arg(script).current_dir(cwd)
-                    // Real login-shell env so setup finds bun/nvm/etc. and
-                    // sees the user's $EDITOR; `bash -l` alone misses what the
-                    // user set in their actual shell (fish/zsh rc) (#16, #17).
-                    .env("PATH", shell_env::resolved_path())
+                    .env("PATH", path)
                     .env("TERMIC_PORT", port.to_string())
                     .env("TERMIC_WORKSPACE_NAME", &name)
                     .env("TERMIC_TASK", &name)
                     .stdout(Stdio::piped()).stderr(Stdio::piped());
-                for (k, v) in shell_env::login_env() {
+                for (k, v) in inject {
                     cmd.env(k, v);
                 }
                 for (k, v) in &sibling_ports {
@@ -3736,6 +4166,39 @@ fn ensure_multirepo_gitignore(wrapper: &Path, member_dirs: &[String]) -> std::io
     fs::write(&path, next)
 }
 
+/// Persist the sidebar order of ONE project's tasks. `ids` is that
+/// project's visible task list in its new top-to-bottom order; each named
+/// task gets its index as `order`.
+///
+/// Unlike `project_reorder` (one projects.json array, so array order IS the
+/// order) tasks live in a file each, hence the explicit key. Ids not found
+/// are skipped, and tasks absent from `ids` (other projects, archived rows)
+/// are left alone — `order` only ever competes inside one project's list.
+/// Only changed tasks are rewritten, so dropping a row back where it started
+/// touches no files.
+///
+/// CONTRACT, NOT ENFORCED: every id must belong to the SAME project. This
+/// function does not check, and the only caller that guarantees it is
+/// `endTaskDrag` in Sidebar.tsx, which filters to the dragged task's project
+/// before calling. Handing it ids from two projects is not corrupting (each
+/// project's rows still sort deterministically, since `order` is only ever
+/// compared inside one project's filtered list) but the resulting positions
+/// are meaningless.
+#[tauri::command]
+fn task_reorder(ids: Vec<String>) -> Result<(), String> {
+    let mut list = load_tasks();
+    for (i, id) in ids.iter().enumerate() {
+        let next = Some(i as u32);
+        if let Some(t) = list.iter_mut().find(|t| &t.id == id) {
+            if t.order != next {
+                t.order = next;
+                save_task(t).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn task_rename(id: String, name: String) -> Result<Task, String> {
     let new_name = name.trim();
@@ -3743,7 +4206,15 @@ fn task_rename(id: String, name: String) -> Result<Task, String> {
         return Err("name cannot be empty".into());
     }
     let mut list = load_tasks();
-    let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
+    let idx = list.iter().position(|w| w.id == id).ok_or("no such task")?;
+    // Same-project live duplicate: refuse, mirroring the CLI `new` check.
+    // Two same-name tasks in one project make name resolution ambiguous
+    // with no name-based way out (both qualify as project/name). Self is
+    // excluded so a case-only rename ("foo" -> "Foo") still works.
+    if task_name_conflict(&list, &list[idx].project_id, new_name, Some(&id)).is_some() {
+        return Err(format!("a task named \"{new_name}\" already exists in this project"));
+    }
+    let w = &mut list[idx];
     w.name = new_name.to_string();
     save_task(w).map_err(|e| e.to_string())?;
     Ok(w.clone())
@@ -4472,6 +4943,44 @@ fn task_set_sandbox(
     Ok(kill_task_ptys(&state, &id))
 }
 
+/// (tasks with a live agent, live AGENT PTYs). Ground truth for what
+/// `termic quit` is about to SIGKILL, counted off the PTY map rather than
+/// the webview's cache: the cache can be stale and this is the number the
+/// user is being asked to approve.
+///
+/// Only `kind == "agent"` counts. The map also holds the aux shell, plain
+/// shell tabs and setup/run script tabs; every one of those dies with the
+/// app too, but calling them "agents" in the confirmation would inflate
+/// the number the user is deciding on. Attribution comes from
+/// `role.task_id`, NOT `slot.task_id` - an agent tab carries the role
+/// while `slot.task_id` is the sandbox trigger and is unset on some tabs,
+/// which would otherwise report "1 agent across 0 tasks".
+pub(crate) fn live_agent_pty_counts(manager: &PtyManager) -> (u32, u32) {
+    let map = manager.inner.lock();
+    count_live_agents(map.values().map(|s| (s.child_pid.is_some(), s.role.as_ref())))
+}
+
+/// The rule behind `live_agent_pty_counts`, over plain data so it can be
+/// unit-tested: a real `PtySlot` owns a live `MasterPty` and cannot be
+/// constructed in a test.
+fn count_live_agents<'a>(
+    slots: impl Iterator<Item = (bool, Option<&'a PtyRole>)>,
+) -> (u32, u32) {
+    let mut tasks: HashSet<&str> = HashSet::new();
+    let mut total = 0u32;
+    for (alive, role) in slots {
+        if !alive {
+            continue; // already exited; nothing left to kill
+        }
+        let Some(role) = role.filter(|r| r.kind == "agent") else {
+            continue;
+        };
+        total += 1;
+        tasks.insert(role.task_id.as_str());
+    }
+    (tasks.len() as u32, total)
+}
+
 /// Find + SIGKILL every live PTY belonging to a task. Shared by
 /// `task_set_sandbox` (profile change requires a respawn) and the CLI's
 /// `archive` (removing a worktree under a live agent is undefined). The
@@ -4495,14 +5004,82 @@ pub(crate) fn kill_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     count
 }
 
-/// The task's ROLE-tagged PTYs that carry no `task_id`: today exactly
-/// the aux shell, which deliberately omits `task_id` (the sandbox
-/// trigger). Archive paths must kill it too; leaving a live shell
-/// inside a removed worktree is the same undefined state the agent
-/// kill exists to prevent. Kept separate from `kill_task_ptys` because
-/// `task_set_sandbox` reuses that one and a sandbox edit has no
-/// business killing the user's scratch shell.
-pub(crate) fn kill_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize {
+/// How long a task's children get to exit on their own after SIGTERM before
+/// archive stops waiting and SIGKILLs them.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Stop a task's PTYs politely, then guarantee they are gone.
+///
+/// Archive removes the worktree, and removing it under a live agent is
+/// undefined, so termination has to be certain. But SIGKILL as the FIRST
+/// signal gives an agent CLI no chance to flush its session transcript, and
+/// that transcript is what makes the task resumable and what `result` reads.
+/// Killing it outright is a silent data loss for anyone who archives a task
+/// they later want to resume or read back.
+///
+/// So: SIGTERM, a short bounded grace, then SIGKILL whatever is still up. The
+/// worktree removal that follows is as safe as before, because the SIGKILL
+/// sweep is unconditional; the grace only decides whether it has anything
+/// left to do.
+///
+/// The wait here is NOT the standing sleep-poll CLAUDE.md forbids. That rule
+/// is about loops that run forever and keep the CPU out of deep sleep; this
+/// runs once per archive, caps at STOP_GRACE, and returns the moment the last
+/// child is gone. `waitpid` is not an option: the waiter thread owns the
+/// Child, which is exactly why `child_pid` is kept as a raw pid here.
+///
+/// Returns how many PTYs were live when we started, matching kill_task_ptys.
+pub(crate) fn stop_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
+    // Counts every matching slot, including any without a child_pid, so the
+    // reported number keeps matching kill_task_ptys. Only the ones with a pid
+    // can be signalled.
+    let victims: Vec<Option<u32>> = {
+        let map = manager.inner.lock();
+        map.iter()
+            .filter(|(_, slot)| slot.task_id.as_deref() == Some(task_id))
+            .map(|(_, slot)| slot.child_pid)
+            .collect()
+    };
+    let count = victims.len();
+    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
+    count
+}
+
+/// SIGTERM, wait for exit up to STOP_GRACE, SIGKILL the remainder.
+/// Split out so both the task-tagged and the role-tagged sweeps share it.
+fn graceful_then_kill(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    for &pid in pids {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    }
+    // `kill(pid, 0)` probes liveness without signalling. A pid the waiter has
+    // already reaped fails with ESRCH, which is the exit we are waiting for.
+    let alive = |pid: u32| unsafe { libc::kill(pid as i32, 0) } == 0;
+    let deadline = std::time::Instant::now() + STOP_GRACE;
+    while std::time::Instant::now() < deadline {
+        if !pids.iter().any(|&p| alive(p)) {
+            return;
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+    for &pid in pids.iter().filter(|&&p| alive(p)) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    }
+}
+
+/// Role-tagged counterpart of `stop_task_ptys`, same SIGTERM-then-SIGKILL
+/// contract.
+///
+/// Covers the task's PTYs that carry no `task_id`: today exactly the aux
+/// shell, which omits it deliberately (the sandbox trigger). Archive has to
+/// sweep these too, since a live shell inside a removed worktree is the same
+/// undefined state the agent kill exists to prevent. Kept separate from the
+/// task-tagged sweep because `task_set_sandbox` reuses that one, and a
+/// sandbox edit has no business killing the user's scratch shell.
+pub(crate) fn stop_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize {
     let victims: Vec<Option<u32>> = {
         let map = manager.inner.lock();
         map.values()
@@ -4514,9 +5091,44 @@ pub(crate) fn kill_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize 
             .collect()
     };
     let count = victims.len();
-    for pid in victims.into_iter().flatten() {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-    }
+    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
+    count
+}
+
+/// Stop ONE tab's agent PTY, same SIGTERM-then-SIGKILL contract as the
+/// task-wide sweeps (`tab close`, GH #185).
+///
+/// Runs AFTER the webview has dropped the tab, as the termination
+/// guarantee: the pane's own kill on unmount is fire-and-forget
+/// (`ipc.ptyKill(...).catch(...)`), so without this sweep the verb would
+/// answer "closed" while the agent might still be up. It normally finds
+/// nothing left to signal.
+///
+/// It deliberately does NOT run first. Stopping the PTY while the pane is
+/// still mounted makes TerminalPane's exit handler treat an induced death
+/// as a voluntary one: a spurious "agent exited" notification, and inside
+/// RESUME_FAILURE_MS of a resume, the failed-resume branch wiping the tab's
+/// session id from disk. See the ordering note in `handle_tab_close`.
+///
+/// Matches EVERY slot carrying this tab's role, not just the newest the way
+/// `find_tab_pty` does: a respawn briefly leaves the killed slot beside its
+/// replacement, and signalling an already-reaped pid is a harmless ESRCH.
+///
+/// Returns how many PTYs were live when we started.
+pub(crate) fn stop_tab_ptys(manager: &PtyManager, task_id: &str, tab_id: &str) -> usize {
+    let victims: Vec<Option<u32>> = {
+        let map = manager.inner.lock();
+        map.values()
+            .filter(|slot| {
+                slot.role.as_ref().is_some_and(|r| {
+                    r.task_id == task_id && r.tab_id.as_deref() == Some(tab_id)
+                })
+            })
+            .map(|slot| slot.child_pid)
+            .collect()
+    };
+    let count = victims.len();
+    graceful_then_kill(&victims.into_iter().flatten().collect::<Vec<_>>());
     count
 }
 
@@ -4846,6 +5458,16 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
     if !list[idx].archived {
         return Err("task is not archived".into());
     }
+    // Same-project live duplicate: refuse, task_rename's rule (GH #153).
+    // Restoring would resurrect two same-name live tasks in one project,
+    // a state CLI name resolution cannot untangle (both qualify as
+    // project/name); the error names the way out.
+    if task_name_conflict(&list, &list[idx].project_id, &list[idx].name, Some(&id)).is_some() {
+        return Err(format!(
+            "a live task named \"{}\" already exists in this project; rename it first, then restore",
+            list[idx].name
+        ));
+    }
 
     let proj = load_projects().into_iter()
         .find(|p| p.id == list[idx].project_id)
@@ -4878,7 +5500,17 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                 if registered {
                     return Err(format!("a worktree already lives at {}", wt_path.display()));
                 }
-                // Orphan directory — remove before adding the worktree.
+                // Orphan directory — remove before adding the worktree. Same
+                // tracked-content guard as task_create_sync: a restored task
+                // whose stored path now overlaps committed files must not take
+                // them with it.
+                if git_tracks_path(&repo, &wt_path) {
+                    return Err(format!(
+                        "{} holds files tracked by git, so it is not a leftover this can \
+                         clear. Move or rename it, then restore again.",
+                        wt_path.display(),
+                    ));
+                }
                 fs::remove_dir_all(&wt_path)
                     .map_err(|e| format!("orphan dir at {}: {e}", wt_path.display()))?;
             }
@@ -6383,6 +7015,9 @@ fn task_path_stat(id: String, path: String) -> Result<PathStat, String> {
     check_task_path_existence(&cwd, &rel)
 }
 
+/// Ceiling on bytes shipped to the webview for a preview or an image diff.
+const PREVIEW_CAP: u64 = 20_000_000;
+
 /// Read `abs` capped at `cap` bytes, TOCTOU-safe: the size/type check runs
 /// against an `fstat` on the already-OPEN handle (not a separate path-based
 /// `metadata()` call), so a swap between the check and the read (symlink
@@ -6484,7 +7119,7 @@ fn task_file_read_base64_for_task(w: &Task, path: &str, known_fp: Option<&str>) 
             return Ok(Base64Read { unchanged: true, mime: None, data: None, fp: current_fp });
         }
     }
-    let bytes = read_capped_file(&abs, 20_000_000)?;
+    let bytes = read_capped_file(&abs, PREVIEW_CAP)?;
     // Re-stat AFTER the read so `fp` is correlated with the bytes just
     // returned (not the pre-read snapshot, which a concurrent write
     // could have already invalidated).
@@ -6512,6 +7147,34 @@ async fn task_file_read_base64(id: String, path: String, known_fp: Option<String
     .map_err(|e| e.to_string())?
 }
 
+/// The `mtime:len` fingerprint of a previewable file, with NO read at all —
+/// same member-aware resolution, containment and extension allowlist as the
+/// base64 read, minus the bytes. The PDF pane asks for this on every
+/// agent-settle tick to decide whether its `<embed>` needs a new URL: a
+/// reload throws the reader back to page 1 (WKWebView keeps no scroll state
+/// across one), so an unchanged PDF must keep the URL it already has. The
+/// base64 channel can't answer that question as cheaply — on a real change it
+/// reads and encodes the whole `PREVIEW_CAP` of file just to be thrown away,
+/// since the bytes reach the webview through the `taskpdf:` scheme instead.
+/// A missing file is an `Err` (`safe_task_path` can't canonicalize it), the
+/// same answer the base64 read gives; the empty-string case `file_fp` returns
+/// is left to a path that resolves but won't stat.
+fn task_file_fp_for_task(w: &Task, path: &str) -> Result<String, String> {
+    let (cwd, rel) = resolve_task_git_path(w, path)?;
+    let abs = safe_task_path(&cwd, &rel)?;
+    preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
+    Ok(file_fp(&abs))
+}
+
+/// Stat a previewable file and return its `mtime:len` fingerprint. Sync: one
+/// `metadata()` call, nowhere near the multi-MB reads the async IPC
+/// discipline targets.
+#[tauri::command]
+fn task_file_fp(id: String, path: String) -> Result<String, String> {
+    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+    task_file_fp_for_task(&w, &path)
+}
+
 /// Read an allowlisted preview file (image/PDF) as raw bytes + mime, reusing
 /// the SAME member-aware resolution, worktree containment, extension
 /// allowlist, and 20 MB cap as `task_file_read_base64_for_task` — just
@@ -6522,7 +7185,7 @@ fn read_preview_file_for_task(w: &Task, path: &str) -> Result<(Vec<u8>, &'static
     let (cwd, rel) = resolve_task_git_path(w, path)?;
     let abs = safe_task_path(&cwd, &rel)?;
     let mime = preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
-    let bytes = read_capped_file(&abs, 20_000_000)?;
+    let bytes = read_capped_file(&abs, PREVIEW_CAP)?;
     Ok((bytes, mime))
 }
 
@@ -6665,12 +7328,14 @@ fn reveal_command(os: &str, target: &str) -> (&'static str, Vec<String>) {
 /// deleted in the worktree).
 #[derive(Serialize)]
 struct FileDiffSides {
+    /// Decoded contents, `kind == "text"` only — "" for image/binary, whose
+    /// bytes travel in `original_data`/`modified_data` (or not at all).
     original: String,
     modified: String,
-    /// Whether each side actually exists (and is readable as UTF-8): the
-    /// content strings are "" both for a MISSING side and for an EMPTY
-    /// file, so the frontend's one-sided detection needs these to avoid
-    /// misclassifying a truncated-to-empty file as "new or deleted".
+    /// Whether each side actually exists: the content strings are "" both for
+    /// a MISSING side and for an EMPTY file, so the frontend's one-sided
+    /// detection needs these to avoid misclassifying a truncated-to-empty
+    /// file as "new or deleted".
     original_exists: bool,
     modified_exists: bool,
     /// Working-tree fingerprint (`mtime_nanos:len`) of the modified file,
@@ -6678,6 +7343,19 @@ struct FileDiffSides {
     /// the same fingerprint the Git panel rows use (store/fileViewed.ts).
     #[serde(default)]
     fp: String,
+    /// "text" | "image" | "binary" — which body the diff pane renders. A PNG
+    /// used to decode into a screenful of U+FFFD on the deleted-line wash;
+    /// see `diff_sides_kind`.
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
+    /// Base64 of each side, `kind == "image"` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_data: Option<String>,
+    original_bytes: u64,
+    modified_bytes: u64,
 }
 
 /// Resolve a task-relative path to (member cwd, path relative to that
@@ -6709,7 +7387,28 @@ fn resolve_task_git_path(w: &Task, path: &str) -> Result<(PathBuf, String), Stri
     resolve_task_git_path_ex(w, path, false)
 }
 
+/// Which body the diff pane renders for these two sides. Text wins whenever
+/// every present side decodes as UTF-8, so an `.svg` (or any other textual
+/// format with an image-ish extension) keeps its line-by-line diff. Images
+/// are shipped as base64 only under the same 20 MB ceiling the preview
+/// channel uses — a bigger one would jank the webview, so it degrades to the
+/// "binary" summary rather than being sent.
+fn diff_sides_kind(abs: Option<&Path>, sides: [Option<&Vec<u8>>; 2]) -> &'static str {
+    let present = || sides.into_iter().flatten();
+    if present().all(|b| std::str::from_utf8(b).is_ok()) {
+        return "text";
+    }
+    let is_image = abs
+        .and_then(preview_mime_for_ext)
+        .is_some_and(|m| m.starts_with("image/"));
+    if is_image && present().all(|b| b.len() as u64 <= PREVIEW_CAP) {
+        return "image";
+    }
+    "binary"
+}
+
 fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> Result<FileDiffSides, String> {
+    use base64::Engine as _;
     let (cwd, rel_path) = resolve_task_git_path(w, path)?;
     // Which two sides to compare depends on where the click came from
     // (GH #122):
@@ -6722,26 +7421,46 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
     //
     // `git show :0:path` reads the index (stage 0); it fails for an
     // untracked path just like `show HEAD:path` fails for a new file.
-    // read_to_string fails for non-UTF8. Either way the side is
-    // unrenderable → exists=false, content "".
+    // Either way the side doesn't exist → exists=false, content "".
+    //
+    // Both sides are read as BYTES: `git()` lossily decodes, which turned a
+    // PNG blob into a screenful of replacement characters.
     let modified_path = safe_task_path(&cwd, &rel_path).ok();
+    // Uncapped, like the `git show` sides: a cap here would report an
+    // oversized file as MISSING, i.e. as a deletion. Size only decides what
+    // gets shipped to the webview (`diff_sides_kind`), not what exists.
     let read_worktree = || match &modified_path {
-        Some(p) if p.exists() => fs::read_to_string(p).ok(),
+        Some(p) if p.exists() => fs::read(p).ok(),
         _ => None,
     };
-    let show_head = || git(&["--no-pager", "show", &format!("HEAD:{rel_path}")], &cwd).ok();
-    let show_index = || git(&["--no-pager", "show", &format!(":0:{rel_path}")], &cwd).ok();
+    let show_head = || git_bytes(&["--no-pager", "show", &format!("HEAD:{rel_path}")], &cwd).ok();
+    let show_index = || git_bytes(&["--no-pager", "show", &format!(":0:{rel_path}")], &cwd).ok();
     let (original, modified) = match scope {
         Some("staged") => (show_head(), show_index()),
         Some("unstaged") => (show_index(), read_worktree()),
         _ => (show_head(), read_worktree()),
     };
     let fp = modified_path.as_deref().map(file_fp).unwrap_or_default();
+    let kind = diff_sides_kind(modified_path.as_deref(), [original.as_ref(), modified.as_ref()]);
+    let b64 = |side: &Option<Vec<u8>>| {
+        side.as_ref().map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+    };
+    let text = |side: &Option<Vec<u8>>| {
+        side.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
+    };
     Ok(FileDiffSides {
         original_exists: original.is_some(),
         modified_exists: modified.is_some(),
-        original: original.unwrap_or_default(),
-        modified: modified.unwrap_or_default(),
+        original_bytes: original.as_ref().map(|b| b.len() as u64).unwrap_or_default(),
+        modified_bytes: modified.as_ref().map(|b| b.len() as u64).unwrap_or_default(),
+        original: if kind == "text" { text(&original) } else { String::new() },
+        modified: if kind == "text" { text(&modified) } else { String::new() },
+        mime: (kind == "image")
+            .then(|| modified_path.as_deref().and_then(preview_mime_for_ext).map(str::to_string))
+            .flatten(),
+        original_data: if kind == "image" { b64(&original) } else { None },
+        modified_data: if kind == "image" { b64(&modified) } else { None },
+        kind,
         fp,
     })
 }
@@ -7104,6 +7823,53 @@ async fn task_match_ignored_files(id: String, clicked: String) -> Result<Vec<Str
 
 // ───────────────────────────── helpers ─────────────────────────────
 
+/// THE same-project name-collision rule (GH #153/#169): live tasks only,
+/// same project, ASCII-case-insensitive, optionally excluding one task id
+/// (renames/restores checking against themselves). Every duplicate guard
+/// and unique_task_name go through here so the rule cannot drift between
+/// call sites; returns the colliding task so errors can echo its name.
+pub(crate) fn task_name_conflict<'a>(
+    tasks: &'a [Task],
+    project_id: &str,
+    name: &str,
+    exclude_task: Option<&str>,
+) -> Option<&'a Task> {
+    tasks.iter().find(|t| {
+        exclude_task != Some(t.id.as_str())
+            && !t.archived
+            && t.project_id == project_id
+            && t.name.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Bump a DERIVED task name past live same-project twins: "main" ->
+/// "main-2" -> "main-3". Mirrors quickTask.ts's uniqueBranch rule: only
+/// auto-filled defaults are adjusted, never a name the caller typed
+/// (callers refuse those as duplicates instead, the task_rename rule).
+/// Without this, the second unnamed "Terminal" on a project derives the
+/// same branch name as the first and the duplicate guard makes it
+/// impossible rather than "main-2" (GH #153 review).
+fn unique_task_name(base: &str, tasks: &[Task], project_id: &str) -> String {
+    let taken = |n: &str| task_name_conflict(tasks, project_id, n, None).is_some();
+    if !taken(base) {
+        return base.to_string();
+    }
+    let parsed = base
+        .rfind('-')
+        .and_then(|i| base[i + 1..].parse::<u32>().ok().map(|v| (i, v)));
+    let (stem, mut n) = match parsed {
+        Some((i, v)) => (&base[..i], v.saturating_add(1)),
+        None => (base, 2),
+    };
+    loop {
+        let cand = format!("{stem}-{n}");
+        if !taken(&cand) {
+            return cand;
+        }
+        n = n.saturating_add(1);
+    }
+}
+
 fn slugify(s: &str) -> String {
     s.trim()
         .to_lowercase()
@@ -7211,12 +7977,13 @@ fn run_script(script: &str, cwd: &Path, port: u16, name: &str) -> Result<String>
     // `bun`/`nvm`/etc. are "command not found" in setup/run scripts even
     // though they work in a terminal (#16), and `$EDITOR` is wrong (#17).
     let mut cmd = Command::new("bash");
+    let (path, inject) = shell_env::spawn_env();
     cmd.arg("-lc").arg(script).current_dir(cwd)
-        .env("PATH", shell_env::resolved_path())
+        .env("PATH", path)
         .env("TERMIC_PORT", port.to_string())
         .env("TERMIC_WORKSPACE_NAME", name)
         .env("TERMIC_TASK", name);
-    for (k, v) in shell_env::login_env() {
+    for (k, v) in inject {
         cmd.env(k, v);
     }
     let out = cmd.output().with_context(|| "run script")?;
@@ -7249,13 +8016,14 @@ fn run_script_streaming(
     use std::process::Stdio;
     thread::spawn(move || {
         let mut cmd = Command::new("bash");
+        let (setup_path, setup_inject) = shell_env::spawn_env();
         cmd.arg("-lc")
             .arg(&script)
             .current_dir(&cwd)
             // Real login-shell env so setup finds bun/nvm/etc. and sees the
             // user's $EDITOR; `bash -l` alone misses what the user set in
             // their actual shell (fish/zsh rc) (#16, #17).
-            .env("PATH", shell_env::resolved_path())
+            .env("PATH", setup_path)
             .env("TERMIC_PORT", port.to_string())
             .env("TERMIC_WORKSPACE_NAME", &name)
             .env("TERMIC_TASK", &name)
@@ -7267,7 +8035,7 @@ fn run_script_streaming(
             .env("PYTHONIOENCODING", "UTF-8")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (k, v) in shell_env::login_env() {
+        for (k, v) in setup_inject {
             cmd.env(k, v);
         }
         let spawn_res = cmd.spawn();
@@ -7973,13 +8741,14 @@ fn task_run_script_stream(
         // `process_group(0)` puts the child in its own group so we can kill
         // the whole tree later via `kill(-pgid, SIGTERM)`.
         let mut cmd = Command::new("bash");
+        let (run_path, run_inject) = shell_env::spawn_env();
         cmd.arg("-lc").arg(&script)
             .current_dir(&cwd)
             // Real login-shell env so the Run script finds bun/nvm/etc. and
             // sees the user's $EDITOR; `bash -l` alone misses what the user
             // set in their actual shell (fish/zsh rc) (#16, #17). The
-            // login_env() loop below adds the non-PATH delta.
-            .env("PATH", shell_env::resolved_path())
+            // inject loop below adds the non-PATH delta.
+            .env("PATH", run_path)
             .env("TERMIC_PORT", port.to_string())
             .env("TERMIC_WORKSPACE_NAME", &name)
             .env("TERMIC_TASK", &name)
@@ -7999,7 +8768,7 @@ fn task_run_script_stream(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        for (k, v) in shell_env::login_env() {
+        for (k, v) in run_inject {
             cmd.env(k, v);
         }
         for (k, v) in &sibling_ports {
@@ -8083,11 +8852,21 @@ fn running_greps_swap(ws_id: &str, new_pid: Option<i32>) -> Option<i32> {
 /// the cap the child is SIGKILLed and `truncated: true` is reported.
 /// Re-entrant safety: any previous grep for the same task is killed
 /// before this one starts (typing fires a new search per keystroke).
+/// `regex` picks POSIX ERE (`-E`) over a literal match (`-F`). Not PCRE
+/// (`-P`) — git is not always compiled with libpcre, Apple's is not.
+/// `case_sensitive` drops the default `-i`.
+#[derive(Deserialize)]
+pub struct GrepOpts {
+    pub regex: bool,
+    pub case_sensitive: bool,
+}
+
 #[tauri::command]
 fn task_grep_start(
     id: String,
     query: String,
     search_id: String,
+    opts: GrepOpts,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
@@ -8125,13 +8904,15 @@ fn task_grep_start(
     let app_o = app.clone();
     let ws_id_o = id.clone();
     let search_id_o = search_id.clone();
+    // git grep flags: -n line numbers, --column column, -I skip binary,
+    // -F literal / -E POSIX ERE, -i / --no-ignore-case, --untracked
+    // --exclude-standard include new files but respect .gitignore.
+    let match_mode = if opts.regex { "-E" } else { "-F" };
+    let case_flag = if opts.case_sensitive { "--no-ignore-case" } else { "-i" };
 
     thread::spawn(move || {
-        // git grep flags: -n line numbers, --column column, -I skip binary,
-        // -F literal, -i case-insensitive, --untracked --exclude-standard
-        // include new files but respect .gitignore. process_group(0) to kill
-        // the tree. We run one child per repo, serially, sharing the result
-        // cap + batch across all of them.
+        // process_group(0) to kill the tree. We run one child per repo,
+        // serially, sharing the result cap + batch across all of them.
         const RESULT_CAP: usize = 500;
         const BATCH_MAX: usize = 50;
         const BATCH_MS: u128 = 30;
@@ -8162,7 +8943,7 @@ fn task_grep_start(
             let spawn = std::process::Command::new("git")
                 .args([
                     "grep",
-                    "-n", "--column", "-I", "-F", "-i",
+                    "-n", "--column", "-I", match_mode, case_flag,
                     "--untracked", "--exclude-standard",
                     "--no-color",
                     "-e", &query,
@@ -8313,6 +9094,69 @@ pub fn dlog(msg: &str) {
 #[tauri::command]
 fn home_dir() -> String {
     dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Names of the projects a candidate tasks path would break, i.e. the ones
+/// `check_tasks_root` will refuse at create time because the path resolves
+/// onto or above their repo. Empty = the value is safe everywhere.
+///
+/// Exists so the complaint lands where the value is TYPED. The create-time
+/// guard is the real safety net, but on its own it defers the error until the
+/// user makes a task, by which point it reads as "task creation is broken"
+/// rather than "that path you set is wrong". Relative paths resolve per
+/// project, so a value can be fine for some repos and fatal for others, which
+/// is why this answers with a list of names instead of a bool.
+///
+/// `project_id` = None checks the value as the GLOBAL default across every
+/// project; Some(id) checks it as that one project's override.
+#[tauri::command]
+fn tasks_path_conflicts(path: String, project_id: Option<String>) -> Vec<String> {
+    // Neither mode normally needs settings.json: in global mode the CANDIDATE
+    // is the default, and in override mode a non-empty candidate short-circuits
+    // the default entirely. Only an EMPTY override (which means "inherit")
+    // has to read the stored value, so the load stays off the typing path.
+    let is_override = project_id.is_some();
+    let inherited = (is_override && path.trim().is_empty())
+        .then(|| load_settings_inner().default_tasks_path)
+        .unwrap_or_default();
+    load_projects()
+        .into_iter()
+        .filter(|p| match project_id.as_deref() {
+            Some(id) => p.id == id,
+            // Global mode judges only the projects that actually FOLLOW the
+            // default. One with its own override never consults it, so
+            // reporting it would block a save over an irrelevant project.
+            None => p.tasks_path.trim().is_empty(),
+        })
+        .filter(|p| {
+            // Both arms resolve the CANDIDATE `path`, never the stored value —
+            // the point is to judge what the user just typed.
+            let root = if is_override {
+                // The candidate is that project's worktree root verbatim,
+                // resolved exactly as task_create would.
+                project_tasks_root_with(&inherited, &Project {
+                    tasks_path: path.clone(),
+                    root_path: p.root_path.clone(),
+                    ..Default::default()
+                })
+            } else {
+                tasks_root_from_default(&path, p)
+            };
+            check_tasks_root(&root, Path::new(&p.root_path)).is_err()
+        })
+        .map(|p| p.name)
+        .collect()
+}
+
+/// Where `project_id`'s worktrees land with NO project-level override, i.e.
+/// purely from the global "Default tasks path". Powers the placeholder on
+/// Settings → Repository → Tasks path, so that field can be left empty and
+/// still show the user where tasks will go.
+#[tauri::command]
+fn project_tasks_path_default(project_id: String) -> Result<String, String> {
+    let p = load_projects().into_iter().find(|p| p.id == project_id)
+        .ok_or("project not found")?;
+    Ok(project_tasks_root_default(&p).to_string_lossy().into_owned())
 }
 
 /// The user's login shell (`$SHELL` with a zsh → bash → fish → sh
@@ -8475,6 +9319,90 @@ fn reveal_path(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// What to do once the OS launcher has been run for a file (GH #147).
+/// Only the real (non-e2e) build shells out, so the e2e binary never reaches
+/// the decision — the unit tests below still cover it in either build.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum AfterOpen {
+    /// The default app took it (or we cannot tell, so assume it did).
+    Done,
+    /// Nothing is registered for this file, so show it in the file manager.
+    Reveal,
+}
+
+/// Decide whether `open_file_external` falls back to revealing the file.
+///
+/// `open_path` treats only a SPAWN failure as an error and ignores the exit
+/// status. That is right for URLs but wrong for files: `open` (macOS) and
+/// `xdg-open` (Linux, exit 3) both exit non-zero when no handler is
+/// registered for the extension, which is the case the fallback exists for.
+///
+/// Windows is deliberately excluded. `explorer.exe` exits non-zero even on
+/// success (see `open_command`), so its status carries no signal and keying
+/// on it would reveal the file on every single open. Windows instead gets
+/// explorer's own "how do you want to open this file?" picker, which covers
+/// the same need natively.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn after_open(os: &str, spawned: bool, exit_ok: bool) -> AfterOpen {
+    if !spawned {
+        // The launcher binary itself is missing or unrunnable. Nothing was
+        // handed to the OS, so the file manager is the only thing left.
+        return AfterOpen::Reveal;
+    }
+    if os == "windows" || exit_ok {
+        return AfterOpen::Done;
+    }
+    AfterOpen::Reveal
+}
+
+/// E2E-ONLY (`--features e2e`): record an external-open instead of running
+/// it. A spec that double-clicks a `.blend` row must not launch Blender on
+/// the machine running the suite, and the reveal fallback would pop a Finder
+/// window over the window under test. One path per line in the isolated
+/// profile dir, so the spec reads it with plain `fs` and needs no extra IPC
+/// command (which would otherwise linger in release builds).
+#[cfg(feature = "e2e")]
+fn e2e_record_open(path: &str) {
+    if let Ok(dir) = data_dir() {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("e2e-opened.log"))
+            .and_then(|mut f| writeln!(f, "{path}"));
+    }
+}
+
+/// Hand an ABSOLUTE file path to the OS default app, falling back to
+/// revealing it in the file manager when nothing is registered for it
+/// (GH #147, the file tree's double-click).
+///
+/// Returns "opened" or "revealed" so the frontend can tell the user which
+/// happened. `Err` only when the fallback ALSO failed, i.e. the file reached
+/// neither an app nor the file manager.
+#[tauri::command]
+fn open_file_external(path: String) -> Result<String, String> {
+    #[cfg(feature = "e2e")]
+    {
+        e2e_record_open(&path);
+        return Ok("opened".to_string());
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let os = std::env::consts::OS;
+        let (program, args) = open_command(os, &path);
+        let status = Command::new(program).args(&args).status();
+        let spawned = status.is_ok();
+        let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
+        if after_open(os, spawned, exit_ok) == AfterOpen::Done {
+            return Ok("opened".to_string());
+        }
+        let (program, args) = reveal_command(os, &path);
+        Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
+        Ok("revealed".to_string())
+    }
+}
+
 /// The argv for opening `target` (a URL or filesystem path) in the OS
 /// default handler. Split out from the side-effecting spawn so the
 /// per-platform dispatch is unit-testable. `os` is
@@ -8555,12 +9483,39 @@ pub struct Settings {
     #[serde(default)]
     pub discovery_dismissed: Vec<String>,
     /// "Enable CLI" (Settings, General): gates every authenticated verb of
-    /// the `termic` control socket. Default OFF; the server always binds and
-    /// answers hello regardless, so a disabled CLI fails fast with a clear
-    /// error instead of a launch-then-timeout dead end (docs/plans/cli.md,
-    /// Landing). Re-read per request, so flipping it applies live.
-    #[serde(default)]
+    /// the `termic` control socket. The server always binds and answers hello
+    /// regardless, so a disabled CLI fails fast with a clear error instead of
+    /// a launch-then-timeout dead end (docs/plans/cli.md, Landing). Re-read
+    /// per request, so flipping it applies live.
+    ///
+    /// Default ON since the CLI left experimental. Access is gated by the
+    /// per-boot token in `<data_dir>/cli-token` (0600, never placed in any
+    /// child's env, cli_server.rs), so the default does not widen the trust
+    /// boundary: it only removes a setup step.
+    ///
+    /// The default alone only reaches fresh profiles and files predating the
+    /// field, because the whole struct is serialized on every save, so any
+    /// existing profile already carries an explicit `cli_enabled: false`.
+    /// `cli_default_migrated` is what reaches those.
+    #[serde(default = "default_true")]
     pub cli_enabled: bool,
+    /// One-time marker for the "CLI graduated, turn it on" migration
+    /// (`migrate_cli_enabled_default`). False/absent means the flip has not
+    /// happened for this profile yet.
+    ///
+    /// A dedicated marker rather than a `schema_version` bump: that counter
+    /// belongs to the workspaces->tasks data migration, which gates on
+    /// `>= TASKS_SCHEMA_VERSION`, so raising it would re-run that migration
+    /// for every existing install.
+    ///
+    /// It cannot distinguish "off because that was the default" from "off
+    /// because the user turned it off", since both are stored as plain
+    /// `false`. The flip is therefore deliberately a one-shot: it runs once
+    /// and stamps this, so anyone who switches the CLI back off keeps it off
+    /// forever after. Accepted because the CLI shipped off by default, so
+    /// nearly every `false` on disk is the default rather than a decision.
+    #[serde(default)]
+    pub cli_default_migrated: bool,
     /// What the window's close button does: "ask" (default) | "menubar" |
     /// "quit". "ask" shows the close prompt whose "Don't ask again" checkbox
     /// writes the chosen one back here. Stored rather than inferred so the
@@ -8588,6 +9543,22 @@ pub struct Settings {
     /// pre-filled, not off, so upgraders keep the original behavior.
     #[serde(default = "default_worktree_symlink_paths")]
     pub worktree_symlink_paths: Vec<String>,
+    /// Where new task worktrees are created, for every project that doesn't
+    /// override it in its own Repository settings.
+    ///
+    /// An ABSOLUTE value (`/vol/work`, `~/code/worktrees`) collects every
+    /// project under one roof, one subdirectory per project folder name -
+    /// exactly what the app did before this setting existed. A RELATIVE value
+    /// (`worktrees`, `.termic/tasks`, `../tasks`) resolves against each
+    /// project's own directory instead, so a repo's tasks live beside it.
+    ///
+    /// REQUIRED, not an "unset" sentinel: files written before this shipped
+    /// (and fresh profiles) get seeded with the built-in `~/<APP_DIR>/tasks`
+    /// so the UI can show a real value rather than a placeholder. A blank
+    /// value can only come from a hand-edited settings.json, and resolves to
+    /// the same built-in. Resolution lives in `project_tasks_root`.
+    #[serde(default = "builtin_tasks_path")]
+    pub default_tasks_path: String,
 }
 
 /// Whether the pre-create base fetch (GH #79) is enabled. Default-on: only an
@@ -9198,6 +10169,9 @@ fn seeded_defaults() -> Settings {
     Settings {
         agents: default_agents(),
         worktree_symlink_paths: default_worktree_symlink_paths(),
+        // Required field: derive(Default) would give "", which the UI would
+        // render as an empty required box on a fresh install.
+        default_tasks_path: builtin_tasks_path(),
         ..Settings::default()
     }
 }
@@ -9629,7 +10603,6 @@ async fn detect_clis() -> Vec<CliInfo> {
 }
 
 fn detect_clis_blocking() -> Vec<CliInfo> {
-    let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let agents = load_settings_inner().agents;
     // Probe agents concurrently — each agent costs a login-shell spawn
     // (`sh -lc`, which sources the user's profile and can take hundreds
@@ -9640,7 +10613,6 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
     let handles: Vec<_> = agents.iter().map(|agent| {
         let id = agent.id.clone();
         let bin = agent.command.trim().to_string();
-        let home = home.clone();
         thread::spawn(move || {
             let bin = bin.as_str();
             let mut found = false;
@@ -9670,15 +10642,13 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
                         }
                     }
                 }
-                // Fallback: probe common macOS install locations directly.
+                // Fallback: probe common install locations directly. Same
+                // list the PATH fallback unions in, and for the same
+                // reason (the login shell that would have found these is
+                // exactly what just failed) — kept in one place so a dir
+                // added there is never missing from the install badge.
                 if !found {
-                    for c in [
-                        format!("{home}/.local/bin/{bin}"),
-                        format!("/opt/homebrew/bin/{bin}"),
-                        format!("/usr/local/bin/{bin}"),
-                        format!("{home}/.bun/bin/{bin}"),
-                        format!("{home}/.cargo/bin/{bin}"),
-                    ] {
+                    for c in shell_env::fallback_dirs().iter().map(|d| format!("{d}/{bin}")) {
                         if Path::new(&c).exists() {
                             found = true;
                             path = c;
@@ -10257,7 +11227,26 @@ pub(crate) fn leave_windowless(app: &AppHandle) {
     }
 }
 
+// ─── startup timing ──────────────────────────────────────────────────────
+// Stamped as early as `run()` can manage. The webview reads it back at first
+// paint (`src/lib/perfMarks.ts`) so the nightly perf job can report
+// spawn → first paint as ONE number, instead of only the webview-relative
+// half that `performance.timeOrigin` gives you. Process spawn → webview
+// creation is real cost a user feels and is invisible from JS.
+//
+// Deliberately NOT behind `--features e2e`: it is one `Instant` and an integer
+// read, and `make perf` wants it available on an ordinary build.
+static BOOT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since process start. 0 if called before `run()` stamped it,
+/// which cannot happen from the webview (it does not exist yet).
+#[tauri::command]
+fn perf_boot_elapsed_ms() -> u64 {
+    BOOT.get().map(|t| t.elapsed().as_millis() as u64).unwrap_or(0)
+}
+
 pub fn run() {
+    let _ = BOOT.set(Instant::now());
     // WebKitGTK 2.42+ defaults to its DMA-BUF renderer. It's the FAST path on
     // AMD/Intel (X11 and Wayland) and MUST stay on there: disabling it drops
     // the whole webview onto a slow copy/software compositing path and makes
@@ -10405,6 +11394,12 @@ pub fn run() {
             // layout. Best-effort + gated by settings.schema_version, so it's a
             // cheap no-op on every launch after the first.
             migrate_workspaces_to_tasks();
+            // One-time flip of cli_enabled for profiles that predate the CLI
+            // graduating (0.26.0). Ordered after the task migration and before
+            // the window so the control socket's first request already reads
+            // the migrated value; cli_enabled is re-read per request, so even
+            // an in-flight one picks it up.
+            migrate_cli_enabled_default();
             // The main window is created HERE (not in tauri.conf.json) so the
             // macOS traffic-light inset can be chosen per-OS. macOS Tahoe (26+)
             // stopped vertically centering the window controls in an overlay
@@ -10607,11 +11602,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            perf_boot_elapsed_ms,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,
             tasks_list, task_create, task_create_multi, task_open_repo, task_importable_worktrees, task_import_worktree, task_archive, task_set_cli, task_set_custom_command, task_set_resume_override, task_set_sandbox, task_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, task_sandbox_add_allowed_host, task_sandbox_add_allowed_path, task_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, task_recent_denials,
             repo_config_load, repo_config_load_at, repo_config_save, repo_config_scaffold, repo_config_add_allowed_host, repo_config_add_allowed_path,
 
+            task_reorder,
             task_restore, task_delete, task_run_script, task_run_script_stream, task_stop_script, task_record_spawn, task_set_has_history, task_set_agent_session_id,
             task_set_tabs, task_set_tab_session_id, task_set_tab_previous_session_id,
             task_set_split_layout,
@@ -10620,11 +11617,11 @@ pub fn run() {
             task_spotlight_start, task_spotlight_stop, task_spotlight_resync, task_spotlight_status,
             task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main, task_merge_to_main,
             task_changes, task_git_status, task_git_branches, project_git_branches, project_branch_context, task_git_checkout, task_git_update, task_git_update_info, task_stage, task_unstage, task_commit, task_discard,
-            task_file_diff, task_file_diff_sides, task_file_read, task_file_read_base64, task_file_write, task_dir_list, task_path_stat,
+            task_file_diff, task_file_diff_sides, task_file_read, task_file_read_base64, task_file_fp, task_file_write, task_dir_list, task_path_stat,
             task_path_rename, task_path_delete, task_reveal_path,
             task_rename, project_rename,
             pty_spawn, pty_write, pty_resize, pty_kill,
-            notify, open_path, reveal_path, home_dir, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
+            notify, open_path, reveal_path, open_file_external, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
             settings_load, settings_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
             automation::automation_result,
             automation::automation_armed,
@@ -10952,6 +11949,101 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // CLI graduation (0.26.0): the serde default only reaches profiles with
+    // the field absent, so existing installs need the one-time flip. The
+    // contract worth pinning is that it is ONE time: without the marker check
+    // the CLI would switch itself back on at every launch and there would be
+    // no way to keep it off.
+    #[test]
+    fn cli_migration_turns_it_on_for_an_existing_profile_that_had_it_off() {
+        let mut s = Settings { cli_enabled: false, cli_default_migrated: false, ..Default::default() };
+        assert!(apply_cli_default_migration(&mut s), "should report a change to persist");
+        assert!(s.cli_enabled);
+        assert!(s.cli_default_migrated, "marker must be stamped so it never re-runs");
+    }
+
+    #[test]
+    fn cli_migration_never_re_enables_after_the_user_turns_it_off() {
+        // The state right after someone switches the CLI off post-migration.
+        let mut s = Settings { cli_enabled: false, cli_default_migrated: true, ..Default::default() };
+        assert!(!apply_cli_default_migration(&mut s), "must not rewrite settings");
+        assert!(!s.cli_enabled, "an explicit opt-out has to survive relaunch");
+    }
+
+    #[test]
+    fn cli_migration_stamps_a_fresh_profile_without_changing_the_answer() {
+        // Fresh install: the serde default already gave us true, but the
+        // marker still has to be stamped or the flip stays pending forever.
+        let mut s = Settings { cli_enabled: true, cli_default_migrated: false, ..Default::default() };
+        assert!(apply_cli_default_migration(&mut s));
+        assert!(s.cli_enabled);
+        assert!(s.cli_default_migrated);
+    }
+
+    fn role(kind: &str, task: &str) -> PtyRole {
+        PtyRole { task_id: task.into(), tab_id: None, kind: kind.into(), is_default: false }
+    }
+
+    // The derived-name bump (GH #153): unnamed repo-root sessions all
+    // derive the branch name, and the duplicate guard must adjust those
+    // past live twins rather than make the second session impossible.
+    #[test]
+    fn unique_task_name_bumps_derived_names_past_live_twins() {
+        let t = |name: &str, project: &str, archived: bool| Task {
+            name: name.into(),
+            project_id: project.into(),
+            archived,
+            ..Task::default()
+        };
+        let tasks = vec![
+            t("main", "p1", false),
+            t("main-2", "p1", false),
+            t("main", "p2", false),  // other project: never collides
+            t("main-3", "p1", true), // archived: reusable
+        ];
+        // A free name passes through untouched.
+        assert_eq!(unique_task_name("solo", &tasks, "p1"), "solo");
+        // Taken (case-insensitive) bumps past every LIVE twin; the
+        // archived main-3 does not block its own reuse.
+        assert_eq!(unique_task_name("Main", &tasks, "p1"), "Main-3");
+        // A base already ending in -<n> bumps the number, no nesting.
+        assert_eq!(unique_task_name("main-2", &tasks, "p1"), "main-3");
+        // Same name, other project: only its own twins count.
+        assert_eq!(unique_task_name("main", &tasks, "p2"), "main-2");
+    }
+
+    // `termic quit`'s confirmation says "kills N agents across M tasks", and
+    // that number is the only thing between a teardown script and every
+    // running agent. The PTY map also holds the aux shell, plain shell tabs
+    // and setup/run script tabs; counting those as "agents" would inflate the
+    // number the user is deciding on.
+    #[test]
+    fn live_agent_count_counts_agents_only() {
+        let a1 = role("agent", "t1");
+        let a2 = role("agent", "t1"); // second agent tab, SAME task
+        let a3 = role("agent", "t2");
+        let aux = role("aux", "t1");
+        let slots = vec![
+            (true, Some(&a1)),
+            (true, Some(&a2)),
+            (true, Some(&a3)),
+            (true, Some(&aux)),  // aux shell: dies too, but is not an agent
+            (true, None),        // setup/run script or plain shell tab
+            (false, Some(&a3)),  // already exited: nothing left to kill
+        ];
+        // 3 live agent tabs across 2 distinct tasks.
+        assert_eq!(count_live_agents(slots.into_iter()), (2, 3));
+    }
+
+    #[test]
+    fn live_agent_count_is_zero_when_only_shells_are_open() {
+        let aux = role("aux", "t1");
+        let slots = vec![(true, Some(&aux)), (true, None)];
+        // Must not report "1 agent across 0 tasks" - the shape the old
+        // slot.task_id attribution produced.
+        assert_eq!(count_live_agents(slots.into_iter()), (0, 0));
+    }
 
     // The close button routes on a STRING from settings.json. Anything the
     // app does not recognise must fall back to ASKING: quitting kills every
@@ -11347,6 +12439,73 @@ mod tests {
     }
 
     #[test]
+    fn task_file_fp_for_task_changes_only_when_the_bytes_change() {
+        // The PDF pane reuses its <embed> URL while this string holds, so a
+        // rewrite MUST move it and a re-stat of untouched bytes must not.
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("report.pdf");
+        fs::write(&pdf, b"%PDF-1.4\none page").unwrap();
+        let task = Task { path: dir.path().to_string_lossy().into_owned(), ..Default::default() };
+
+        let first = task_file_fp_for_task(&task, "report.pdf").unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(task_file_fp_for_task(&task, "report.pdf").unwrap(), first);
+
+        fs::write(&pdf, b"%PDF-1.4\none page, rewritten longer").unwrap();
+        assert_ne!(task_file_fp_for_task(&task, "report.pdf").unwrap(), first);
+    }
+
+    #[test]
+    fn task_file_fp_for_task_resolves_member_path() {
+        let host = tempdir().unwrap();
+        let member = tempdir().unwrap();
+        fs::write(member.path().join("report.pdf"), b"%PDF-1.4\n").unwrap();
+        let task = task_with_member("docs", host.path(), member.path());
+
+        assert!(!task_file_fp_for_task(&task, "docs/report.pdf").unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_file_fp_for_task_rejects_non_previewable_extension() {
+        // A stat is not a read, but this must not become a generic "does the
+        // agent's private key exist, and how big is it" oracle either.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("id_rsa"), "secret").unwrap();
+        let task = Task { path: dir.path().to_string_lossy().into_owned(), ..Default::default() };
+
+        assert!(task_file_fp_for_task(&task, "id_rsa").is_err());
+    }
+
+    #[test]
+    fn task_file_fp_for_task_rejects_a_symlink_escaping_the_worktree() {
+        // A `.pdf` NAME is not a `.pdf` LOCATION: containment is decided by
+        // `safe_task_path`, which canonicalizes through the symlink before
+        // the extension is ever looked at, so an in-worktree link pointing
+        // out cannot turn this into a stat oracle for the whole disk.
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("elsewhere.pdf"), b"%PDF-1.4\n").unwrap();
+        let ws = tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("elsewhere.pdf"),
+            ws.path().join("looks-local.pdf"),
+        )
+        .unwrap();
+        let task = Task { path: ws.path().to_string_lossy().into_owned(), ..Default::default() };
+
+        assert!(task_file_fp_for_task(&task, "looks-local.pdf").is_err());
+    }
+
+    #[test]
+    fn task_file_fp_for_task_errors_on_a_missing_file() {
+        // Same answer the base64 read gives; the PDF pane keeps whatever it
+        // has on screen rather than reloading on it.
+        let dir = tempdir().unwrap();
+        let task = Task { path: dir.path().to_string_lossy().into_owned(), ..Default::default() };
+
+        assert!(task_file_fp_for_task(&task, "gone.pdf").is_err());
+    }
+
+    #[test]
     fn read_preview_file_for_task_roundtrips_pdf_bytes_and_mime() {
         let dir = tempdir().unwrap();
         let pdf_bytes: &[u8] = b"%PDF-1.4\nnot-a-real-pdf-but-that's-fine-here";
@@ -11398,6 +12557,41 @@ mod tests {
     fn open_command_unknown_os_falls_back_to_xdg_open() {
         let (prog, _) = open_command("freebsd", "https://x.com");
         assert_eq!(prog, "xdg-open");
+    }
+
+    #[test]
+    fn after_open_reveals_when_no_handler_is_registered() {
+        // The whole point of the fallback (#147): `open` on macOS and
+        // `xdg-open` on Linux (exit 3) both fail when nothing claims the
+        // extension, e.g. a .blend with no Blender installed.
+        assert_eq!(after_open("macos", true, false), AfterOpen::Reveal);
+        assert_eq!(after_open("linux", true, false), AfterOpen::Reveal);
+    }
+
+    #[test]
+    fn after_open_keeps_quiet_when_the_app_took_it() {
+        // A clean exit means an app launched, so no Finder window on top.
+        assert_eq!(after_open("macos", true, true), AfterOpen::Done);
+        assert_eq!(after_open("linux", true, true), AfterOpen::Done);
+    }
+
+    #[test]
+    fn after_open_never_reveals_on_windows() {
+        // explorer.exe exits non-zero even on SUCCESS (see open_command), so
+        // keying the fallback on its status would pop a file-manager window
+        // on every single open. Windows gets explorer's own picker instead.
+        assert_eq!(after_open("windows", true, false), AfterOpen::Done);
+        assert_eq!(after_open("windows", true, true), AfterOpen::Done);
+    }
+
+    #[test]
+    fn after_open_reveals_when_the_launcher_cannot_spawn() {
+        // No `open`/`xdg-open` binary at all: nothing reached the OS, so the
+        // file manager is the only thing left to try. Windows included here
+        // — a missing explorer.exe is a real spawn failure, not exit noise.
+        assert_eq!(after_open("macos", false, false), AfterOpen::Reveal);
+        assert_eq!(after_open("linux", false, false), AfterOpen::Reveal);
+        assert_eq!(after_open("windows", false, false), AfterOpen::Reveal);
     }
 
     #[test]
@@ -11656,6 +12850,105 @@ mod tests {
         let unstaged = task_file_diff_sides_for_task(&task, "base.txt", Some("unstaged")).unwrap();
         assert_eq!(unstaged.original, "staged content\n");
         assert_eq!(unstaged.modified, "worktree content\n");
+
+        assert_eq!(full.kind, "text");
+        assert_eq!(full.original_bytes, "base content\n".len() as u64);
+    }
+
+    /// A 1×1 transparent PNG — real enough that an <img> renders it.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+        0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+        0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+        0x42, 0x60, 0x82,
+    ];
+
+    /// `git_commit_file` takes a &str, so binary fixtures commit their bytes
+    /// here instead.
+    fn git_commit_bytes(repo: &Path, name: &str, bytes: &[u8]) {
+        fs::write(repo.join(name), bytes).unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["-c", "user.name=Test", "-c", "user.email=t@t", "commit", "-m", name]);
+    }
+
+    fn task_at(dir: &Path) -> Task {
+        Task { path: dir.to_string_lossy().into_owned(), ..Default::default() }
+    }
+
+    #[test]
+    fn diff_sides_ships_both_png_sides_as_base64() {
+        use base64::Engine as _;
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_commit_bytes(dir.path(), "shot.png", TINY_PNG);
+        // Any different bytes; the modified side just has to not equal HEAD.
+        let edited: Vec<u8> = TINY_PNG.iter().copied().chain([0u8, 1, 2]).collect();
+        fs::write(dir.path().join("shot.png"), &edited).unwrap();
+
+        let sides = task_file_diff_sides_for_task(&task_at(dir.path()), "shot.png", None).unwrap();
+        assert_eq!(sides.kind, "image");
+        assert_eq!(sides.mime.as_deref(), Some("image/png"));
+        assert!(sides.original_exists && sides.modified_exists);
+        // The whole point: bytes survive the round trip instead of being
+        // lossily decoded into U+FFFD.
+        let dec = |s: &Option<String>| {
+            base64::engine::general_purpose::STANDARD.decode(s.as_ref().unwrap()).unwrap()
+        };
+        assert_eq!(dec(&sides.original_data), TINY_PNG);
+        assert_eq!(dec(&sides.modified_data), edited);
+        assert_eq!(sides.original_bytes, TINY_PNG.len() as u64);
+        assert_eq!(sides.modified_bytes, edited.len() as u64);
+        // Text fields stay empty for a non-text diff.
+        assert!(sides.original.is_empty() && sides.modified.is_empty());
+        assert!(!sides.fp.is_empty());
+    }
+
+    #[test]
+    fn diff_sides_reports_an_untracked_png_as_a_one_sided_image() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        fs::write(dir.path().join("new.png"), TINY_PNG).unwrap();
+
+        let sides = task_file_diff_sides_for_task(&task_at(dir.path()), "new.png", None).unwrap();
+        assert_eq!(sides.kind, "image");
+        assert!(!sides.original_exists);
+        assert!(sides.modified_exists);
+        assert!(sides.original_data.is_none());
+        assert!(sides.modified_data.is_some());
+        assert_eq!(sides.original_bytes, 0);
+        assert_eq!(sides.modified_bytes, TINY_PNG.len() as u64);
+    }
+
+    #[test]
+    fn diff_sides_summarizes_a_non_image_binary_without_shipping_bytes() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_commit_bytes(dir.path(), "blob.bin", &[0u8, 159, 146, 150]);
+        fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3, 4, 5]).unwrap();
+
+        let sides = task_file_diff_sides_for_task(&task_at(dir.path()), "blob.bin", None).unwrap();
+        assert_eq!(sides.kind, "binary");
+        assert!(sides.mime.is_none());
+        assert!(sides.original_data.is_none() && sides.modified_data.is_none());
+        assert_eq!(sides.original_bytes, 4);
+        assert_eq!(sides.modified_bytes, 6);
+    }
+
+    #[test]
+    fn diff_sides_keeps_svg_as_a_text_diff() {
+        // SVG is in the image extension whitelist but is valid UTF-8, and a
+        // line diff of the changed attribute beats two pictures.
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        git_commit_bytes(dir.path(), "icon.svg", b"<svg width=\"1\"/>\n");
+        fs::write(dir.path().join("icon.svg"), "<svg width=\"2\"/>\n").unwrap();
+
+        let sides = task_file_diff_sides_for_task(&task_at(dir.path()), "icon.svg", None).unwrap();
+        assert_eq!(sides.kind, "text");
+        assert_eq!(sides.original, "<svg width=\"1\"/>\n");
+        assert_eq!(sides.modified, "<svg width=\"2\"/>\n");
+        assert!(sides.original_data.is_none() && sides.modified_data.is_none());
     }
 
     // ──────────────── spotlight git mechanics ────────────────
@@ -12342,5 +13635,344 @@ mod tests {
         // The branch ref STILL hasn't moved through all of this.
         assert_eq!(git_rev(main, "main"), main_ref_before, "main ref never moved");
         assert_eq!(git_head(main), git_head(&wt), "repo root HEAD == worktree HEAD");
+    }
+
+    // ── Default tasks path (global setting + per-project override) ──────
+
+    fn proj(root: &str, tasks_path: &str) -> Project {
+        Project {
+            id: "p1".into(),
+            name: "Web App".into(),
+            root_path: root.into(),
+            tasks_path: tasks_path.into(),
+            ..Default::default()
+        }
+    }
+
+    // The shipped default is the tilde form, and it resolves to the same
+    // `~/APP_DIR/tasks/<repo folder>` worktrees used before the setting
+    // existed. Pinned because the seeded string is what the user sees and
+    // edits, while the migration compares against the expanded path.
+    #[test]
+    fn the_builtin_default_resolves_to_the_app_tasks_dir() {
+        let p = proj("/Users/x/code/web", "");
+        assert_eq!(builtin_tasks_path(), format!("~/{APP_DIR}/tasks"));
+        assert_eq!(
+            project_tasks_root_with(&builtin_tasks_path(), &p),
+            default_worktrees_base().join("web"),
+        );
+    }
+
+    // Blank can only come from a hand-edited settings.json (the UI requires a
+    // value). It must not produce a relative "web" dir next to the CWD.
+    #[test]
+    fn a_blank_default_falls_back_to_the_builtin() {
+        let p = proj("/Users/x/code/web", "");
+        assert_eq!(
+            project_tasks_root_with("   ", &p),
+            default_worktrees_base().join("web"),
+        );
+    }
+
+    // A full path collects every project under one root, a folder each — so
+    // two repos with different names can share it without colliding.
+    #[test]
+    fn absolute_location_gets_a_subdir_per_project() {
+        let web = proj("/Users/x/code/web", "");
+        let api = proj("/Users/x/other/api", "");
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &web),
+            PathBuf::from("/vol/work/web"),
+        );
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &api),
+            PathBuf::from("/vol/work/api"),
+        );
+    }
+
+    // `~` counts as absolute (it names a fixed place), and is expanded rather
+    // than left for the shell — nothing downstream runs these through one.
+    #[test]
+    fn tilde_location_is_absolute_and_expanded() {
+        let p = proj("/Users/x/code/web", "");
+        let home = dirs::home_dir().expect("test host has a home dir");
+        assert_eq!(
+            project_tasks_root_with("~/worktrees", &p),
+            home.join("worktrees").join("web"),
+        );
+        assert!(is_absolute_location("~"));
+        assert!(is_absolute_location("~/wt"));
+        assert!(is_absolute_location("/vol/wt"));
+        assert!(!is_absolute_location("wt"));
+        assert!(!is_absolute_location("./wt"));
+        assert!(!is_absolute_location("../wt"));
+    }
+
+    // A relative location is already project-scoped: it hangs off the repo's
+    // own directory and does NOT get the project name appended (that would
+    // give `<repo>/worktrees/web/<task>`).
+    #[test]
+    fn relative_location_resolves_inside_the_project() {
+        let p = proj("/Users/x/code/web", "");
+        assert_eq!(
+            project_tasks_root_with("worktrees", &p),
+            PathBuf::from("/Users/x/code/web/worktrees"),
+        );
+        // `./` is noise, not a path segment.
+        assert_eq!(
+            project_tasks_root_with("./.termic/tasks", &p),
+            PathBuf::from("/Users/x/code/web/.termic/tasks"),
+        );
+        // `..` escapes to a sibling of the repo, which is a legitimate layout.
+        // It MUST come back lexically resolved: task_create compares this
+        // against `git worktree list`, which reports canonical paths, and a
+        // stray `..` would make it read a live worktree as a deletable orphan.
+        assert_eq!(
+            project_tasks_root_with("../wt", &p),
+            PathBuf::from("/Users/x/code/wt"),
+        );
+    }
+
+    // The guard behind that: `.` (and any override naming the repo or an
+    // ancestor) resolves onto the working tree itself, where task_create's
+    // orphan cleanup would rm -rf a tracked directory sharing the task slug.
+    #[test]
+    fn a_tasks_root_containing_the_repo_is_rejected() {
+        let repo = Path::new("/Users/x/code/web");
+        let p = proj("/Users/x/code/web", "");
+        // As the GLOBAL default. An absolute value still gets the project dir
+        // appended, so only ones that land ON or ABOVE the repo are dangerous.
+        for bad in [".", "./", "..", "/Users/x/code"] {
+            let root = project_tasks_root_with(bad, &p);
+            assert!(
+                check_tasks_root(&root, repo).is_err(),
+                "global {bad:?} resolved to {root:?}, which must not be accepted",
+            );
+        }
+        // As a per-project OVERRIDE, an absolute value is the worktree root
+        // verbatim — so naming the repo itself is dangerous here even though
+        // the same string is harmless as a global.
+        for bad in [".", "..", "/Users/x/code/web", "/Users/x/code"] {
+            let over = proj("/Users/x/code/web", bad);
+            let root = project_tasks_root_with("/vol/work", &over);
+            assert!(
+                check_tasks_root(&root, repo).is_err(),
+                "override {bad:?} resolved to {root:?}, which must not be accepted",
+            );
+        }
+        // ...while the layouts we advertise stay allowed.
+        for ok in ["worktrees", "./.termic/tasks", "../wt", "/vol/work"] {
+            let root = project_tasks_root_with(ok, &p);
+            assert!(
+                check_tasks_root(&root, repo).is_ok(),
+                "{ok:?} resolved to {root:?} and should be accepted",
+            );
+        }
+        // A global pointing AT the repo is fine: it nests one level in.
+        assert_eq!(
+            project_tasks_root_with("/Users/x/code/web", &p),
+            PathBuf::from("/Users/x/code/web/web"),
+        );
+    }
+
+    // The save-time check and the create-time guard must agree, or the UI
+    // would green-light a value that later refuses to create a task. Both go
+    // through check_tasks_root on an identically-resolved root; this pins the
+    // two resolution modes the command switches between.
+    #[test]
+    fn conflict_detection_matches_the_create_time_guard() {
+        let repo = Path::new("/Users/x/code/web");
+        let p = proj("/Users/x/code/web", "");
+
+        // Global mode: the value is resolved per project, with the project dir
+        // appended for absolute values.
+        for bad in [".", "..", "/Users/x/code"] {
+            let root = tasks_root_from_default(bad, &p);
+            assert!(check_tasks_root(&root, repo).is_err(), "global {bad:?} should conflict");
+        }
+        for ok in ["worktrees", "../wt", "/vol/work", "/Users/x/code/web"] {
+            let root = tasks_root_from_default(ok, &p);
+            assert!(check_tasks_root(&root, repo).is_ok(), "global {ok:?} should be clean");
+        }
+
+        // Override mode: an absolute value is the root verbatim, so naming the
+        // repo conflicts here even though it is fine as a global.
+        let over = proj("/Users/x/code/web", "/Users/x/code/web");
+        let root = project_tasks_root_with("/vol/work", &over);
+        assert!(check_tasks_root(&root, repo).is_err(), "override naming the repo should conflict");
+
+        // An empty override defers to the global, which decides validity.
+        let inherit = proj("/Users/x/code/web", "");
+        assert!(check_tasks_root(&project_tasks_root_with("/vol/work", &inherit), repo).is_ok());
+        assert!(check_tasks_root(&project_tasks_root_with(".", &inherit), repo).is_err());
+    }
+
+    #[test]
+    fn lexical_normalize_resolves_dot_segments_without_touching_disk() {
+        assert_eq!(lexically_normalize(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(lexically_normalize(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        assert_eq!(lexically_normalize(Path::new("/a/b/../..")), PathBuf::from("/"));
+        // Nothing above the root to pop: keep the `..` rather than escaping.
+        assert_eq!(lexically_normalize(Path::new("/../a")), PathBuf::from("/../a"));
+    }
+
+    // The per-project field wins over the global setting, under the same
+    // absolute/relative rule. The one difference: a project-level absolute
+    // path already names ONE project's root, so nothing is appended.
+    #[test]
+    fn project_override_beats_the_global_location() {
+        let abs = proj("/Users/x/code/web", "/mnt/fast/web-tasks");
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &abs),
+            PathBuf::from("/mnt/fast/web-tasks"),
+            "absolute override is the worktree root verbatim",
+        );
+        let rel = proj("/Users/x/code/web", "wt");
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &rel),
+            PathBuf::from("/Users/x/code/web/wt"),
+        );
+        // Whitespace-only is not an override — it falls through to global.
+        let blank = proj("/Users/x/code/web", "   ");
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &blank),
+            PathBuf::from("/vol/work/web"),
+        );
+    }
+
+    // An auto-created multi-repo host lives at `~/APP_DIR/projects/<slug>`, so
+    // the root_path basename IS the slug project_add_multi used to write —
+    // existing hosts keep resolving where their worktrees already are.
+    #[test]
+    fn multi_repo_host_subdir_matches_what_add_wrote() {
+        let mut p = proj("/Users/x/termic/projects/web-app", "");
+        p.project_type = ProjectType::Multi;
+        assert_eq!(
+            project_tasks_root_with("/vol/work", &p),
+            PathBuf::from("/vol/work/web-app"),
+        );
+    }
+
+    // ...and renaming is inert, because the subdir comes from the immutable
+    // root_path. Keying it on `name` would scatter one project's tasks across
+    // two directories the first time someone renamed it.
+    #[test]
+    fn renaming_a_project_does_not_move_where_new_tasks_go() {
+        let mut p = proj("/Users/x/termic/projects/web-app", "");
+        p.project_type = ProjectType::Multi;
+        let before = project_tasks_root_with("/vol/work", &p);
+        p.name = "Something Else Entirely".into();
+        assert_eq!(project_tasks_root_with("/vol/work", &p), before);
+    }
+
+    // `tasks_path` is an override, so a value that merely restates the
+    // built-in default has to read as "unset" — otherwise every project
+    // `project_add` ever wrote would pin itself and ignore the global setting.
+    #[test]
+    fn a_tasks_path_restating_the_default_normalizes_to_unset() {
+        let base = default_worktrees_base();
+        let mut list = vec![proj(
+            "/Users/x/code/web",
+            &base.join("web").to_string_lossy(),
+        )];
+        normalize_default_task_paths(&mut list);
+        assert_eq!(list[0].tasks_path, "");
+        // Idempotent: a second pass has nothing left to do.
+        normalize_default_task_paths(&mut list);
+        assert_eq!(list[0].tasks_path, "");
+    }
+
+    // Anything that is NOT the default is a deliberate customization and has
+    // to survive: those worktrees exist on disk and agents resume by CWD.
+    #[test]
+    fn customized_task_paths_survive_normalization() {
+        let base = default_worktrees_base();
+        let mut list = vec![
+            proj("/Users/x/code/web", "/mnt/fast/web-tasks"),
+            // Right root, different leaf — still a customization.
+            proj("/Users/x/code/web", &base.join("web-custom").to_string_lossy()),
+        ];
+        normalize_default_task_paths(&mut list);
+        assert_eq!(list[0].tasks_path, "/mnt/fast/web-tasks");
+        assert_eq!(list[1].tasks_path, base.join("web-custom").to_string_lossy());
+    }
+
+    // ── Sidebar task order (drag-to-reorder) ────────────────────────────
+
+    fn ordered(id: &str, created: &str, order: Option<u32>) -> Task {
+        Task { id: id.into(), created: created.into(), order, ..Default::default() }
+    }
+
+    fn ids(list: &[Task]) -> Vec<&str> {
+        list.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    // Nobody has dragged anything yet: every task carries `order: None`, and
+    // the list must come back in exactly the creation order it had before
+    // drag-to-reorder existed.
+    #[test]
+    fn sort_tasks_falls_back_to_creation_order() {
+        let mut list = vec![
+            ordered("c", "2026-03-01T00:00:00Z", None),
+            ordered("a", "2026-01-01T00:00:00Z", None),
+            ordered("b", "2026-02-01T00:00:00Z", None),
+        ];
+        sort_tasks(&mut list);
+        assert_eq!(ids(&list), ["a", "b", "c"]);
+    }
+
+    // After a drag, the manual index wins outright — including when it
+    // inverts creation order, which is the whole point of the feature
+    // ("main at the top" on a task that was created last).
+    #[test]
+    fn sort_tasks_honors_manual_order_over_creation() {
+        let mut list = vec![
+            ordered("old", "2026-01-01T00:00:00Z", Some(1)),
+            ordered("new", "2026-03-01T00:00:00Z", Some(0)),
+        ];
+        sort_tasks(&mut list);
+        assert_eq!(ids(&list), ["new", "old"]);
+    }
+
+    // A task created AFTER a reorder has no order key. It must append at the
+    // bottom, not jump to the top: `None` sorts after every `Some`.
+    #[test]
+    fn sort_tasks_appends_unordered_tasks_last() {
+        let mut list = vec![
+            ordered("fresh", "2026-09-01T00:00:00Z", None),
+            ordered("second", "2026-02-01T00:00:00Z", Some(1)),
+            ordered("first", "2026-03-01T00:00:00Z", Some(0)),
+        ];
+        sort_tasks(&mut list);
+        assert_eq!(ids(&list), ["first", "second", "fresh"]);
+    }
+
+    // Two projects each number their tasks from 0, and load_tasks sorts the
+    // whole directory at once. Equal keys must not scramble either project's
+    // internal order, since the sidebar filters this one list per project.
+    #[test]
+    fn sort_tasks_keeps_each_projects_sequence_when_indices_collide() {
+        let mut list = vec![
+            Task { id: "p2-b".into(), project_id: "p2".into(), created: "2026-02-02T00:00:00Z".into(), order: Some(1), ..Default::default() },
+            Task { id: "p1-b".into(), project_id: "p1".into(), created: "2026-01-02T00:00:00Z".into(), order: Some(1), ..Default::default() },
+            Task { id: "p2-a".into(), project_id: "p2".into(), created: "2026-02-01T00:00:00Z".into(), order: Some(0), ..Default::default() },
+            Task { id: "p1-a".into(), project_id: "p1".into(), created: "2026-01-01T00:00:00Z".into(), order: Some(0), ..Default::default() },
+        ];
+        sort_tasks(&mut list);
+        let p1: Vec<&str> = list.iter().filter(|t| t.project_id == "p1").map(|t| t.id.as_str()).collect();
+        let p2: Vec<&str> = list.iter().filter(|t| t.project_id == "p2").map(|t| t.id.as_str()).collect();
+        assert_eq!(p1, ["p1-a", "p1-b"]);
+        assert_eq!(p2, ["p2-a", "p2-b"]);
+    }
+
+    // Old task files on disk predate the `order` field entirely. They must
+    // deserialize (serde default) rather than fail the whole load.
+    #[test]
+    fn task_without_order_field_deserializes_as_unordered() {
+        let json = r#"{"id":"t1","project_id":"p","name":"main","branch":"main",
+                       "base_branch":"main","path":"/tmp/x","cli":"claude","port":0,
+                       "created":"2026-01-01T00:00:00Z","archived":false}"#;
+        let t: Task = serde_json::from_str(json).expect("legacy task file still parses");
+        assert_eq!(t.order, None);
     }
 }

@@ -27,6 +27,7 @@ import {
 
 const LS_EDITOR_FONT   = "editorFont";
 const LS_EDITOR_THEME  = "editorThemeId";
+const LS_EDITOR_THEME_LIGHT = "editorThemeIdLight";
 const LS_TERMINAL_FONT = "terminalFont";
 const LS_TERMINAL_SIZE = "terminalFontSize";
 const LS_EDITOR_SIZE   = "editorFontSize";
@@ -43,11 +44,14 @@ const LS_TERMINAL_LETTERSPACING = "terminalLetterSpacing";
 const LS_TERMINAL_SCROLLBACK   = "terminalScrollback";
 const LS_TERMINAL_OPTION_AS_META = "terminalOptionAsMeta";
 const LS_TERMINAL_GPU            = "terminalGpuEnabled";
+const LS_TERMINAL_RENDERER       = "terminalRenderer";
 const LS_TERMINAL_COPY_ON_SELECT = "terminalCopyOnSelect";
 const LS_TASK_EXPAND_MODE = "taskExpandMode";
 const LS_HIDE_INACTIVE_PROJECTS = "hideInactiveProjects";
 const LS_MD_VIEW       = "markdownDefaultView";
 const LS_LOAD_REMOTE_IMAGES = "loadRemoteImages";
+const LS_FIND_IN_FILES_REGEX = "findInFilesRegex";
+const LS_FIND_IN_FILES_MATCH_CASE = "findInFilesMatchCase";
 const LS_BRANCH_PREFIX = "branchPrefix";
 const LS_QUEUE_MIN_INTERVAL = "queueMinIntervalMs";
 const LS_SHORTCUTS     = "shortcutBindings";
@@ -66,6 +70,19 @@ const clampUiScale = (pct: number): number =>
 
 /** Markdown edit-tab view: source editor, rendered preview, or both. */
 export type MarkdownView = "source" | "preview" | "split";
+
+/** Which xterm renderer backs a terminal. "webgl" is the default fast path.
+ *  "canvas" rasterizes glyphs the same way but hands the compositor a plain
+ *  2D canvas rather than a live GL surface. "dom" is xterm's fallback, which
+ *  builds real DOM nodes per cell. */
+export type TerminalRendererKind = "webgl" | "canvas" | "dom";
+
+/** Narrow an untrusted localStorage string to a renderer kind. */
+export const parseTerminalRenderer = (
+  v: string | null | undefined,
+  fallback: TerminalRendererKind,
+): TerminalRendererKind =>
+  v === "webgl" || v === "canvas" || v === "dom" ? v : fallback;
 
 export type BuiltinThemeMode = "auto" | "light" | "dark" | "claude" | "solarized" | "cobalt" | "matrix" | "rosepine";
 /** The user's selection: a built-in mode, or a custom theme file id
@@ -466,6 +483,13 @@ interface PrefsState {
    *  webview is outside the cage". A per-document affordance in the
    *  preview can unblock a single file without flipping this pref. */
   loadRemoteImages: boolean;
+  /** Find in files (⇧⌘F) treats the query as a POSIX ERE instead of a
+   *  literal string. Toggled from the search bar itself, persisted so it
+   *  survives a relaunch. */
+  findInFilesRegex: boolean;
+  /** Find in files matches the query's case. OFF by default, which is the
+   *  case-insensitive search the dialog has always done. */
+  findInFilesMatchCase: boolean;
   /** Default for the NewTaskDialog's Sandbox toggle when neither
    *  the project's `default_sandbox` nor an explicit user pick is in
    *  effect. Lets a single-keystroke toggle apply across all projects
@@ -499,10 +523,16 @@ interface PrefsState {
   customThemeRev: number;
   /** Font for the CodeMirror editor + diff viewer. */
   editorFontId: string;
-  /** Syntax theme for the editor + diff viewer (atomone, tokyo-night, …).
-   *  Independent of the app `themeMode` — the surface still tracks the
-   *  app palette, only the token colors come from this. */
-  editorThemeId: string;
+  /** Syntax theme for the editor + diff viewer under a dark app theme
+   *  (atomone, tokyo-night, …). The surface still tracks the app palette
+   *  regardless of which syntax theme is chosen — only the token colors
+   *  come from this. */
+  editorThemeIdDark: string;
+  /** Same as `editorThemeIdDark`, but for a light app theme. Kept separate
+   *  so switching the app between light/dark doesn't force the same
+   *  syntax theme on both (a dark-optimized theme can look wrong on a
+   *  light app surface, and vice versa). */
+  editorThemeIdLight: string;
   /** Font for the xterm terminals (main + aux). Kept separate because power
    *  users often want a Nerd Font for the shell but a clean prose-friendly
    *  font for the editor. */
@@ -529,6 +559,15 @@ interface PrefsState {
    *  makes typing lag. Turning this OFF forces xterm's DOM renderer. Applies to
    *  terminals opened after the change (relaunch to switch every terminal). */
   terminalGpuEnabled: boolean;
+  /** Which xterm renderer to attach. Supersedes the two-state
+   *  `terminalGpuEnabled`, which could only pick between WebGL and DOM and so
+   *  had no way to name the middle option: xterm's 2D-canvas renderer, which
+   *  rasterizes glyphs like WebGL but composites one plain canvas layer
+   *  instead of a live GL surface. The two stay in sync (see
+   *  setTerminalRenderer) so the existing toggle keeps working; this is the
+   *  value the renderer actually reads. Applies to terminals opened after the
+   *  change (relaunch to switch every terminal). */
+  terminalRenderer: TerminalRendererKind;
   /** iTerm-style copy-on-select: a finished mouse selection in any terminal
    *  is written to the clipboard automatically. ON by default. */
   terminalCopyOnSelect: boolean;
@@ -583,13 +622,15 @@ interface PrefsState {
   splitPaneDimAmount: number;
 
   setEditorFontId:    (id: string) => void;
-  setEditorThemeId:   (id: string) => void;
+  setEditorThemeIdDark:  (id: string) => void;
+  setEditorThemeIdLight: (id: string) => void;
   setTerminalFontId:  (id: string) => void;
   setTerminalFontSize:(px: number) => void;
   setTerminalLetterSpacing:(px: number) => void;
   setTerminalScrollback:  (n: number) => void;
   setTerminalOptionAsMeta: (v: boolean) => void;
   setTerminalGpuEnabled: (v: boolean) => void;
+  setTerminalRenderer: (v: TerminalRendererKind) => void;
   setTerminalCopyOnSelect: (v: boolean) => void;
   setEditorFontSize:  (px: number) => void;
   /** Set whole-app zoom (percent, clamped to UI_SCALE_MIN..MAX). */
@@ -616,6 +657,8 @@ interface PrefsState {
   setConfirmBeforeCloseAgentTab: (v: boolean) => void;
   setWorkingIndicator: (v: boolean) => void;
   setLoadRemoteImages: (v: boolean) => void;
+  setFindInFilesRegex: (v: boolean) => void;
+  setFindInFilesMatchCase: (v: boolean) => void;
   setGlobalDefaultSandbox: (v: boolean) => void;
   setSandboxBypassPermissions: (v: boolean) => void;
   setAllowScope: (s: "agent" | "project" | "repo") => void;
@@ -688,6 +731,7 @@ export const APPEARANCE_DEFAULTS = {
   terminalScrollback:    5000,
   terminalOptionAsMeta:  false,
   terminalGpuEnabled:    true,
+  terminalRenderer:      "webgl" as TerminalRendererKind,
   editorFontSize:        13,
   uiScale:               100,
   codeLigatures:         true,
@@ -695,13 +739,23 @@ export const APPEARANCE_DEFAULTS = {
 } as const;
 
 const initialEditorFont   = lsGet(LS_EDITOR_FONT, APPEARANCE_DEFAULTS.editorFontId);
-const initialEditorTheme  = lsGet(LS_EDITOR_THEME, "auto");
+const initialEditorThemeDark  = lsGet(LS_EDITOR_THEME, "auto");
+// Seeds from the pre-split value on first read (no LS_EDITOR_THEME_LIGHT
+// key yet) so an existing explicit pick (or "auto") keeps applying to
+// both modes exactly as before, until the user overrides light on its own.
+const initialEditorThemeLight = lsGet(LS_EDITOR_THEME_LIGHT, initialEditorThemeDark);
 const initialTerminalFont = lsGet(LS_TERMINAL_FONT, APPEARANCE_DEFAULTS.terminalFontId);
 const initialTerminalSize = lsGetNum(LS_TERMINAL_SIZE, APPEARANCE_DEFAULTS.terminalFontSize);
 const initialTerminalLetterSpacing = Math.max(0, Math.round(lsGetNum(LS_TERMINAL_LETTERSPACING, APPEARANCE_DEFAULTS.terminalLetterSpacing)));
 const initialTerminalScrollback    = Math.max(1000, Math.min(100000, Math.round(lsGetNum(LS_TERMINAL_SCROLLBACK, APPEARANCE_DEFAULTS.terminalScrollback))));
 const initialTerminalOptionAsMeta  = lsGetBool(LS_TERMINAL_OPTION_AS_META, APPEARANCE_DEFAULTS.terminalOptionAsMeta);
 const initialTerminalGpuEnabled    = lsGetBool(LS_TERMINAL_GPU, APPEARANCE_DEFAULTS.terminalGpuEnabled);
+// No stored renderer means this profile predates the three-way pref, so honour
+// whatever the old boolean said rather than snapping everyone back to WebGL.
+const initialTerminalRenderer      = parseTerminalRenderer(
+  lsGet(LS_TERMINAL_RENDERER, ""),
+  initialTerminalGpuEnabled ? "webgl" : "dom",
+);
 const initialTerminalCopyOnSelect  = lsGetBool(LS_TERMINAL_COPY_ON_SELECT, true);
 const initialEditorSize   = lsGetNum(LS_EDITOR_SIZE, APPEARANCE_DEFAULTS.editorFontSize);
 const initialUiScale      = clampUiScale(lsGetNum(LS_UI_SCALE, APPEARANCE_DEFAULTS.uiScale));
@@ -727,6 +781,8 @@ const initialWorkingIndicator = lsGetBool(LS_WORKING_INDICATOR, true);
 // OFF by default (issue #69): closing the remote-image sandbox gap must not
 // silently start firing image requests for existing users.
 const initialLoadRemoteImages = lsGetBool(LS_LOAD_REMOTE_IMAGES, false);
+const initialFindInFilesRegex = lsGetBool(LS_FIND_IN_FILES_REGEX, false);
+const initialFindInFilesMatchCase = lsGetBool(LS_FIND_IN_FILES_MATCH_CASE, false);
 const initialDefaultSandbox = lsGetBool(LS_DEFAULT_SANDBOX, false);
 // ON by default — sandboxed agents bypass their own permission prompts
 // because the seatbelt is the real boundary. Users can opt out.
@@ -760,17 +816,21 @@ export const usePrefs = create<PrefsState>(set => ({
   confirmBeforeCloseAgentTab: initialConfirmCloseAgentTab,
   workingIndicator: initialWorkingIndicator,
   loadRemoteImages: initialLoadRemoteImages,
+  findInFilesRegex: initialFindInFilesRegex,
+  findInFilesMatchCase: initialFindInFilesMatchCase,
   globalDefaultSandbox: initialDefaultSandbox,
   sandboxBypassPermissions: initialSandboxBypass,
   allowScope: initialAllowScope,
   editorFontId: initialEditorFont,
-  editorThemeId: initialEditorTheme,
+  editorThemeIdDark: initialEditorThemeDark,
+  editorThemeIdLight: initialEditorThemeLight,
   terminalFontId: initialTerminalFont,
   terminalFontSize: initialTerminalSize,
   terminalLetterSpacing: initialTerminalLetterSpacing,
   terminalScrollback: initialTerminalScrollback,
   terminalOptionAsMeta: initialTerminalOptionAsMeta,
   terminalGpuEnabled: initialTerminalGpuEnabled,
+  terminalRenderer: initialTerminalRenderer,
   terminalCopyOnSelect: initialTerminalCopyOnSelect,
   editorFontSize: initialEditorSize,
   uiScale: initialUiScale,
@@ -790,9 +850,13 @@ export const usePrefs = create<PrefsState>(set => ({
     applyEditorFont(id);
     set({ editorFontId: id });
   },
-  setEditorThemeId: (id) => {
+  setEditorThemeIdDark: (id) => {
     try { localStorage.setItem(LS_EDITOR_THEME, id); } catch {}
-    set({ editorThemeId: id });
+    set({ editorThemeIdDark: id });
+  },
+  setEditorThemeIdLight: (id) => {
+    try { localStorage.setItem(LS_EDITOR_THEME_LIGHT, id); } catch {}
+    set({ editorThemeIdLight: id });
   },
   setTerminalFontId: (id) => {
     try { localStorage.setItem(LS_TERMINAL_FONT, id); } catch {}
@@ -820,9 +884,26 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_TERMINAL_OPTION_AS_META, v ? "1" : "0"); } catch {}
     set({ terminalOptionAsMeta: v });
   },
+  // The boolean and the three-way pref are two views of one setting, so both
+  // setters write both keys. Letting them drift would mean the toggle and the
+  // renderer disagreed about what is mounted, and only the winner would be
+  // visible in the UI. Flipping the boolean back ON restores WebGL rather than
+  // canvas: "on" has always meant the GPU fast path.
   setTerminalGpuEnabled: (v) => {
-    try { localStorage.setItem(LS_TERMINAL_GPU, v ? "1" : "0"); } catch {}
-    set({ terminalGpuEnabled: v });
+    const kind: TerminalRendererKind = v ? "webgl" : "dom";
+    try {
+      localStorage.setItem(LS_TERMINAL_GPU, v ? "1" : "0");
+      localStorage.setItem(LS_TERMINAL_RENDERER, kind);
+    } catch {}
+    set({ terminalGpuEnabled: v, terminalRenderer: kind });
+  },
+  setTerminalRenderer: (v) => {
+    const gpu = v === "webgl";
+    try {
+      localStorage.setItem(LS_TERMINAL_RENDERER, v);
+      localStorage.setItem(LS_TERMINAL_GPU, gpu ? "1" : "0");
+    } catch {}
+    set({ terminalRenderer: v, terminalGpuEnabled: gpu });
   },
   setTerminalCopyOnSelect: (v) => {
     try { localStorage.setItem(LS_TERMINAL_COPY_ON_SELECT, v ? "1" : "0"); } catch {}
@@ -931,6 +1012,14 @@ export const usePrefs = create<PrefsState>(set => ({
   setLoadRemoteImages: (v) => {
     try { localStorage.setItem(LS_LOAD_REMOTE_IMAGES, v ? "1" : "0"); } catch {}
     set({ loadRemoteImages: v });
+  },
+  setFindInFilesRegex: (v) => {
+    try { localStorage.setItem(LS_FIND_IN_FILES_REGEX, v ? "1" : "0"); } catch {}
+    set({ findInFilesRegex: v });
+  },
+  setFindInFilesMatchCase: (v) => {
+    try { localStorage.setItem(LS_FIND_IN_FILES_MATCH_CASE, v ? "1" : "0"); } catch {}
+    set({ findInFilesMatchCase: v });
   },
   setGlobalDefaultSandbox: (v) => {
     try { localStorage.setItem(LS_DEFAULT_SANDBOX, v ? "1" : "0"); } catch {}

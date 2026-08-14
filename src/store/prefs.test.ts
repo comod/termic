@@ -58,6 +58,187 @@ describe("prefs: loadRemoteImages", () => {
   });
 });
 
+describe("prefs: findInFilesRegex", () => {
+  const KEY = "findInFilesRegex";
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("defaults to false with nothing in localStorage", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().findInFilesRegex).toBe(false);
+  });
+
+  it("picks up a persisted true value as the initial state on load", async () => {
+    localStorage.setItem(KEY, "1");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().findInFilesRegex).toBe(true);
+  });
+
+  it("setFindInFilesRegex(true) updates state and persists it", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setFindInFilesRegex(true);
+    expect(usePrefs.getState().findInFilesRegex).toBe(true);
+    expect(localStorage.getItem(KEY)).toBe("1");
+  });
+
+  it("setFindInFilesRegex(false) updates state and persists it", async () => {
+    localStorage.setItem(KEY, "1");
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setFindInFilesRegex(false);
+    expect(usePrefs.getState().findInFilesRegex).toBe(false);
+    expect(localStorage.getItem(KEY)).toBe("0");
+  });
+});
+
+describe("prefs: findInFilesMatchCase", () => {
+  const KEY = "findInFilesMatchCase";
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("defaults to false, so search stays case-insensitive", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().findInFilesMatchCase).toBe(false);
+  });
+
+  it("picks up a persisted true value as the initial state on load", async () => {
+    localStorage.setItem(KEY, "1");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().findInFilesMatchCase).toBe(true);
+  });
+
+  it("setFindInFilesMatchCase(true) updates state and persists it", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setFindInFilesMatchCase(true);
+    expect(usePrefs.getState().findInFilesMatchCase).toBe(true);
+    expect(localStorage.getItem(KEY)).toBe("1");
+  });
+
+  it("setFindInFilesMatchCase(false) updates state and persists it", async () => {
+    localStorage.setItem(KEY, "1");
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setFindInFilesMatchCase(false);
+    expect(usePrefs.getState().findInFilesMatchCase).toBe(false);
+    expect(localStorage.getItem(KEY)).toBe("0");
+  });
+
+  it("is independent of the regexp toggle", async () => {
+    localStorage.setItem("findInFilesRegex", "1");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().findInFilesRegex).toBe(true);
+    expect(usePrefs.getState().findInFilesMatchCase).toBe(false);
+  });
+});
+
+// The three-way renderer pref (GH #140 follow-up) has to coexist with the
+// boolean it supersedes: profiles in the wild only have terminalGpuEnabled,
+// and the Appearance toggle still writes it. Anything that lets the two drift
+// means the UI and the mounted renderer disagree, so the sync is the contract
+// worth pinning, in both directions and across a reload.
+describe("prefs: terminalRenderer", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("defaults to webgl with nothing stored", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().terminalRenderer).toBe("webgl");
+    expect(usePrefs.getState().terminalGpuEnabled).toBe(true);
+  });
+
+  it("migrates a pre-existing terminalGpuEnabled=0 profile to dom", async () => {
+    localStorage.setItem("terminalGpuEnabled", "0");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().terminalRenderer).toBe("dom");
+  });
+
+  it("prefers an explicit terminalRenderer over the legacy boolean", async () => {
+    localStorage.setItem("terminalGpuEnabled", "0");
+    localStorage.setItem("terminalRenderer", "canvas");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().terminalRenderer).toBe("canvas");
+  });
+
+  it("falls back to the boolean when the stored kind is garbage", async () => {
+    localStorage.setItem("terminalRenderer", "vulkan");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().terminalRenderer).toBe("webgl");
+  });
+
+  it("setTerminalRenderer(canvas) clears the legacy boolean", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setTerminalRenderer("canvas");
+    expect(usePrefs.getState().terminalGpuEnabled).toBe(false);
+    expect(localStorage.getItem("terminalRenderer")).toBe("canvas");
+    expect(localStorage.getItem("terminalGpuEnabled")).toBe("0");
+  });
+
+  it("setTerminalGpuEnabled(false) moves the renderer to dom, not canvas", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setTerminalRenderer("canvas");
+    usePrefs.getState().setTerminalGpuEnabled(false);
+    expect(usePrefs.getState().terminalRenderer).toBe("dom");
+  });
+
+  it("setTerminalGpuEnabled(true) restores webgl, not the previous canvas", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setTerminalRenderer("canvas");
+    usePrefs.getState().setTerminalGpuEnabled(true);
+    expect(usePrefs.getState().terminalRenderer).toBe("webgl");
+    expect(localStorage.getItem("terminalRenderer")).toBe("webgl");
+  });
+});
+
+describe("prefs: editorThemeIdDark / editorThemeIdLight", () => {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", fakeLocalStorage());
+    vi.resetModules();
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("both default to auto with nothing in localStorage", async () => {
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().editorThemeIdDark).toBe("auto");
+    expect(usePrefs.getState().editorThemeIdLight).toBe("auto");
+  });
+
+  // Pre-split installs only ever wrote the single "editorThemeId" key. An
+  // explicit pick applied under both app modes, so on first load after the
+  // split, both selectors must seed from it identically — otherwise an
+  // existing user's chosen theme silently vanishes from one mode.
+  it("seeds editorThemeIdLight from the pre-split editorThemeId when unset", async () => {
+    localStorage.setItem("editorThemeId", "tokyo-night");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().editorThemeIdDark).toBe("tokyo-night");
+    expect(usePrefs.getState().editorThemeIdLight).toBe("tokyo-night");
+  });
+
+  it("editorThemeIdLight uses its own key once explicitly set, independent of dark", async () => {
+    localStorage.setItem("editorThemeId", "tokyo-night");
+    localStorage.setItem("editorThemeIdLight", "github-light");
+    const { usePrefs } = await import("./prefs");
+    expect(usePrefs.getState().editorThemeIdDark).toBe("tokyo-night");
+    expect(usePrefs.getState().editorThemeIdLight).toBe("github-light");
+  });
+
+  it("setEditorThemeIdDark/Light update state and persist independently", async () => {
+    const { usePrefs } = await import("./prefs");
+    usePrefs.getState().setEditorThemeIdDark("nord");
+    usePrefs.getState().setEditorThemeIdLight("xcode-light");
+    expect(usePrefs.getState().editorThemeIdDark).toBe("nord");
+    expect(usePrefs.getState().editorThemeIdLight).toBe("xcode-light");
+    expect(localStorage.getItem("editorThemeId")).toBe("nord");
+    expect(localStorage.getItem("editorThemeIdLight")).toBe("xcode-light");
+  });
+});
+
 // #83: light themes must raise the terminal's minimumContrastRatio so CLI
 // truecolor fg (which bypasses the ANSI-16 remap) stays readable on a light
 // bg; dark themes leave it at 1 (off) so their tuned palettes are untouched.

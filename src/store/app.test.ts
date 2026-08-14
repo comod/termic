@@ -32,54 +32,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { isUserWatching, useApp } from "@/store/app";
 import * as ipc from "@/lib/ipc";
 import { markUnattendedSpawn, takeUnattendedSpawn } from "@/lib/unattendedSpawns";
-import type { QueueItem, Tab, TerminalTab, Task, PersistedTab } from "@/lib/types";
+import type { QueueItem, Tab, TerminalTab, PersistedTab } from "@/lib/types";
 import { useUI } from "@/store/ui";
-
-// ── helpers ───────────────────────────────────────────────────────────
-
-function makeTermTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
-  return {
-    id: crypto.randomUUID(),
-    type: "terminal",
-    title: "claude",
-    ptyId: "pty-1",
-    cli: "claude",
-    workState: "idle",
-    workProgress: null,
-    workProgressKind: null,
-    workClearedAt: undefined,
-    preview: false,
-    ...overrides,
-  } as TerminalTab;
-}
-
-function addTab(taskId: string, tab: Tab) {
-  useApp.setState(s => ({
-    tabs: { ...s.tabs, [taskId]: [...(s.tabs[taskId] ?? []), tab] },
-    activeTab: { ...s.activeTab, [taskId]: tab.id },
-  }));
-}
-
-function makeTask(overrides: Partial<Task> = {}): Task {
-  return {
-    id: "ws1", project_id: "p1", name: "Feature Foo", branch: "feature/foo",
-    base_branch: "main", path: "/x/ws1", cli: "claude", port: 1420,
-    created: "2024-01-01", archived: false,
-    ...overrides,
-  } as Task;
-}
+// Store interactor — the ONE place that knows the store's shape. Cases below
+// say what they mean ("what work state is that tab in?") instead of spelling
+// out `tabs[taskId].find(...) as TerminalTab` on every assertion.
+import {
+  focusTab,
+  getActiveTabId,
+  getTabIds,
+  getTabWorkState,
+  getTabs,
+  getTabsRef,
+  getTabUnread,
+  getTerminalTab,
+  makeTask,
+  makeTerminalTab as makeTermTab,
+  resetAppStore,
+  seedTab as addTab,
+} from "@/test-utils/store";
 
 beforeEach(() => {
-  // Reset store to clean state before each test.
-  useApp.setState({
-    tabs: {},
-    activeTab: {},
-    activeTaskId: null,
-    mountedTasks: new Set(),
-    tasks: [],
-    projects: [],
-    agents: [],
-  });
+  resetAppStore();
   vi.clearAllMocks();
 });
 
@@ -93,8 +67,7 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("working");
+    expect(getTabWorkState(taskId, tab.id)).toBe("working");
   });
 
   it("transitions working → done", () => {
@@ -104,8 +77,7 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "done");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("done");
+    expect(getTabWorkState(taskId, tab.id)).toBe("done");
   });
 
   // The focused-tab rule downgrades "done" to "idle" because the user is
@@ -120,20 +92,18 @@ describe("setWorkState", () => {
     const taskId = "ws-bg";
     const tab = makeTermTab({ workState: "working" });
     addTab(taskId, tab);
-    useApp.setState({ activeTaskId: taskId, activeTab: { [taskId]: tab.id } } as never);
+    focusTab(taskId, tab.id);
 
     useUI.getState().setWindowless(false);
     useApp.getState().setWorkState(taskId, tab.id, "done");
-    let result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("idle");
+    expect(getTabWorkState(taskId, tab.id)).toBe("idle");
 
     const tab2 = makeTermTab({ workState: "working" });
     addTab(taskId, tab2);
-    useApp.setState({ activeTaskId: taskId, activeTab: { [taskId]: tab2.id } } as never);
+    focusTab(taskId, tab2.id);
     useUI.getState().setWindowless(true);
     useApp.getState().setWorkState(taskId, tab2.id, "done");
-    result = useApp.getState().tabs[taskId].find(t => t.id === tab2.id) as TerminalTab;
-    expect(result.workState).toBe("done");
+    expect(getTabWorkState(taskId, tab2.id)).toBe("done");
     useUI.getState().setWindowless(false);
   });
 
@@ -144,7 +114,7 @@ describe("setWorkState", () => {
     const taskId = "watch-1";
     const tab = makeTermTab();
     addTab(taskId, tab);
-    useApp.setState({ activeTaskId: taskId, activeTab: { [taskId]: tab.id } } as never);
+    focusTab(taskId, tab.id);
 
     useUI.getState().setWindowless(false);
     expect(isUserWatching(taskId, tab.id)).toBe(true);
@@ -166,8 +136,7 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("done");
+    expect(getTabWorkState(taskId, tab.id)).toBe("done");
   });
 
   it("sticky done: an unstamped done stays sticky", () => {
@@ -177,8 +146,7 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("done");
+    expect(getTabWorkState(taskId, tab.id)).toBe("done");
   });
 
   it("a busy signal past the sticky window takes the tab back to working", () => {
@@ -191,9 +159,8 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("working");
-    expect(result.workDoneAt).toBeUndefined();
+    expect(getTabWorkState(taskId, tab.id)).toBe("working");
+    expect(getTerminalTab(taskId, tab.id).workDoneAt).toBeUndefined();
   });
 
   it("drops the stale done badge when the agent goes back to work", () => {
@@ -207,8 +174,7 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.unread).toBeNull();
+    expect(getTabUnread(taskId, tab.id)).toBeNull();
   });
 
   it("keeps an attention badge when the agent goes back to work", () => {
@@ -224,9 +190,8 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "working");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workState).toBe("working");
-    expect(result.unread?.reason).toBe("attention");
+    expect(getTabWorkState(taskId, tab.id)).toBe("working");
+    expect(getTabUnread(taskId, tab.id)?.reason).toBe("attention");
   });
 
   it("stamps workDoneAt on the transition to done", () => {
@@ -237,8 +202,7 @@ describe("setWorkState", () => {
     const before = Date.now();
     useApp.getState().setWorkState(taskId, tab.id, "done");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
-    expect(result.workDoneAt).toBeGreaterThanOrEqual(before);
+    expect(getTerminalTab(taskId, tab.id).workDoneAt).toBeGreaterThanOrEqual(before);
   });
 
   it("idempotent: same state write causes no update", () => {
@@ -246,9 +210,9 @@ describe("setWorkState", () => {
     const tab = makeTermTab({ workState: "idle" });
     addTab(taskId, tab);
 
-    const before = useApp.getState().tabs[taskId];
+    const before = getTabsRef(taskId);
     useApp.getState().setWorkState(taskId, tab.id, "idle");
-    const after = useApp.getState().tabs[taskId];
+    const after = getTabsRef(taskId);
 
     // Same reference = no re-render triggered
     expect(after).toBe(before);
@@ -259,13 +223,12 @@ describe("setWorkState", () => {
     const tab = makeTermTab({ workState: "working" });
     addTab(taskId, tab);
     // Mark this task+tab as active (the user is looking at it)
-    useApp.setState({ activeTaskId: taskId, activeTab: { [taskId]: tab.id } });
+    focusTab(taskId, tab.id);
 
     useApp.getState().setWorkState(taskId, tab.id, "done");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
     // "done" on the focused tab is silently downgraded to "idle"
-    expect(result.workState).toBe("idle");
+    expect(getTabWorkState(taskId, tab.id)).toBe("idle");
   });
 
   it("no-op on non-terminal tab", () => {
@@ -273,9 +236,9 @@ describe("setWorkState", () => {
     const editTab: Tab = { id: "edit-1", type: "edit", title: "foo.ts", path: "/x/foo.ts" } as any;
     addTab(taskId, editTab);
 
-    const before = useApp.getState().tabs[taskId];
+    const before = getTabsRef(taskId);
     useApp.getState().setWorkState(taskId, "edit-1", "working");
-    expect(useApp.getState().tabs[taskId]).toBe(before);
+    expect(getTabsRef(taskId)).toBe(before);
   });
 
   it("clears workProgress when leaving working state", () => {
@@ -285,8 +248,8 @@ describe("setWorkState", () => {
 
     useApp.getState().setWorkState(taskId, tab.id, "done");
 
-    const result = useApp.getState().tabs[taskId].find(t => t.id === tab.id) as TerminalTab;
     // workProgress cleared when not "working"
+    const result = getTerminalTab(taskId, tab.id);
     expect(result.workProgress).toBeNull();
     expect(result.workProgressKind).toBeNull();
   });
@@ -302,7 +265,7 @@ describe("closeTab", () => {
 
     useApp.getState().closeTab(taskId, tab.id);
 
-    expect(useApp.getState().tabs[taskId]).toHaveLength(0);
+    expect(getTabs(taskId)).toHaveLength(0);
   });
 
   it("adjusts active tab to the previous sibling", () => {
@@ -315,7 +278,7 @@ describe("closeTab", () => {
 
     useApp.getState().closeTab(taskId, "t2");
 
-    expect(useApp.getState().activeTab[taskId]).toBe("t1");
+    expect(getActiveTabId(taskId)).toBe("t1");
   });
 
   it("adjusts active tab to next sibling when first is closed", () => {
@@ -328,7 +291,7 @@ describe("closeTab", () => {
 
     useApp.getState().closeTab(taskId, "t1");
 
-    expect(useApp.getState().activeTab[taskId]).toBe("t2");
+    expect(getActiveTabId(taskId)).toBe("t2");
   });
 
   it("no-op when tab id does not exist", () => {
@@ -336,9 +299,44 @@ describe("closeTab", () => {
     const tab = makeTermTab();
     addTab(taskId, tab);
 
-    const before = useApp.getState().tabs[taskId];
+    const before = getTabsRef(taskId);
     useApp.getState().closeTab(taskId, "ghost-id");
-    expect(useApp.getState().tabs[taskId]).toBe(before);
+    expect(getTabsRef(taskId)).toBe(before);
+  });
+
+  it("a close that matches nothing does not rewrite the durable set (GH #185)", () => {
+    // The no-op above is about the STORE; this is about DISK. closeTab used
+    // to re-sync persisted_tabs unconditionally, even after deciding there
+    // was nothing to close, and syncDurableTabs rebuilds that set from the
+    // store's tab list. On a task with no tabs loaded (never opened this
+    // session) the rebuild kept only the default tab and dropped every other
+    // agent's session_id, permanently, while closing nothing at all.
+    //
+    // Unreachable from the GUI, which never names a tab it is not rendering.
+    // `termic tab close` can name one on an unmounted task, which is how it
+    // surfaced; that verb refuses such tasks, and this pins the floor under
+    // it so the store is safe regardless of who calls.
+    const taskId = "ws1";
+    useApp.setState(s => ({
+      tabs: { ...s.tabs, [taskId]: [] },
+      tasks: [{
+        id: taskId, project_id: "p1", name: "fix-auth", branch: "main",
+        base_branch: "main", path: "/x/ws1", cli: "claude", port: 1420,
+        created: "2024-01-01", archived: false,
+        persisted_tabs: [
+          { id: "main", cli: "claude", is_default: true, session_id: "SESSION-A" },
+          { id: "second", cli: "codex", session_id: "SESSION-B" },
+        ],
+      }] as never,
+    }));
+    vi.mocked(ipc.taskSetTabs).mockClear();
+
+    useApp.getState().closeTab(taskId, "second");
+
+    expect(ipc.taskSetTabs).not.toHaveBeenCalled();
+    expect(
+      useApp.getState().tasks.find(t => t.id === taskId)?.persisted_tabs?.map(t => t.id),
+    ).toEqual(["main", "second"]);
   });
 });
 
@@ -489,6 +487,79 @@ describe("openPreviewTab", () => {
     expect(tab.remoteImagesUnblocked).toBeUndefined();
   });
 
+  // ── directory tabs (issue #151) ─────────────────────────────────────
+  // A folder link recycles the SAME preview slot a file link uses, so it
+  // must never leave a second tab behind or inherit the previous
+  // occupant's per-document state.
+
+  it("recycles the preview tab into a directory listing", () => {
+    const wsId = "ws1";
+    const previewTab: Tab = { id: "prev-1", type: "edit", title: "guide.md", path: "docs/guide.md", preview: true } as any;
+    useApp.setState({ tabs: { [wsId]: [previewTab] }, activeTab: { [wsId]: "prev-1" } });
+
+    useApp.getState().openPreviewTab(wsId, { type: "dir", path: "docs/plans", title: "plans" });
+
+    const tabs = useApp.getState().tabs[wsId];
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0].type).toBe("dir");
+    expect((tabs[0] as any).path).toBe("docs/plans");
+    expect(tabs[0].preview).toBe(true);
+    expect(useApp.getState().activeTab[wsId]).toBe("prev-1");
+  });
+
+  it("clears a per-document remoteImagesUnblocked override when recycling into a directory", () => {
+    const wsId = "ws1";
+    const previewTab: Tab = {
+      id: "prev-1", type: "edit", title: "old.md", path: "docs/old.md",
+      preview: true, remoteImagesUnblocked: true,
+    } as any;
+    useApp.setState({ tabs: { [wsId]: [previewTab] }, activeTab: { [wsId]: "prev-1" } });
+
+    useApp.getState().openPreviewTab(wsId, { type: "dir", path: "docs", title: "docs" });
+
+    expect((useApp.getState().tabs[wsId][0] as any).remoteImagesUnblocked).toBeUndefined();
+  });
+
+  it("does not confuse a directory tab with a file tab on the same path", () => {
+    // "docs" the folder and a (hypothetical) "docs" file are different
+    // targets; the existing-tab lookup keys on type as well as path, so
+    // opening the folder must not just re-activate the file tab.
+    const wsId = "ws1";
+    const fileTab: Tab = { id: "e1", type: "edit", title: "docs", path: "docs", preview: false } as any;
+    useApp.setState({ tabs: { [wsId]: [fileTab] }, activeTab: { [wsId]: "e1" } });
+
+    useApp.getState().openPreviewTab(wsId, { type: "dir", path: "docs", title: "docs" });
+
+    const tabs = useApp.getState().tabs[wsId];
+    expect(tabs).toHaveLength(2);
+    expect(tabs[1].type).toBe("dir");
+    expect(useApp.getState().activeTab[wsId]).toBe(tabs[1].id);
+  });
+
+  it("re-activates an open directory tab instead of duplicating it", () => {
+    const wsId = "ws1";
+    const dirTab: Tab = { id: "d1", type: "dir", title: "docs", path: "docs", preview: false } as any;
+    const other: Tab = { id: "e1", type: "edit", title: "guide.md", path: "docs/guide.md", preview: true } as any;
+    useApp.setState({ tabs: { [wsId]: [dirTab, other] }, activeTab: { [wsId]: "e1" } });
+
+    useApp.getState().openPreviewTab(wsId, { type: "dir", path: "docs", title: "docs" });
+
+    expect(useApp.getState().tabs[wsId]).toHaveLength(2);
+    expect(useApp.getState().activeTab[wsId]).toBe("d1");
+  });
+
+  it("does not set reveal fields on directory tabs", () => {
+    const wsId = "ws1";
+    useApp.setState({ tabs: { [wsId]: [] } });
+
+    useApp.getState().openPreviewTab(wsId, {
+      type: "dir", path: "docs", title: "docs", revealHeading: "usage",
+    });
+
+    const tab = useApp.getState().tabs[wsId][0] as any;
+    expect(tab.revealHeading).toBeUndefined();
+  });
+
   it("does not wipe a not-yet-consumed reveal when re-activating an existing tab without a new one", () => {
     // Regression: re-activating the SAME already-open file (no new reveal
     // target in this call) must never cancel a reveal that's already
@@ -546,9 +617,7 @@ describe("openPreviewTab", () => {
 // ── reorderTab (issue #6: drag-to-reorder) ────────────────────────────
 
 describe("reorderTab", () => {
-  function ids(taskId: string) {
-    return useApp.getState().tabs[taskId].map(t => t.id);
-  }
+  const ids = getTabIds;
   function seed(taskId: string, n: number) {
     for (let i = 0; i < n; i++) addTab(taskId, makeTermTab({ id: `t${i}` }));
   }

@@ -4,7 +4,7 @@
 // Exposed as seed(opts) so wdio.conf can seed an ISOLATED profile per parallel
 // worker (own data dir + fixture repo + tasks/worktree base). Idempotent.
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -12,6 +12,10 @@ import os from "node:os";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const seedDir = path.join(scriptDir, "e2e-seed");
+
+/** 1x1 transparent PNG — the committed side of the image-diff spec's fixture. */
+const TINY_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: "ignore" });
 const shOut = (cmd, cwd) =>
@@ -47,6 +51,19 @@ export function seed(o = {}) {
     );
   }
 
+  // 1a. A committed 1x1 PNG, so the image-diff spec has a HEAD side to compare
+  // against. Separate from the block above (which only runs for a brand-new
+  // fixture) so an already-seeded checkout picks it up too.
+  const shot = path.join(fixture, "shot.png");
+  if (!existsSync(shot)) {
+    writeFileSync(shot, Buffer.from(TINY_PNG_B64, "base64"));
+    sh("git add shot.png", fixture);
+    sh(
+      'git -c user.email=e2e@termic.dev -c user.name=e2e commit -q -m "fixture image"',
+      fixture,
+    );
+  }
+
   // 1b. An `origin` remote with `origin/main`. Real repos are cloned and carry
   // a remote-tracking base, so the default project base_branch is "origin/main"
   // (see projects.json + detect_base_branch in lib.rs). Without this the fixture
@@ -72,7 +89,63 @@ export function seed(o = {}) {
     sh("git branch --set-upstream-to=origin/main main", fixture);
   }
 
+  // 1b. Self-heal tracked fixture content. Specs that edit tracked files
+  // (git dirty-tree, editor save) restore them in after(), but a crashed
+  // or aborted run skips teardown and leaves the tree dirty; the git
+  // spec asserts clean-at-boot and its "Git" tab match breaks on the
+  // dirty-count badge. Tracked files only: untracked state (a spec's
+  // .termic.yaml, task droppings) is owned and cleaned by the specs.
+  // Unstage first: `checkout HEAD -- .` restores tracked paths but leaves
+  // a file staged as NEW sitting in the index; reset demotes it to
+  // untracked (spec-owned, like .termic.yaml). Then HEAD (not the bare
+  // `-- .` index form): a run that crashed after staging leaves the dirt
+  // in index AND worktree, where the index form is a no-op and the
+  // clean-tree spec still boots red.
+  try {
+    sh("git reset -q HEAD -- .", fixture);
+    sh("git checkout -q HEAD -- .", fixture);
+  } catch {
+    /* ignore */
+  }
+
   // 2. An unopened `sbcheck` worktree (the import-worktree spec expects it).
+  //
+  // The dir lives under $HOME and is SHARED by every termic checkout's
+  // fixture, so it can exist but belong to another checkout (its `.git`
+  // file points at that checkout's fixture). Such a dir blocks
+  // `worktree add` with "already exists" AND keeps this fixture's stale
+  // registration alive (git only prunes when the dir is gone or
+  // unreadable, verified: a foreign-owned dir is NOT prunable), which
+  // used to skip the re-add entirely and leave the import-worktree spec
+  // red forever, on whichever checkout lost the dir. Reclaim it: it is
+  // throwaway derived state on both sides, and the losing checkout's
+  // seed does the same reclaim right back on its next run.
+  // Owned means the back-pointer names THIS fixture AND the admin dir it
+  // points at still exists: a recreated .e2e (rm -rf, or this checkout
+  // being a re-made task worktree) leaves the dir's .git naming our path
+  // while the fixture no longer knows it, and treating that dangling
+  // state as "ours" would skip the reclaim and leave `worktree add`
+  // permanently blocked by the non-empty dir.
+  const sbcheckOwnedHere = () => {
+    try {
+      const gitfile = readFileSync(path.join(sbcheck, ".git"), "utf8");
+      const target = gitfile.replace(/^gitdir:\s*/, "").trim();
+      return gitfile.includes(path.join(fixture, ".git")) && existsSync(target);
+    } catch {
+      return false;
+    }
+  };
+  if (existsSync(sbcheck) && !sbcheckOwnedHere()) {
+    rmSync(sbcheck, { recursive: true, force: true });
+  }
+  // With a foreign dir gone (or the dir deleted out from under git), the
+  // leftover registration is now genuinely dangling; prune BEFORE listing
+  // so the includes() check below reflects reality.
+  try {
+    sh("git worktree prune", fixture);
+  } catch {
+    /* ignore */
+  }
   let worktrees = "";
   try {
     worktrees = shOut("git worktree list", fixture);
@@ -84,7 +157,15 @@ export function seed(o = {}) {
     try {
       sh(`git worktree add -q "${sbcheck}" -b sbcheck`, fixture);
     } catch {
-      /* already exists */
+      // -b fails when the branch survived a removed worktree; attach the
+      // existing branch instead of seeding nothing. Guarded: seed() must
+      // never hard-fail the whole suite over this fixture nicety, and a
+      // missing sbcheck only reddens the one import spec.
+      try {
+        sh(`git worktree add -q "${sbcheck}" sbcheck`, fixture);
+      } catch {
+        /* leave it to the import spec to report */
+      }
     }
   }
 

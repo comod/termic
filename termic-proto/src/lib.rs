@@ -31,7 +31,37 @@ use std::io::{self, BufRead, Read, Write};
 /// the bidirectional `attach` session (AttachFrame lines after the
 /// accepted request). Exit codes 10 (apply conflict) and 11 (attach
 /// target closed) become live.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// v4 (Phase 3): the `quit` verb. v5: `tab` / `agents` (GH #138 part 1).
+///
+/// v6 (GH #138 part 2): `tab` selectors (`tab` field on send / wait /
+/// attach / logs), `TaskStatus.tabs`, and `tab -p` (prompt fields on the
+/// `tab` command, `TabData.prompt`).
+///
+/// v7: the `rename` verb (GH #153).
+///
+/// v8 (GH #169): attach existing work. `new` gains `from` (adopt a
+/// registered worktree instead of creating one) and `resume` (seed the
+/// agent's session id); `tab` gains `resume`.
+///
+/// v9 (Phase 4): prompt library access. The `prompts` verb (list, or
+/// resolve one selector to its body) and `prompt_ref` on `new` / `send`
+/// / `tab` (the `-P/--library` selector; the server resolves it against
+/// the live prompt store and composes the body with any literal prompt).
+/// `send.prompt` becomes optional on the wire (`prompt_ref` can stand
+/// alone).
+///
+/// v10 (GH #185): the `tab_close` verb. Additive in shape, but a v9
+/// server rejects the new `cmd` value as a malformed request, which is
+/// exactly the skew the version gate turns into "Termic updated, rerun
+/// your command". `AttachData.reason` gains "closed".
+pub const PROTOCOL_VERSION: u32 = 10;
+
+/// serde default for `QuitData::running`.
+pub(crate) fn default_true() -> bool { true }
+
+/// serde skip helper for default-false flags.
+pub(crate) fn is_false(b: &bool) -> bool { !*b }
 
 /// Socket + token file names inside the app's data dir.
 pub const SOCKET_FILE: &str = "termic.sock";
@@ -181,6 +211,14 @@ pub enum Command {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        /// Prompt-library selector (`-P/--library`, v9): an exact prompt
+        /// id (`builtin:review`, a custom prompt's UUID) or a
+        /// case-insensitive exact title. The server resolves it against
+        /// the live prompt store BEFORE the task is created and delivers
+        /// the body; with `prompt` too, the body, a blank line, then the
+        /// text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         /// "worktree" | "main". Absent = the GUI's remembered mode.
@@ -189,6 +227,16 @@ pub enum Command {
         /// Base branch for a worktree task. Absent = the repo default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        /// Adopt this EXISTING registered worktree instead of creating
+        /// one (GH #169). Absolute path (the CLI canonicalizes). Mutually
+        /// exclusive with mode/base; no setup script runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// Session id to resume in the agent's first spawn (GH #169).
+        /// The agent must declare `resume_id_args`. Valid with or
+        /// without `from`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
         /// "off" | "monitor" | "enforce" | "enforce-fs". Absent = the
         /// project's sandbox seeds (same fallback the GUI uses).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,9 +268,104 @@ pub enum Command {
         project: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        /// Wait on ONE tab instead of the whole task: a tab id (as
+        /// printed by `termic tab`), a 1-based strip index, or a title.
+        /// Absent = task-level quiescence, the pre-v6 meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<String>,
         /// The CLI's working directory, for worktree-first resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+    },
+    /// List the agent registry: what `--agent` / `--terminal` accept.
+    /// Answers "what can I pass?", which was otherwise only discoverable
+    /// by guessing wrong and reading the error (GH #138).
+    Agents,
+    /// The prompt library (Phase 4): what `-P/--library` accepts. The
+    /// library is per-user and editable, so static help cannot carry it
+    /// (the `agents` argument). Resolution happens in the webview's live
+    /// prompt store at request time, so overrides, renames and deletions
+    /// are always current.
+    Prompts {
+        /// Absent: list the library (ids, titles, flags; no bodies).
+        /// Present: resolve ONE prompt (exact id, then case-insensitive
+        /// exact title) and include its body (`prompts show`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+    },
+    /// Open a tab INSIDE a running task: the GUI's "+" menu as a verb.
+    /// The KIND is explicit rather than a string, because the kinds differ
+    /// in sandbox, resume and YOLO behaviour and a typo must not land the
+    /// caller in the wrong semantics (docs/plans/cli.md, GH #138).
+    Tab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        kind: TabKind,
+        /// Deliver this prompt into the tab just opened (agent kinds
+        /// only), through the same confirmed `send_prompt` route `send`
+        /// uses; the tab's id is the target, so nothing races a second
+        /// tab opening meanwhile. Streamed reply when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        /// Prompt-library selector (`-P/--library`, v9); see `New`. The
+        /// server resolves it BEFORE the tab is opened (fail fast).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_ref: Option<String>,
+        /// With `prompt`: hold the reply until that prompt's turn
+        /// settles, the same contract as `send --wait`.
+        #[serde(default)]
+        wait: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Session id the new tab's agent resumes (GH #169). Agent kinds
+        /// only; the agent must declare `resume_id_args`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Close ONE tab of a running task: the GUI's × as a verb (GH #185).
+    /// Anything that opens tabs programmatically needs a way to clean
+    /// them up; task-level `archive` is the wrong hammer, it takes every
+    /// tab including the caller's own session.
+    TabClose {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// Tab selector (id, 1-based strip index, or title/cli), resolved
+        /// by the same rules `send`/`wait`/`attach`/`logs` use. Required:
+        /// there is no "the obvious tab" to close by default, and
+        /// guessing one would be the destructive direction.
+        tab: String,
+        /// Permit closing the DEFAULT tab, the one every unqualified
+        /// `send`/`wait`/`attach` resolves to. Refused without this even
+        /// when its agent already exited, because the refusal is about
+        /// what other scripts are talking to, not about liveness.
+        #[serde(default)]
+        yes: bool,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Shut the app down: every PTY, script process group, in-flight grep
+    /// and spotlight session goes with it (the same teardown Cmd-Q does).
+    /// Authenticated, because it is the most destructive thing the socket
+    /// can do. The confirmation prompt is the CLI's job (`--yes` skips it);
+    /// the server never asks.
+    Quit {
+        /// Actually quit. Defaults to FALSE, i.e. preview only.
+        ///
+        /// Deliberately phrased so the fail-open direction is the safe one.
+        /// The protocol tolerates unknown fields by design, so `previw: true`
+        /// or any future rename would silently take the default - and for the
+        /// most destructive verb on the socket that default must not be
+        /// "tear the app down".
+        #[serde(default)]
+        commit: bool,
     },
     /// Archive a task. Live agent PTYs are SIGKILLed first. The
     /// confirmation prompt is the CLI's job (`--yes` skips it); the
@@ -231,6 +374,22 @@ pub enum Command {
         task: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
+    },
+    /// Rename a task: the sidebar label ONLY. The branch and worktree
+    /// directory keep their creation-time names (they are pushed /
+    /// referenced by live PTY cwds; moving them is not this verb's job).
+    /// cwd-aware when `task` absent, like `open`.
+    Rename {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// The new display name. Must be non-empty after trimming; a
+        /// same-project live duplicate is a Conflict.
+        name: String,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Register a directory as a project (absolute path; the CLI
     /// canonicalizes before sending). `non_git` opts a plain folder in
@@ -257,7 +416,14 @@ pub enum Command {
         task: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
+        /// The literal prompt text. Defaulted (v9) so `prompt_ref` can
+        /// stand alone; the server rejects the request when BOTH are
+        /// empty/absent.
+        #[serde(default)]
         prompt: String,
+        /// Prompt-library selector (`-P/--library`, v9); see `New`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_ref: Option<String>,
         /// No agent running: restore the last session, then deliver.
         #[serde(default)]
         resume: bool,
@@ -270,6 +436,12 @@ pub enum Command {
         wait: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        /// Deliver to ONE tab instead of the default agent tab: a tab id
+        /// (as printed by `termic tab`), a 1-based strip index, or a
+        /// title. `resume`/`fresh` are refused alongside it (they spawn,
+        /// a selector targets something already open).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<String>,
         /// The CLI's working directory, for worktree-first resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -308,6 +480,11 @@ pub enum Command {
         /// Target the task's aux terminal instead of the agent.
         #[serde(default)]
         shell: bool,
+        /// Target ONE agent tab: a tab id (as printed by `termic tab`),
+        /// a 1-based strip index, or a title. Mutually exclusive with
+        /// `shell` (the aux terminal is not in the strip).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<String>,
         /// Cap the returned tail to this many bytes (absent = the whole
         /// retained buffer).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,6 +520,11 @@ pub enum Command {
         /// Target the task's aux terminal instead of the agent.
         #[serde(default)]
         shell: bool,
+        /// Target ONE agent tab: a tab id (as printed by `termic tab`),
+        /// a 1-based strip index, or a title. Mutually exclusive with
+        /// `shell` (the aux terminal is not in the strip).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab: Option<String>,
         /// The CLI's working directory, for worktree-first resolution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -390,6 +572,28 @@ impl Reply {
     }
 }
 
+/// What `termic tab` opens. Separate variants rather than one string:
+/// an agent tab inherits the task's sandbox pin, while terminal and shell
+/// tabs are uncaged exactly as the GUI's are, so a mistyped kind must not
+/// silently downgrade a caged agent into an uncaged shell.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "tab", rename_all = "snake_case")]
+pub enum TabKind {
+    /// A `kind: "agent"` registry entry. Rejected if unknown, disabled or
+    /// not detected on PATH: the GUI hides those, but a CLI caller has no
+    /// menu to look at and must be told why.
+    Agent { id: String },
+    /// A `kind: "terminal"` custom entry (#27). Never resumes, no YOLO args.
+    Terminal { id: String },
+    /// A plain login shell tab in the task's strip, uncaged like the GUI's.
+    /// NOT the aux terminal: `attach --shell` / `logs --shell` resolve the
+    /// separate aux pane (role kind "aux"), which this does not create.
+    Shell,
+    /// Another tab of whatever the task already runs. What the `+` button
+    /// does before you pick anything.
+    Default,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReplyData {
@@ -399,7 +603,13 @@ pub enum ReplyData {
     Open(OpenData),
     New(NewData),
     Wait(WaitData),
+    Agents(AgentsData),
+    Prompts(PromptsData),
+    Tab(TabData),
+    TabClose(TabCloseData),
+    Quit(QuitData),
     Archive(ArchiveData),
+    Rename(RenameData),
     ProjectList(ProjectListData),
     ProjectAdd(ProjectAddData),
     ProjectRemove(ProjectRemoveData),
@@ -468,12 +678,195 @@ pub struct WaitData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentsData {
+    pub agents: Vec<AgentEntry>,
+}
+
+/// One registry entry, as the CLI sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentEntry {
+    /// What you pass to `--agent` or `--terminal`.
+    pub id: String,
+    /// "agent" or "terminal". Decides WHICH flag takes it, and with it the
+    /// sandbox behaviour, so it is not cosmetic.
+    pub kind: String,
+    /// Enabled in Settings. A disabled entry is rejected by `tab`.
+    pub enabled: bool,
+    /// Found on PATH. `None` when detection has not run yet, which is not
+    /// the same as "not installed" and must not be rendered as such.
+    #[serde(default)]
+    pub installed: Option<bool>,
+    /// Usable RIGHT NOW: enabled, and installed where that is known. The
+    /// single field a caller should branch on, so the enabled/installed
+    /// rule cannot drift between the CLI and the tab validator.
+    pub usable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromptsData {
+    /// The whole library in display order for a list, exactly one entry
+    /// for a resolved selector.
+    pub prompts: Vec<PromptEntry>,
+}
+
+/// One prompt-library entry, as the CLI sees it (Phase 4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromptEntry {
+    /// The stable identity every selector resolves to: `builtin:<slug>`
+    /// for shipped prompts, a UUID for custom ones. Pin THIS in scripts;
+    /// titles are user-editable conveniences.
+    pub id: String,
+    pub title: String,
+    pub builtin: bool,
+    /// Shown in the GUI dropdown. A DISABLED prompt is still fireable by
+    /// explicit selector: disabled means hidden, not dead.
+    pub enabled: bool,
+    /// Built-in only: the user edited it away from the shipped text.
+    pub modified: bool,
+    /// The prompt body. Present only for a resolved selector
+    /// (`prompts show`); the list omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// True when `body` was trimmed to fit the reply-line cap. The body
+    /// itself carries NO marker text (a marker would ride a
+    /// `show | send -p -` pipe into an agent as instructions); the CLI
+    /// warns on stderr instead.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TabData {
+    /// The task the tab was opened in.
+    pub task_id: String,
+    /// The tab's stable store id. Printed for every kind so a script can
+    /// record what it made, and it never changes the way an index or an
+    /// agent-authored title does.
+    ///
+    /// Resolution caveat for part 2: only AGENT tabs carry a `PtyRole`
+    /// today, so only those are addressable by the RUST-NATIVE path
+    /// (`find_role_pty`, which `attach` and `logs` use). Anything routed
+    /// through the webview sees every tab, since the store holds them all.
+    /// Giving shell and custom-terminal tabs a role would close that gap
+    /// and is NOT a sandbox change: the cage keys on `pty_spawn`'s separate
+    /// `task_id` argument, not on `role`.
+    pub tab_id: String,
+    /// Resolved cli id ("claude", "shell", a custom terminal's id).
+    pub cli: String,
+    /// Display title the GUI gave it.
+    pub title: String,
+    /// Present when a prompt rode along (`tab -p`): how it reached the
+    /// new tab. Delivery goes through `send_prompt` targeted at this
+    /// tab's id, the same confirmed route `send --tab` uses; a second
+    /// injection recipe would reintroduce the silently-dropped prompt
+    /// Phase 1 exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptOutcome>,
+}
+
+/// How a rode-along prompt (`tab -p`) reached its target.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromptOutcome {
+    /// See `send_mode`.
+    pub mode: String,
+    /// False when the target agent has work-done detection disabled
+    /// (prompt typed immediately, no settle signal; `--wait` refuses).
+    pub capable: bool,
+    /// Present under `wait`: how the watched turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TabCloseData {
+    pub task_id: String,
+    /// The tab that was closed, echoed back as its stable id: the caller
+    /// may have named it by index or title, and only the id identifies
+    /// what actually went.
+    pub tab_id: String,
+    /// Resolved cli id of the closed tab ("claude", "codex", "shell",
+    /// a custom terminal's id).
+    pub cli: String,
+    /// Display title the GUI had given it.
+    pub title: String,
+    /// "agent" | "shell" | "terminal" | "run". Unlike every other
+    /// tab-targeting verb, `tab close` reaches all of them: closing is
+    /// not driving, and the CLI can open shell tabs, so it has to be
+    /// able to clean them up.
+    ///
+    /// NOT named `kind`, which every sibling payload uses, because
+    /// `ReplyData` is an internally-tagged enum whose tag IS `kind`:
+    /// serde flattens the two into one key and the reply fails to parse
+    /// with "duplicate field `kind`". `roundtrip_every_reply` catches it.
+    #[serde(default)]
+    pub tab_kind: String,
+    /// True when this was the task's DEFAULT tab (closed under `yes`).
+    /// Load-bearing for the caller, because the default tab is DURABLE:
+    /// closing it ends the agent for now, and the task brings it back on
+    /// reopen. A secondary tab is forgotten instead, recoverable only
+    /// from the GUI's Resume menu.
+    #[serde(default)]
+    pub was_default: bool,
+    /// A live process was stopped by this close (false when the tab's
+    /// agent or shell had already exited).
+    ///
+    /// Named for the PTY, not the agent, because this verb closes shell
+    /// and custom-terminal tabs too. How it dies differs by kind, and
+    /// only agent tabs get the polite version: they carry a `PtyRole`,
+    /// so the server can find and SIGTERM them by tab id and let the
+    /// agent flush its transcript. Nothing else carries one, so those
+    /// die the way the GUI's close button kills them, which costs
+    /// nothing since they have no transcript to lose.
+    #[serde(default)]
+    pub killed_pty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuitData {
+    /// Always true from the server (it answered, so it was running). The
+    /// not-running case is synthesised by the CLI with `running: false`, so
+    /// a script can branch on this one field either way.
+    #[serde(default = "crate::default_true")]
+    pub running: bool,
+    /// Tasks with at least one live agent PTY.
+    #[serde(default)]
+    pub tasks_with_agents: u32,
+    /// Live agent PTYs that will die (or died) with the app.
+    #[serde(default)]
+    pub live_agents: u32,
+    /// TASKS the webview reports as working, not agents: the work-state
+    /// cache aggregates per task, so two busy tabs in one task count once.
+    /// Named for what it counts rather than what a caller might hope.
+    /// Clamped to `tasks_with_agents`, because a lagging cache can otherwise
+    /// name a task whose agent PTY is already gone.
+    ///
+    /// `None` means UNKNOWN, not zero: the cache went stale, so the webview
+    /// stopped reporting. The distinction is load-bearing for a confirmation
+    /// prompt - collapsing it into 0 would render "nothing is working" and
+    /// "I cannot tell" identically, and understating what is about to die is
+    /// the wrong direction for a safety question. `live_agents` is ground
+    /// truth either way; only this field can go dark.
+    #[serde(default)]
+    pub working_tasks: Option<u32>,
+    /// False for `preview`, true when the app is on its way out.
+    pub quitting: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArchiveData {
     pub task_id: String,
     pub name: String,
     pub project: String,
     /// Live agent PTYs SIGKILLed before the archive ran.
     pub killed_agents: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenameData {
+    /// The task AFTER the rename, re-read from disk (name is the new one).
+    pub task: TaskSummary,
+    /// What the task was called before, for "renamed X to Y" output.
+    pub old_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -556,6 +949,46 @@ pub struct TaskStatus {
     /// files_changed + untracked, when the diff stat resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty_files: Option<u64>,
+    /// The task's terminal tabs in strip order (GH #138 part 2), when
+    /// the webview's per-tab snapshot answered. `None` means UNKNOWN
+    /// (webview booting or stale), not "no tabs": consumers must not
+    /// render it as an empty strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<TabStatus>>,
+}
+
+/// One tab row for `status` (GH #138 part 2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TabStatus {
+    /// Stable tab id: the identity every `--tab` selector resolves to.
+    pub id: String,
+    /// 1-based row number in THIS list, which is the task's terminal
+    /// tabs in strip order (editor/diff tabs are not listed and do not
+    /// shift it). `--tab <n>` means exactly this number.
+    pub index: u32,
+    /// "agent" | "shell" | "terminal" (custom, #27) | "run" (script
+    /// tabs). Additive: skip unknown kinds. Only agent tabs are
+    /// addressable by send/wait/attach/logs; the rest are write-only
+    /// from the CLI by design (docs/plans/cli.md, GH #138).
+    pub kind: String,
+    /// cli id ("claude", "shell", a custom terminal's id).
+    pub agent: String,
+    /// Display title, as the GUI renders it (agent-authored titles
+    /// change mid-turn; the id does not).
+    pub title: String,
+    /// Per-tab work state ("working", "waiting", "done", "idle").
+    /// `None` for tabs with no settle signal (shell, custom terminal,
+    /// work-done-incapable agents). Additive: pass unknown strings
+    /// through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The tab send/wait/attach/logs resolve to when `--tab` is absent.
+    pub is_default: bool,
+    /// A PTY is live in this tab right now (vs a durable tab awaiting
+    /// restore).
+    pub live: bool,
+    /// Prompts queued behind the current turn (send's queue-on-busy).
+    pub queued: u32,
 }
 
 /// How `send` got the prompt to the agent. Additive: new modes may
@@ -634,8 +1067,9 @@ pub struct AttachData {
     pub task_id: String,
     /// Why the session ended: "detached" (client asked), "exited"
     /// (the PTY closed), "archived" (the task was archived under us),
-    /// "lagged" (the session fell too far behind the output stream and
-    /// was force-detached). Additive: skip unknown reasons.
+    /// "closed" (the tab was closed under us, `tab close`), "lagged"
+    /// (the session fell too far behind the output stream and was
+    /// force-detached). Additive: skip unknown reasons.
     pub reason: String,
 }
 
@@ -1063,9 +1497,12 @@ mod tests {
             Command::New {
                 name: "fix-auth".into(),
                 prompt: Some("fix the login redirect".into()),
+                prompt_ref: Some("builtin:review".into()),
                 agent: Some("claude".into()),
                 mode: Some("worktree".into()),
                 base: Some("develop".into()),
+                from: None,
+                resume: None,
                 sandbox: Some("enforce-fs".into()),
                 yolo: true,
                 project: Some("web".into()),
@@ -1077,9 +1514,30 @@ mod tests {
             Command::New {
                 name: "bare".into(),
                 prompt: None,
+                prompt_ref: None,
                 agent: None,
                 mode: None,
                 base: None,
+                from: None,
+                resume: None,
+                sandbox: None,
+                yolo: false,
+                project: None,
+                open: false,
+                wait: false,
+                timeout_ms: None,
+                cwd: None,
+            },
+            // v7 import shape (GH #169): adopt a worktree + resume a session.
+            Command::New {
+                name: String::new(),
+                prompt: None,
+                prompt_ref: None,
+                agent: Some("claude".into()),
+                mode: None,
+                base: None,
+                from: Some("/tasks/web/poll-linear".into()),
+                resume: Some("018f2c1e-aaaa-bbbb-cccc-1234567890ab".into()),
                 sandbox: None,
                 yolo: false,
                 project: None,
@@ -1092,10 +1550,66 @@ mod tests {
                 task: Some("fix-auth".into()),
                 project: None,
                 timeout_ms: Some(1000),
+                tab: Some("2".into()),
                 cwd: None,
             },
-            Command::Wait { task: None, project: None, timeout_ms: None, cwd: Some("/t".into()) },
+            Command::Wait {
+                task: None, project: None, timeout_ms: None, tab: None, cwd: Some("/t".into()),
+            },
+            Command::Tab {
+                task: Some("fix-auth".into()),
+                project: None,
+                kind: TabKind::Agent { id: "claude".into() },
+                prompt: Some("run the tests".into()),
+                prompt_ref: Some("builtin:review".into()),
+                wait: true,
+                timeout_ms: Some(60_000),
+                resume: Some("018f2c1e-aaaa-bbbb-cccc-1234567890ab".into()),
+                cwd: None,
+            },
+            Command::Tab {
+                task: None, project: None, kind: TabKind::Shell,
+                prompt: None, prompt_ref: None, wait: false, timeout_ms: None,
+                resume: None, cwd: None,
+            },
+            Command::Tab {
+                task: None, project: None, kind: TabKind::Default,
+                prompt: None, prompt_ref: None, wait: false, timeout_ms: None,
+                resume: None, cwd: None,
+            },
+            // v10 (GH #185): close one tab, by every selector shape.
+            Command::TabClose {
+                task: Some("fix-auth".into()),
+                project: Some("web".into()),
+                tab: "2".into(),
+                yes: true,
+                cwd: None,
+            },
+            Command::TabClose {
+                task: None,
+                project: None,
+                tab: "a1b2c3".into(),
+                yes: false,
+                cwd: Some("/tasks/web/x".into()),
+            },
+            Command::Agents,
+            Command::Prompts { selector: None },
+            Command::Prompts { selector: Some("builtin:review".into()) },
+            Command::Quit { commit: false },
+            Command::Quit { commit: true },
             Command::Archive { task: "fix-auth".into(), project: Some("web".into()) },
+            Command::Rename {
+                task: Some("fix-auth".into()),
+                project: Some("web".into()),
+                name: "PR 123 - fix login".into(),
+                cwd: None,
+            },
+            Command::Rename {
+                task: None,
+                project: None,
+                name: "retitled".into(),
+                cwd: Some("/tasks/web/x".into()),
+            },
             Command::ProjectAdd { path: "/repo/web".into(), non_git: false },
             Command::ProjectAdd { path: "/notes/plain".into(), non_git: true },
             Command::ProjectList,
@@ -1104,20 +1618,24 @@ mod tests {
                 task: Some("fix-auth".into()),
                 project: Some("web".into()),
                 prompt: "run the tests".into(),
+                prompt_ref: None,
                 resume: false,
                 fresh: false,
                 wait: true,
                 timeout_ms: Some(60_000),
+                tab: Some("claude".into()),
                 cwd: None,
             },
             Command::Send {
                 task: None,
                 project: None,
                 prompt: "continue".into(),
+                prompt_ref: Some("Review".into()),
                 resume: true,
                 fresh: false,
                 wait: false,
                 timeout_ms: None,
+                tab: None,
                 cwd: Some("/repo/web".into()),
             },
             Command::Apply { task: "fix-auth".into(), project: Some("web".into()) },
@@ -1127,11 +1645,23 @@ mod tests {
                 task: Some("fix-auth".into()),
                 project: None,
                 shell: true,
+                tab: None,
                 last_bytes: Some(4096),
                 cwd: None,
             },
+            Command::Logs {
+                task: Some("fix-auth".into()),
+                project: None,
+                shell: false,
+                tab: Some("a1b2c3".into()),
+                last_bytes: None,
+                cwd: None,
+            },
             Command::LastResult { task: Some("fix-auth".into()), project: None, cwd: None },
-            Command::Attach { task: None, project: None, shell: false, cwd: Some("/t".into()) },
+            Command::Attach {
+                task: None, project: None, shell: false, tab: Some("1".into()),
+                cwd: Some("/t".into()),
+            },
         ] {
             roundtrip(&Request { id: "r1".into(), token: Some("t".into()), cmd });
         }
@@ -1190,6 +1720,39 @@ mod tests {
                     sandbox: "enforce".into(),
                     sessions: 2,
                     dirty_files: Some(4),
+                    tabs: Some(vec![
+                        TabStatus {
+                            id: "t1".into(),
+                            index: 1,
+                            kind: "agent".into(),
+                            agent: "claude".into(),
+                            title: "claude".into(),
+                            state: Some("working".into()),
+                            is_default: true,
+                            live: true,
+                            queued: 1,
+                        },
+                        TabStatus {
+                            id: "t2".into(),
+                            index: 2,
+                            kind: "shell".into(),
+                            agent: "shell".into(),
+                            title: "Terminal".into(),
+                            state: None,
+                            is_default: false,
+                            live: true,
+                            queued: 0,
+                        },
+                    ]),
+                },
+            }),
+            ReplyData::Status(StatusData {
+                task: TaskStatus {
+                    summary: summary.clone(),
+                    sandbox: "off".into(),
+                    sessions: 0,
+                    dirty_files: None,
+                    tabs: None,
                 },
             }),
             ReplyData::Open(OpenData { task: Some(summary.clone()), raised: true }),
@@ -1211,11 +1774,105 @@ mod tests {
                 task_id: "w1".into(),
                 result: WaitResult { outcome: WaitOutcome::Timeout, state: None, detail: Some("x".into()) },
             }),
+            ReplyData::Agents(AgentsData {
+                agents: vec![AgentEntry {
+                    id: "claude".into(),
+                    kind: "agent".into(),
+                    enabled: true,
+                    installed: Some(true),
+                    usable: true,
+                }],
+            }),
+            ReplyData::Prompts(PromptsData {
+                prompts: vec![
+                    PromptEntry {
+                        id: "builtin:review".into(),
+                        title: "Review".into(),
+                        builtin: true,
+                        enabled: true,
+                        modified: false,
+                        body: None,
+                        truncated: false,
+                    },
+                    PromptEntry {
+                        id: "3f1c0d6e-aaaa-bbbb-cccc-1234567890ab".into(),
+                        title: "Ship it".into(),
+                        builtin: false,
+                        enabled: false,
+                        modified: false,
+                        body: Some("Review the diff, then commit.".into()),
+                        truncated: true,
+                    },
+                ],
+            }),
+            ReplyData::Tab(TabData {
+                task_id: "w1".into(),
+                tab_id: "3f1c-…".into(),
+                cli: "claude".into(),
+                title: "claude".into(),
+                prompt: None,
+            }),
+            ReplyData::Tab(TabData {
+                task_id: "w1".into(),
+                tab_id: "3f1c-…".into(),
+                cli: "claude".into(),
+                title: "claude".into(),
+                prompt: Some(PromptOutcome {
+                    mode: send_mode::SPAWNED.into(),
+                    capable: true,
+                    wait: Some(WaitResult {
+                        outcome: WaitOutcome::Done,
+                        state: Some("done".into()),
+                        detail: None,
+                    }),
+                }),
+            }),
+            // v10 (GH #185): a secondary tab (forgotten) and the default
+            // tab (durable), the distinction `was_default` exists for.
+            ReplyData::TabClose(TabCloseData {
+                task_id: "w1".into(),
+                tab_id: "tab-2".into(),
+                cli: "claude".into(),
+                title: "reviewing the diff".into(),
+                tab_kind: "agent".into(),
+                was_default: false,
+                killed_pty: true,
+            }),
+            ReplyData::TabClose(TabCloseData {
+                task_id: "w1".into(),
+                tab_id: "main".into(),
+                cli: "codex".into(),
+                title: "codex".into(),
+                tab_kind: "agent".into(),
+                was_default: true,
+                killed_pty: false,
+            }),
+            // A shell tab: reachable by `tab close` and nothing else.
+            ReplyData::TabClose(TabCloseData {
+                task_id: "w1".into(),
+                tab_id: "tab-sh".into(),
+                cli: "shell".into(),
+                title: "Terminal".into(),
+                tab_kind: "shell".into(),
+                was_default: false,
+                killed_pty: true,
+            }),
+            ReplyData::Quit(QuitData {
+                running: true,
+                tasks_with_agents: 2,
+                live_agents: 3,
+                working_tasks: Some(1),
+                quitting: true,
+            }),
             ReplyData::Archive(ArchiveData {
                 task_id: "w1".into(),
                 name: "fix-auth".into(),
                 project: "web".into(),
                 killed_agents: 2,
+            }),
+            ReplyData::Rename(RenameData {
+                task: summary.clone(),
+                old_name: "fix-auth".into(),
             }),
             ReplyData::ProjectList(ProjectListData {
                 projects: vec![ProjectInfo {
@@ -1277,6 +1934,21 @@ mod tests {
             "not a registered project",
             serde_json::json!({ "root": "/repo/web" }),
         ));
+    }
+
+    #[test]
+    fn send_prompt_field_is_optional_on_the_wire() {
+        // v9: `prompt_ref` can stand alone, so a send line without
+        // `prompt` must parse (defaulting to empty) rather than error.
+        let line = r#"{"id":"r1","token":"t","cmd":"send","prompt_ref":"builtin:review"}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req.cmd {
+            Command::Send { prompt, prompt_ref, .. } => {
+                assert_eq!(prompt, "");
+                assert_eq!(prompt_ref.as_deref(), Some("builtin:review"));
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
     }
 
     #[test]

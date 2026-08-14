@@ -1,4 +1,33 @@
+import { execSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { archiveTask, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitVisible } from "../helpers";
+
+/** Click the [role="switch"] in the settings row whose label matches exactly.
+ *  Toggle rows are label + switch inside one .justify-between wrapper
+ *  (Controls.tsx / AppearanceSection.tsx, same markup). */
+const clickToggleByLabel = (label: string) =>
+  browser.execute((lbl) => {
+    const labelEl = [...document.querySelectorAll("div")].find(
+      (d) => d.textContent?.trim() === lbl,
+    );
+    const sw = labelEl
+      ?.closest(".justify-between")
+      ?.querySelector('[role="switch"]') as HTMLElement | null;
+    if (!sw) throw new Error("toggle switch not found for: " + lbl);
+    sw.click();
+  }, label);
+
+/** Click a segment of the renderer picker. Keyed off `data-renderer`, whose
+ *  values are the pref values themselves, so copy edits to the visible labels
+ *  cannot break the test the way matching on label text would. */
+const selectRendererByValue = (value: "webgl" | "canvas" | "dom") =>
+  browser.execute((v) => {
+    const btn = document.querySelector(`[data-renderer="${v}"]`) as HTMLElement | null;
+    if (!btn) throw new Error("renderer segment not found: " + v);
+    btn.click();
+  }, value);
 
 // Settings/preferences subsystem. Guards that a real toggle in the Settings
 // overlay flips the pref in the prefs store and the control reflects it.
@@ -31,16 +60,7 @@ describe("settings", () => {
     );
 
     // Click the actual toggle switch in that setting's row.
-    await browser.execute((lbl) => {
-      const labelEl = [...document.querySelectorAll("div")].find(
-        (d) => d.textContent?.trim() === lbl,
-      );
-      const sw = labelEl
-        ?.closest(".justify-between")
-        ?.querySelector('[role="switch"]') as HTMLElement | null;
-      if (!sw) throw new Error("toggle switch not found for: " + lbl);
-      sw.click();
-    }, LABEL);
+    await clickToggleByLabel(LABEL);
 
     // The prefs store must reflect the flip (poll, don't sleep).
     await browser.waitUntil(
@@ -78,7 +98,30 @@ describe("settings", () => {
 // to a control that lives ONLY there, so a section landing on the wrong rail
 // item fails here instead of in a bug report.
 describe("settings rail", () => {
+  /** Snapshot for the GPU-toggle case below. The case restores in its own
+   *  finally (so the NEXT case in this file never sees a flipped pref: the
+   *  preview case asserts a canvas mounts, and the DOM renderer creates
+   *  none); this after() is the backstop for the shared profile when the
+   *  whole run dies mid-case. Same discipline as the signal-inspector
+   *  snapshot. */
+  let gpuOriginal: "webgl" | "canvas" | "dom" | undefined;
+  /** Same discipline for the two editor-theme prefs: the case below writes
+   *  both, and later specs in the run read the editor. */
+  let editorThemeOriginals: { dark: string; light: string } | undefined;
+
   after(async () => {
+    if (gpuOriginal !== undefined) {
+      await browser.execute((v) => {
+        window.__termic!.usePrefs.getState().setTerminalRenderer(v);
+      }, gpuOriginal);
+    }
+    if (editorThemeOriginals) {
+      await browser.execute((o) => {
+        const p = window.__termic!.usePrefs.getState();
+        p.setEditorThemeIdDark(o.dark);
+        p.setEditorThemeIdLight(o.light);
+      }, editorThemeOriginals);
+    }
     await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
   });
 
@@ -171,10 +214,18 @@ describe("settings rail", () => {
     }
   });
 
-  it("marks the CLI page experimental", async () => {
+  // The CLI graduated in 0.26.0. Inverted rather than deleted: docs/ui.md ties
+  // the badge to being off by default, so a badge reappearing next to a
+  // setting we now ship enabled is a real contradiction to catch. Asserts both
+  // sites the badge used to render, the rail item and the page title.
+  it("no longer marks the CLI page experimental", async () => {
     await clickRail("Termic CLI");
     await waitForText("Enable CLI");
-    await waitForText("Experimental");
+    expect(await paneText()).not.toContain("Experimental");
+    const railText = await browser.execute(
+      () => (document.querySelector('[data-rail-item="cli"]') as HTMLElement)?.textContent ?? "",
+    );
+    expect(railText.toLowerCase()).not.toContain("exp");
   });
 
   it("documents that agents in tasks can drive the CLI", async () => {
@@ -254,6 +305,80 @@ describe("settings rail", () => {
     expect(interfacePane).not.toContain("Terminal font");
   });
 
+  // GH #140: the renderer control used to be hidden behind !IS_MAC, forcing
+  // Mac users to hand-edit localStorage to escape WebGL. It is now a three-way
+  // picker (webgl / canvas / dom) on every platform. The suite runs on macOS,
+  // so asserting the control exists IS the regression guard for the exposure.
+  //
+  // Canvas is the case worth driving through the real <select>: it is the only
+  // value the legacy boolean could not express, so a regression that dropped
+  // the enum back to a toggle would still pass a webgl <-> dom test.
+  it("exposes the three-way renderer picker on the Terminal tab and it lands in prefs", async () => {
+    // Explicitly select the Terminal sub-tab: a click on the rail item is a
+    // no-op when Appearance is already open, and the previous case leaves it
+    // on Interface.
+    await clickRail("Appearance");
+    await clickAppearanceTab("terminal");
+    await waitForText("Terminal renderer");
+
+    const original = await browser.execute(
+      () => window.__termic!.usePrefs.getState().terminalRenderer,
+    );
+    gpuOriginal = original;
+    const pref = () =>
+      browser.execute(() => window.__termic!.usePrefs.getState().terminalRenderer);
+
+    // The finally puts the pref back through the setter even when an assertion
+    // mid-case throws, so the next case (which asserts a canvas mounts in the
+    // preview) never runs on the DOM renderer, which creates none.
+    try {
+      // All three values must be reachable from the control. Guards against a
+      // regression that drops the picker back to a two-state toggle, which a
+      // webgl <-> dom test alone would still pass.
+      const options = await browser.execute(() =>
+        [...document.querySelectorAll("[data-renderer]")].map(
+          (b) => (b as HTMLElement).dataset.renderer,
+        ),
+      );
+      expect(options).toEqual(["webgl", "canvas", "dom"]);
+
+      // canvas: the value the legacy boolean could not express at all.
+      await selectRendererByValue("canvas");
+      await browser.waitUntil(async () => (await pref()) === "canvas", {
+        timeout: 8_000,
+        timeoutMsg: "terminalRenderer never became canvas",
+      });
+      // The legacy boolean is a second view of the same setting, so it has to
+      // follow: a drift here means the toggle and the mounted renderer disagree.
+      expect(
+        await browser.execute(() => window.__termic!.usePrefs.getState().terminalGpuEnabled),
+      ).toBe(false);
+
+      // dom: the other non-default, and the one the old toggle's "off" meant.
+      await selectRendererByValue("dom");
+      await browser.waitUntil(async () => (await pref()) === "dom", {
+        timeout: 8_000,
+        timeoutMsg: "terminalRenderer never became dom",
+      });
+      expect(
+        await browser.execute(() => window.__termic!.usePrefs.getState().terminalGpuEnabled),
+      ).toBe(false);
+
+      await selectRendererByValue("webgl");
+      await browser.waitUntil(async () => (await pref()) === "webgl", {
+        timeout: 8_000,
+        timeoutMsg: "terminalRenderer never went back to webgl",
+      });
+      expect(
+        await browser.execute(() => window.__termic!.usePrefs.getState().terminalGpuEnabled),
+      ).toBe(true);
+    } finally {
+      await browser.execute((v) => {
+        window.__termic!.usePrefs.getState().setTerminalRenderer(v);
+      }, original);
+    }
+  });
+
   it("does not spawn the preview pty until the preview is armed", async () => {
     // TerminalPreview is a real AuxTerminal. Terminal being the landing tab
     // must not mean a settings visit forks a shell in $HOME, so a fresh open
@@ -311,6 +436,112 @@ describe("settings rail", () => {
       () => !!document.getElementById("setting-load-remote-images"),
     );
     expect(found).toBe(true);
+  });
+
+  // The syntax theme is per app mode now (dark and light are separate prefs).
+  // The rendered result is pinned in editor.e2e.ts; this is the control side:
+  // Appearance -> Editor must offer BOTH selects, and each must write only its
+  // own pref. A single-select regression fails on the second half.
+  it("offers a dark and a light editor theme, each writing its own pref", async () => {
+    await clickRail("Appearance");
+    await clickAppearanceTab("editor");
+    await waitForText("Editor theme (dark)");
+    const pane = await paneText();
+    expect(pane).toContain("Editor theme (dark)");
+    expect(pane).toContain("Editor theme (light)");
+
+    const before = await browser.execute(() => {
+      const p = window.__termic!.usePrefs.getState();
+      return { dark: p.editorThemeIdDark, light: p.editorThemeIdLight };
+    });
+    editorThemeOriginals = before;
+
+    /** The <select> in the row whose label matches, driven through a real
+     *  change event so React's onChange runs (setting .value alone does not). */
+    const pickTheme = (label: string, id: string) =>
+      browser.execute(
+        (lbl, val) => {
+          const labelEl = [
+            ...document.querySelectorAll('[data-testid="settings-pane"] div'),
+          ].find((d) => d.textContent?.trim() === lbl);
+          const sel = labelEl
+            ?.closest(".justify-between")
+            ?.querySelector("select") as HTMLSelectElement | null;
+          if (!sel) throw new Error("no select for: " + lbl);
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLSelectElement.prototype,
+            "value",
+          )!.set!;
+          setter.call(sel, val);
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+        },
+        label,
+        id,
+      );
+
+    await pickTheme("Editor theme (light)", "github-light");
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => window.__termic!.usePrefs.getState().editorThemeIdLight,
+        )) === "github-light",
+      { timeout: 8_000, timeoutMsg: "editorThemeIdLight never took" },
+    );
+    // The light pick must not have dragged the dark pref along with it.
+    const darkAfterLight = await browser.execute(
+      () => window.__termic!.usePrefs.getState().editorThemeIdDark,
+    );
+    expect(darkAfterLight).toBe(before.dark);
+
+    await pickTheme("Editor theme (dark)", "github-dark");
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => window.__termic!.usePrefs.getState().editorThemeIdDark,
+        )) === "github-dark",
+      { timeout: 8_000, timeoutMsg: "editorThemeIdDark never took" },
+    );
+    const lightAfterDark = await browser.execute(
+      () => window.__termic!.usePrefs.getState().editorThemeIdLight,
+    );
+    expect(lightAfterDark).toBe("github-light");
+  });
+
+  // WKWebView paints its own bevelled gradient over a <select> no matter what
+  // background/border CSS the element carries, which read as a stray system
+  // widget on the light theme's flat panels. The reset is a bare-element rule
+  // in index.css, so it is one deletion away from coming back on every select
+  // at once; assert it on every select the settings pane renders.
+  it("strips the native chrome from every settings select", async () => {
+    await clickRail("Appearance");
+    await clickAppearanceTab("editor");
+    await waitForText("Editor font");
+
+    const selects = await browser.execute(() =>
+      [...document.querySelectorAll('[data-testid="settings-pane"] select')].map(
+        (s) => {
+          const cs = getComputedStyle(s);
+          return {
+            appearance: cs.appearance,
+            webkit: cs.webkitAppearance,
+            image: cs.backgroundImage,
+            padRight: parseFloat(cs.paddingRight),
+          };
+        },
+      ),
+    );
+    expect(selects.length).toBeGreaterThan(0);
+    for (const s of selects) {
+      expect(s.appearance).toBe("none");
+      expect(s.webkit).toBe("none");
+      // appearance:none drops the native arrow too, so the rule repaints one.
+      expect(s.image).toContain("svg");
+      // ...and the instance has to reserve room for it, or the longest option
+      // label runs under the chevron. `pr-8` is 32px at 100% UI zoom; assert
+      // the property (clears the 14px glyph + its 0.6em inset) not the class.
+      expect(s.padRight).toBeGreaterThanOrEqual(24);
+    }
+    await snap("settings-select-chrome.png");
   });
 });
 
@@ -769,6 +1000,325 @@ describe("agent signal inspector", () => {
     // permanently working. A silently missing suggestion reads as a bug.
     expect(text).toContain("Skipped");
     await snap("signal-inspector.png");
+  });
+});
+
+// P1: default tasks path — Settings → Tasks decides where every project's task
+// worktrees are created, and a project's own "Tasks path" overrides it. One
+// rule at both levels: a FULL path (`/…`, `~/…`) is a fixed root that holds a
+// folder per project, a RELATIVE path resolves inside each project's own
+// directory. Cases assert where a created worktree actually LANDS on disk,
+// plus the placeholder that tells the user before they create anything.
+//
+// Everything runs against a throwaway repo + throwaway roots under $TMPDIR, so
+// the shared fixture-repo and the profile's real tasks tree are never touched.
+describe("default tasks path", () => {
+  let repoDir = "";        // throwaway git repo, added as a project
+  let absRoot = "";        // throwaway absolute tasks root
+  let projectId = "";
+  let projectRoot = "";    // canonical: projectAdd resolves symlinks
+  let projectDirName = "";
+  let seededPath = "";     // whatever the profile carried in, restored in after()
+  const createdTasks: string[] = [];
+
+  /** Write the global default tasks path, preserving the rest of Settings
+   *  (settings_save round-trips the whole object). */
+  const setDefaultPath = (p: string) =>
+    browser.execute(async (v) => {
+      const t = window.__termic!;
+      const s = await t.ipc.settingsLoad();
+      await t.ipc.settingsSave({ ...s, default_tasks_path: v });
+    }, p);
+
+  /** Write the project's own override through the same command the Repository
+   *  page debounces into. */
+  const setProjectTasksPath = (value: string) =>
+    browser.execute(async (id, v) => {
+      const t = window.__termic!;
+      const p = t.useApp.getState().projects.find((x: any) => x.id === id);
+      await t.ipc.projectUpdate({ ...p, tasks_path: v });
+      await t.useApp.getState().loadAll();
+    }, projectId, value);
+
+  /** Create a shell (token-free) worktree task and remember it for teardown. */
+  const createTask = async (name: string) => {
+    const task = await browser.execute(async (pid, n) => {
+      const t = await window.__termic!.ipc.taskCreate({
+        project_id: pid, name: n, cli: "shell", base_branch: "main",
+      });
+      await window.__termic!.useApp.getState().loadAll();
+      return t;
+    }, projectId, name);
+    createdTasks.push((task as any).id);
+    return task as any;
+  };
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+    repoDir = mkdtempSync(path.join(os.tmpdir(), "e2e-wtloc-"));
+    absRoot = mkdtempSync(path.join(os.tmpdir(), "e2e-wtroot-"));
+    // `-b main` explicitly: the create calls below branch from "main", and a
+    // host whose git defaults to `master` would otherwise fail the base ref.
+    execSync(
+      `git -C "${repoDir}" init -q -b main && git -C "${repoDir}" ` +
+      `-c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
+    );
+    const snapshot = await browser.execute(async (d) => {
+      const t = window.__termic!;
+      const s = await t.ipc.settingsLoad();
+      const project = await t.ipc.projectAdd(d);
+      await t.useApp.getState().loadAll();
+      return { project, defaultPath: s.default_tasks_path ?? "" };
+    }, repoDir);
+    projectId = (snapshot as any).project.id;
+    projectRoot = (snapshot as any).project.root_path;
+    projectDirName = path.basename(projectRoot);
+    seededPath = (snapshot as any).defaultPath;
+  });
+
+  after(async () => {
+    for (const id of createdTasks) {
+      await browser.execute(async (i) => {
+        await window.__termic!.ipc.taskArchive(i, true); // deleteBranch
+        await window.__termic!.useApp.getState().loadAll();
+      }, id);
+    }
+    await setDefaultPath(seededPath);
+    if (projectId) {
+      await browser.execute(async (id) => {
+        await window.__termic!.ipc.projectRemove(id);
+        await window.__termic!.useApp.getState().loadAll();
+      }, projectId);
+    }
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(absRoot, { recursive: true, force: true });
+  });
+
+  // The setting is REQUIRED, so a loaded profile always carries a real value
+  // rather than an empty "unset" the UI would have to paper over. Shape, not
+  // an exact string: the app dir differs between the dev and release builds.
+  it("ships a real default tasks path rather than an empty setting", () => {
+    expect(seededPath).toMatch(/^~\/[^/]+\/tasks$/);
+  });
+
+  // Adding a project used to bake the resolved default into `tasks_path`,
+  // which would pin every new project and make the global setting a no-op for
+  // it. The field is an override now, so it starts empty and the project's
+  // effective root is composed from the global value at read time.
+  it("leaves a new project's tasks path empty so the global setting applies", async () => {
+    const stored = await browser.execute(
+      (id) => window.__termic!.useApp.getState().projects.find((p: any) => p.id === id)?.tasks_path,
+      projectId,
+    );
+    expect(stored).toBe("");
+    await setDefaultPath(absRoot);
+    const derived = await browser.execute(
+      (id) => window.__termic!.ipc.projectTasksPathDefault(id), projectId,
+    );
+    expect(derived).toBe(path.join(absRoot, projectDirName));
+  });
+
+  it("puts tasks under a full path, one folder per project", async () => {
+    await setDefaultPath(absRoot);
+    const task = await createTask("wtloc-abs");
+    expect(task.path).toBe(path.join(absRoot, projectDirName, "wtloc-abs"));
+    expect(existsSync(task.path)).toBe(true);
+  });
+
+  // The relative half of the rule: the path hangs off the repo itself and does
+  // NOT get the project name appended (that would nest it twice).
+  it("puts tasks inside the project directory for a relative path", async () => {
+    await setDefaultPath("worktrees");
+    const task = await createTask("wtloc-rel");
+    expect(task.path).toBe(path.join(projectRoot, "worktrees", "wtloc-rel"));
+    expect(existsSync(task.path)).toBe(true);
+  });
+
+  it("lets a project's own tasks path override the default", async () => {
+    await setDefaultPath(absRoot);
+    await setProjectTasksPath("mywt");
+    const task = await createTask("wtloc-override");
+    expect(task.path).toBe(path.join(projectRoot, "mywt", "wtloc-override"));
+    expect(existsSync(task.path)).toBe(true);
+    await setProjectTasksPath("");
+  });
+
+  // The per-project half: the field is EMPTY and shows the global-derived path
+  // greyed out, so "no value here" still tells the user where tasks go.
+  it("shows the default tasks path as the project field's placeholder", async () => {
+    await setDefaultPath(absRoot);
+    await setProjectTasksPath("");
+    await browser.execute(
+      (id) => window.__termic!.useApp.getState().openSettings("repositories", id), projectId,
+    );
+    await waitVisible('[data-repo-tab="advanced"]');
+    await browser.execute(() =>
+      (document.querySelector('[data-repo-tab="advanced"]') as HTMLElement).click(),
+    );
+    await waitVisible('[data-testid="project-tasks-path-input"]');
+    // Poll: the placeholder arrives from an async IPC after the field mounts.
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (want) =>
+            (document.querySelector(
+              '[data-testid="project-tasks-path-input"]',
+            ) as HTMLInputElement).placeholder === want,
+          path.join(absRoot, projectDirName),
+        ),
+      { timeout: 8_000, timeoutMsg: "tasks path placeholder never showed the default" },
+    );
+    const value = await browser.execute(
+      () => (document.querySelector(
+        '[data-testid="project-tasks-path-input"]',
+      ) as HTMLInputElement).value,
+    );
+    expect(value).toBe("");
+    await snap("default-tasks-path-placeholder.png");
+  });
+
+  // The per-project field autosaves (no Save button), so the guard has to be
+  // in the debounced write, not a disabled control: typing a repo-swallowing
+  // override must leave projects.json untouched, and recovering must resume
+  // saving. Drives the real input, since the whole point is the save path.
+  it("does not persist a repo-swallowing project override", async () => {
+    await setProjectTasksPath("");
+    await browser.execute(
+      (id) => window.__termic!.useApp.getState().openSettings("repositories", id), projectId,
+    );
+    await waitVisible('[data-repo-tab="advanced"]');
+    await browser.execute(() =>
+      (document.querySelector('[data-repo-tab="advanced"]') as HTMLElement).click(),
+    );
+    await waitVisible('[data-testid="project-tasks-path-input"]');
+
+    const typeOverride = (value: string) =>
+      browser.execute((v) => {
+        const input = document.querySelector(
+          '[data-testid="project-tasks-path-input"]',
+        ) as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value",
+        )!.set!;
+        setter.call(input, v);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }, value);
+    const stored = () =>
+      browser.execute(
+        (id) => window.__termic!.useApp.getState()
+          .projects.find((p: any) => p.id === id)?.tasks_path ?? null,
+        projectId,
+      );
+
+    await typeOverride(".");
+    await waitVisible('[data-testid="project-tasks-path-conflict"]');
+    // Inverted wait, not a sleep: the save debounce is 500ms, so if the guard
+    // were absent this would resolve well inside the window. Timing out IS the
+    // pass, and it stays bounded.
+    await expect(
+      browser.waitUntil(async () => (await stored()) === ".", { timeout: 2_500 }),
+    ).rejects.toThrow();
+    expect(await stored()).toBe("");
+
+    // Recovering resumes the autosave, so the guard skips writes, not the form.
+    await typeOverride("recovered-wt");
+    await browser.waitUntil(async () => (await stored()) === "recovered-wt", {
+      timeout: 8_000, timeoutMsg: "a valid override never resumed autosaving",
+    });
+    await setProjectTasksPath("");
+  });
+
+  // The global field itself: it carries a REAL value (not a placeholder), and
+  // the preview under it flips between the two halves of the rule as you type.
+  // Emptying it is a validation error, since the setting is required.
+  it("previews where tasks go as the default tasks path is typed", async () => {
+    await setDefaultPath(absRoot);
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("tasks"));
+    await waitVisible('[data-testid="default-tasks-path-input"]');
+
+    const field = () =>
+      browser.execute(() => {
+        const el = document.querySelector(
+          '[data-testid="default-tasks-path-input"]',
+        ) as HTMLInputElement;
+        return { value: el.value, placeholder: el.placeholder };
+      });
+    const type = (value: string) =>
+      browser.execute((v) => {
+        const input = document.querySelector(
+          '[data-testid="default-tasks-path-input"]',
+        ) as HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value",
+        )!.set!;
+        setter.call(input, v);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }, value);
+    const preview = () =>
+      browser.execute(
+        () => (document.querySelector(
+          '[data-testid="default-tasks-path-preview"]',
+        ) as HTMLElement | null)?.textContent ?? "",
+      );
+    const conflict = () =>
+      browser.execute(
+        () => (document.querySelector(
+          '[data-testid="default-tasks-path-conflict"]',
+        ) as HTMLElement | null)?.textContent ?? "",
+      );
+    /** The section's own save button, found by text so it can't collide with
+     *  the other Save buttons on this page (symlink paths). */
+    const saveDisabled = () =>
+      browser.execute(() => {
+        const btn = [...document.querySelectorAll("button")].find(
+          (b) => b.textContent?.trim() === "Save tasks path",
+        ) as HTMLButtonElement | undefined;
+        if (!btn) throw new Error("no 'Save tasks path' button");
+        return btn.disabled;
+      });
+
+    // The saved path is the field's VALUE. Nothing is hidden in a placeholder.
+    const initial = (await field()) as { value: string; placeholder: string };
+    expect(initial.value).toBe(absRoot);
+    expect(initial.placeholder).toBe("");
+
+    await type("/vol/work");
+    await browser.waitUntil(async () => (await preview()) === "/vol/work/<project>/<task>", {
+      timeout: 5_000, timeoutMsg: "absolute path preview never updated",
+    });
+
+    await type("worktrees");
+    await browser.waitUntil(async () => (await preview()) === "<project>/worktrees/<task>", {
+      timeout: 5_000, timeoutMsg: "relative path preview never updated",
+    });
+
+    // A path that would land on the repo itself is refused HERE, not deferred
+    // to the next task create: the error names the projects and the save is
+    // blocked. `.` resolves to every project's own root.
+    await type(".");
+    await browser.waitUntil(
+      async () =>
+        (await conflict()).includes("inside the repo itself") && (await saveDisabled()),
+      { timeout: 8_000, timeoutMsg: "a repo-swallowing tasks path was not rejected on save" },
+    );
+    // ...and a good value clears it again. Deliberately NOT `absRoot`: that is
+    // already the saved value, so the button would stay disabled for "nothing
+    // to save" and the assertion could not tell that apart from "still blocked".
+    await type(`${absRoot}/nested`);
+    await browser.waitUntil(async () => (await conflict()) === "" && !(await saveDisabled()), {
+      timeout: 8_000, timeoutMsg: "a valid tasks path stayed blocked",
+    });
+
+    // Required: emptying it drops the preview and blocks the save.
+    await type("");
+    await browser.waitUntil(
+      async () => (await preview()) === "" && (await saveDisabled()),
+      { timeout: 5_000, timeoutMsg: "an empty required path was still saveable" },
+    );
+    await snap("default-tasks-path-settings.png");
   });
 });
 

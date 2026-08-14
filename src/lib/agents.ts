@@ -94,6 +94,16 @@ export function cliSupportsCaptureResume(cli: string): boolean {
       && (caps.resume_id_args?.length ?? 0) > 0;
 }
 
+/** The agent can resume a SPECIFIC session by id (`resume_id_args`
+ *  non-empty, regardless of whether it can also mint one): the gate for
+ *  attaching an externally-started session to a task or tab (GH #169,
+ *  `--resume <SESSION_ID>`). Mirrors AgentMeta.id_resume on the Rust
+ *  side; keep the two predicates in step. */
+export function cliSupportsResumeById(cli: string): boolean {
+  const { caps } = findAgent(cli);
+  return (caps.resume_id_args?.length ?? 0) > 0;
+}
+
 /** Post-launch capture config for a CLI, or undefined if not configured. */
 export function postLaunchCaptureForCli(cli: string): Agent["post_launch_capture"] {
   const registry = useApp.getState().agents;
@@ -409,13 +419,31 @@ export function classifyAgentTitle(
   const t = title.trim();
   if (!t) return null;
   const user = agents.find(a => a.id === cli)?.capabilities?.signals;
-  const sig = user && (user.busy?.length || user.idle?.length || user.attention?.length)
-    ? user
-    : BUILTIN_TITLE_SIGNALS[cli];
-  if (!sig) return null;
-  if (compileSignals(sig.attention).some(re => re.test(t))) return "attention";
-  if (compileSignals(sig.busy).some(re => re.test(t))) return "busy";
-  if (compileSignals(sig.idle).some(re => re.test(t))) return "idle";
+  const builtin = BUILTIN_TITLE_SIGNALS[cli];
+  if (!user && !builtin) return null;
+
+  // PER-FIELD fallback, matching what hasPendingWork already does for
+  // `pending`. Setting one field used to swap out the whole built-in set, so
+  // an agent whose busy pattern you narrowed silently lost its idle pattern
+  // too — and since `goIdle` only fires on a busy→idle title transition, the
+  // fast done signal just stopped, quietly, with nothing in the UI saying so.
+  //
+  // Deliberately REPLACE per field rather than UNION the two. Union would make
+  // it impossible to narrow a built-in: claude's busy pattern is a catch-all
+  // ("any leading glyph that is not ✳"), so a user swapping it for a strict
+  // spinner whitelist needs their pattern to WIN, not to be or-ed with the
+  // catch-all it was written to escape. Narrowing is the main reason to touch
+  // these fields at all.
+  //
+  // Cost of the choice: "no patterns at all for this field" is no longer
+  // expressible by emptying it, because empty now means "inherit". A field
+  // that must match nothing needs an unmatchable pattern such as `(?!)`.
+  const pick = (k: keyof Required<SignalPatterns>): string[] =>
+    (user?.[k]?.length ? user[k] : builtin?.[k]) ?? [];
+
+  if (compileSignals(pick("attention")).some(re => re.test(t))) return "attention";
+  if (compileSignals(pick("busy")).some(re => re.test(t))) return "busy";
+  if (compileSignals(pick("idle")).some(re => re.test(t))) return "idle";
   return null;
 }
 
@@ -582,8 +610,10 @@ export function decideResume(opts: {
  *    C. name_args (claude `--name`):
  *       - Appended on every primary-tab spawn (worktree or repo-root,
  *         mint or resume) so the task name is always visible.
- *       - Skipped for secondary "+" tabs (`isPrimary=false`) and
- *         no-task spawns (`task` absent).
+ *       - Skipped for secondary "+" tabs (`isPrimary=false`), no-task
+ *         spawns (`task` absent), and whenever `resumeOverride` is set
+ *         (renaming on every relaunch would reassign the session's
+ *         display name out from under the override's `--resume` target).
  *
  *    D. always-applied:
  *       - `yolo_args` appended LAST so a subcommand-style resume
@@ -666,8 +696,11 @@ export function spawnArgsForCli(
     ...resumeBlock,
     // name_args on every primary-tab spawn (worktree or repo-root, mint or
     // resume) so claude always shows the task name. Skipped for
-    // secondary "+" tabs (isPrimary=false) and no-task spawns.
-    ...(opts.isPrimary && opts.task ? (caps.name_args ?? []) : []),
+    // secondary "+" tabs (isPrimary=false), no-task spawns, and whenever a
+    // resumeOverride is active: renaming the session on every relaunch
+    // reassigns its display name out from under the override's target, so
+    // the next `--resume <name>` no longer matches (breaks after 1 relaunch).
+    ...(opts.isPrimary && opts.task && !override ? (caps.name_args ?? []) : []),
     ...(opts.yolo ? (caps.yolo_args ?? []) : []),
   ];
   return composed.map(a => expandArg(a, vars));
@@ -693,6 +726,12 @@ export async function tryToggleYoloLive(cli: string, ptyId: string, yolo: boolea
 // Old single-CLI accessors kept around so older call sites don't break.
 export const yoloArgsForCli   = (cli: string) => findAgent(cli).caps.yolo_args   ?? [];
 export const resumeArgsForCli = (cli: string) => findAgent(cli).caps.resume_args ?? [];
+/** The registry's resume-by-id args with `{UUID}` already expanded to the
+ *  given session id. The capture-resume spawn path composes these instead
+ *  of hardcoding one agent's flag, so any agent declaring `resume_id_args`
+ *  resumes with ITS OWN spelling (GH #169 review). */
+export const resumeIdArgsForCli = (cli: string, sessionId: string) =>
+  (findAgent(cli).caps.resume_id_args ?? []).map(a => a.replaceAll("{UUID}", sessionId));
 
 /** Per-agent env block (from Settings → Agents). Merged into the spawn
  *  env in TerminalPane; agent-side values take precedence over the

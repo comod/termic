@@ -103,6 +103,10 @@ doctor: ## Verify the dev env without installing anything (CI-friendly, exits no
 # ─── dev ──────────────────────────────────────────────────────────────
 
 dev: ## Run termic in dev mode (Vite HMR + Rust auto-rebuild).
+	@# A freshly pulled commit can add npm deps (tsc then fails with
+	@# TS2307 "Cannot find module"). npm install is a ~1s no-op when
+	@# node_modules is already in sync, so always run it first.
+	@npm install --no-fund --no-audit
 	@# Run dev.mjs directly (not via `npm run`): npm 11 swallows Ctrl+C and
 	@# orphans the tauri/cargo/app subtree. Direct exec makes node the
 	@# process-group leader so dev.mjs's signal handler can tear the group down.
@@ -151,6 +155,44 @@ e2e: ## Build the e2e binary (--features e2e) and run the WebdriverIO suite. Rea
 	@npm run e2e:build
 	@npm run test:e2e
 .PHONY: e2e
+
+perf: ## Run both performance suites locally and report each separately.
+	@# Section 1 is the same suite the nightly workflow runs (startup marks +
+	@# RSS growth) — durations and memory, measurable anywhere, reported not
+	@# gated. Section 2 is the local-only half (idle CPU / GPU / compositor)
+	@# that a CI runner cannot measure honestly. They print separately because
+	@# they carry different amounts of trust: section 1 is reproducible,
+	@# section 2 is only as good as the desktop it ran on.
+	@# Why not gated: docs/research/perf-ci.md.
+	@[ -x node_modules/.bin/wdio ] || npm install
+	@node scripts/e2e-seed.mjs
+	@npm run perf:build
+	@mkdir -p .perf
+	@echo ""
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo "  Section 1 — CI SUITE (startup, memory) — same as the nightly"
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo ""
+	@# Section 1 must NOT abort the run. A spec that fails still emits the rows
+	@# it got to, and section 2 measures something else entirely, so swallowing
+	@# it here would hide half the report over an unrelated failure. The status
+	@# is kept and re-raised at the end so `make perf` still fails honestly.
+	@npm run test:perf; echo $$? > .perf/.section1-status
+	@./bench/local-report.sh
+	@s=$$(cat .perf/.section1-status 2>/dev/null || echo 0); \
+	  if [ "$$s" != "0" ]; then \
+	    echo ""; \
+	    echo "  NOTE: section 1 exited $$s (a spec failed). Section 2 above still ran."; \
+	    exit "$$s"; \
+	  fi
+.PHONY: perf
+
+perf-ci: ## Section 1 only: the nightly suite (startup + memory), no local bench.
+	@[ -x node_modules/.bin/wdio ] || npm install
+	@node scripts/e2e-seed.mjs
+	@npm run perf:build
+	@npm run test:perf
+.PHONY: perf-ci
 
 # ─── release ──────────────────────────────────────────────────────────
 

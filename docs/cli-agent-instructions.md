@@ -67,6 +67,18 @@ Rules that matter:
   agent (queues if it is mid-turn). With no agent running, add
   `--resume` (restore the last session) or `--fresh` (new agent, no
   context). `-p -` reads stdin. Same exit-code contract as `new --wait`.
+- A task can hold SEVERAL agent tabs. `"$TERMIC_CLI" tab <task>
+  --agent <id> -p "<text>"` opens one and prompts it; record the
+  printed tab id and pass `--tab <id>` to `send`/`wait`/`logs` to keep
+  addressing that tab (ids are stable; indexes and titles shift).
+  `status --json` lists every tab with its id, state and queue.
+- `"$TERMIC_CLI" tab close <task> --tab <id>` - close a tab you opened,
+  so the strip does not fill up with finished ones. Kills that tab's
+  agent (no `/exit` negotiation needed) and leaves the task and its
+  other tabs running. This is the one tab verb that also reaches shell
+  and custom-terminal tabs, so anything `tab` opens, it can close.
+  Closing the task's DEFAULT tab needs `--yes`, because it is what an
+  unqualified `send`/`wait`/`attach` resolves to.
 - `"$TERMIC_CLI" result <task>` - the agent's last message from its
   session transcript (claude only; other agents error and you fall back
   to the file convention).
@@ -87,10 +99,24 @@ Rules that matter:
 - `"$TERMIC_CLI" wait <task> --timeout 10m` - block until an existing
   task's agent is quiescent (settled AND empty message queue).
 - `"$TERMIC_CLI" status <task> --json` - one task in depth.
+- `"$TERMIC_CLI" prompts --json` - the user's prompt library. Pass a
+  prompt to `new`/`send`/`tab` with `-P <id>` (e.g. `-P builtin:review`);
+  it delivers that prompt's body, and with `-p` too the body arrives
+  first, then a blank line, then your text - so
+  `... result plan | ... new review -P builtin:review -p -` hands one
+  agent's output to another under a curated prompt. Pin ids in scripts
+  (titles are user-editable); `prompts show <id>` prints a body.
 - `"$TERMIC_CLI" archive <task> --yes` - kill the task's agents and
   remove its worktree. Destructive; only when asked to clean up.
 - `"$TERMIC_CLI" project add <path>` - register a repo (needed once
   before creating tasks in it).
+
+DO NOT run `"$TERMIC_CLI" quit`. Its `about` in `help --json` says the
+same, so this block and the machine surface agree. It exists for the
+human at the keyboard, not for you. It kills EVERY agent in EVERY task, including the sibling
+agents you may be coordinating with and the session you are running in,
+and it reverts any active spotlight session, which force-checks-out the
+project's main checkout. `archive` is scoped to one task; this is not.
 
 (`attach` exists too, but it is interactive and needs a real TTY; as an
 agent you want `send`/`logs`/`result` instead.)

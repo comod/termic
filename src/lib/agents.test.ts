@@ -21,7 +21,7 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { spawnArgsForCli, visibleCliIds, cliSupportsIdSession, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { spawnArgsForCli, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
 
 // ── spawnArgsForCli ───────────────────────────────────────────────────
@@ -86,6 +86,18 @@ describe("spawnArgsForCli", () => {
     });
     expect(second).toContain("--name");
     expect(second).toContain("improve-tests");
+  });
+
+  it("omits name_args when a resumeOverride is active", () => {
+    const fakeTask = { id: "ws1", name: "Improve Tests", branch: "main", port: 1420 } as any;
+    // A verbatim --resume override targets the session by name; renaming it
+    // via --name on every relaunch would break the next override's lookup.
+    const args = spawnArgsForCli("claude", {
+      yolo: false, resume: false, isPrimary: true,
+      task: fakeTask, resumeOverride: "--resume {WORKSPACE_NAME}",
+    });
+    expect(args).not.toContain("--name");
+    expect(args).toContain("--resume");
   });
 
   it("omits name_args for secondary (+) tabs", () => {
@@ -393,6 +405,64 @@ describe("cliSupportsIdSession", () => {
   });
 });
 
+// ── cliSupportsResumeById (GH #169 `--resume <SESSION_ID>` gate) ──────
+
+describe("cliSupportsResumeById", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+
+  it("claude can resume by id (resume_id_args in the fallback)", () => {
+    expect(cliSupportsResumeById("claude")).toBe(true);
+  });
+
+  it("opencode can resume by id WITHOUT being id-session capable", () => {
+    // The capture-resume class: resume_id_args but no session_id_args.
+    // The by-id gate must be wider than cliSupportsIdSession or attaching
+    // an external opencode session would be refused despite working.
+    expect(cliSupportsResumeById("opencode")).toBe(true);
+    expect(cliSupportsIdSession("opencode")).toBe(false);
+  });
+
+  it("codex is cwd-resume only", () => {
+    expect(cliSupportsResumeById("codex")).toBe(false);
+  });
+
+  it("a registry entry gains the capability by declaring resume_id_args", () => {
+    // Platform-agnostic by design: no agent names anywhere in the gate.
+    mockAgents.push({
+      id: "future", display_name: "Future", command: "future", args: [],
+      icon_id: "lucide:star", color: "#000", builtin: false,
+      capabilities: { resume_id_args: ["--attach", "{UUID}"] },
+    } as unknown as import("@/lib/types").Agent);
+    expect(cliSupportsResumeById("future")).toBe(true);
+  });
+});
+
+// ── external session attach (GH #169): seeded uuid composes a resume ──
+
+describe("attaching an externally-started session", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+
+  it("a seeded tab sessionId resolves to resume-id, not mint", () => {
+    const d = decideResume({
+      isAgent: true, idCapable: true, isPrimary: true, isRepoRoot: false,
+      // Import seeds has_resumable_history=true alongside the id; the
+      // stored uuid must win over the legacy cwd-continue path.
+      hasResumableHistory: true,
+      storedUuid: "ext-session-uuid", failedResume: false,
+    });
+    expect(d).toEqual({ kind: "resume-id" });
+  });
+
+  it("composes --resume <id> and KEEPS --name (unlike resume_override)", () => {
+    const task = { id: "w1", name: "poll linear", branch: "b", port: 1 } as never;
+    const args = spawnArgsForCli("claude", {
+      yolo: false, resume: false, task, isPrimary: true,
+      sessionUuid: "ext-session-uuid", resumeKnown: true,
+    });
+    expect(args).toEqual(["--resume", "ext-session-uuid", "--name", "poll-linear"]);
+  });
+});
+
 // ── agentDisplayName ──────────────────────────────────────────────────
 
 describe("agentDisplayName", () => {
@@ -434,6 +504,81 @@ describe("classifyAgentTitle", () => {
     expect(classifyAgentTitle("claude", "✳ Ready", [])).toBe("idle");
     expect(classifyAgentTitle("claude", "⠋ thinking", [])).toBe("busy");
     expect(classifyAgentTitle("claude", "   ", [])).toBe(null);
+  });
+
+  // Claude's spinner alphabet is not fixed: Braille frames, "⠐ ⠂" pairs and the
+  // circle family (◐◑◒◓) have all been seen in the wild. The busy pattern is a
+  // catch-all ("any leading glyph that is not the ✳ brand mark") precisely so a
+  // new frame does not need a code change. These cases pin that promise for the
+  // circle frames specifically, so a future tightening of the pattern to an
+  // explicit glyph list cannot silently drop them and make a working agent read
+  // as idle.
+  it("treats circle spinner frames as busy for claude", () => {
+    for (const t of ["◐", "◑", "◒", "◓"]) {
+      expect(classifyAgentTitle("claude", t, [])).toBe("busy");
+      expect(classifyAgentTitle("claude", `${t} Working`, [])).toBe("busy");
+      expect(classifyAgentTitle("claude", `${t} Thinking… (5s · esc to interrupt)`, [])).toBe("busy");
+      expect(classifyAgentTitle("claude", `  ${t} indented`, [])).toBe("busy");
+    }
+    // Still idle when claude's own done glyph leads, even though ✳ is also
+    // non-alphanumeric. This is the precedence the busy pattern's ✳ exclusion
+    // exists to protect.
+    expect(classifyAgentTitle("claude", "✳ Ready", [])).toBe("idle");
+  });
+
+  // Per-field fallback. Setting one field used to replace the WHOLE built-in
+  // set, which is a quiet footgun: narrowing claude's busy pattern also deleted
+  // its `^\s*✳` idle pattern, and because goIdle only fires on a busy→idle
+  // title transition, the fast done signal stopped with nothing saying so.
+  // `hasPendingWork` already resolved `pending` per field; these lock the other
+  // three to the same rule.
+  describe("per-field fallback to the built-ins", () => {
+    const withSignals = (signals: NonNullable<Agent["capabilities"]>["signals"]) =>
+      [sigAgent("claude", signals)];
+
+    it("a custom busy pattern keeps the built-in idle pattern", () => {
+      const a = withSignals({ busy: ["^\\s*[\\u2800-\\u28FF◐◑◒◓]"] });
+      expect(classifyAgentTitle("claude", "⠋ thinking", a)).toBe("busy");
+      expect(classifyAgentTitle("claude", "◐ Working", a)).toBe("busy");
+      // The regression: this used to fall through to null.
+      expect(classifyAgentTitle("claude", "✳ Ready", a)).toBe("idle");
+    });
+
+    it("a custom idle pattern keeps the built-in busy pattern", () => {
+      const a = withSignals({ idle: ["^DONE$"] });
+      expect(classifyAgentTitle("claude", "DONE", a)).toBe("idle");
+      expect(classifyAgentTitle("claude", "⠋ thinking", a)).toBe("busy");
+    });
+
+    it("a custom field REPLACES rather than unions the built-in", () => {
+      // The whole point of narrowing: claude's built-in busy is a catch-all, so
+      // a strict whitelist must WIN over it or narrowing is impossible.
+      const a = withSignals({ busy: ["^\\s*[◐◑]"] });
+      expect(classifyAgentTitle("claude", "◐ Working", a)).toBe("busy");
+      // Would be "busy" under the built-in catch-all; the whitelist excludes it.
+      expect(classifyAgentTitle("claude", "~/repo", a)).toBe(null);
+      expect(classifyAgentTitle("claude", "[main] build", a)).toBe(null);
+    });
+
+    it("an unmatchable pattern is how you opt a field out entirely", () => {
+      // Empty now means "inherit", so opting out needs an explicit never-match.
+      const a = withSignals({ busy: ["(?!)"] });
+      expect(classifyAgentTitle("claude", "⠋ thinking", a)).toBe(null);
+      expect(classifyAgentTitle("claude", "✳ Ready", a)).toBe("idle");
+    });
+
+    it("attention still outranks busy when only attention is customised", () => {
+      const a = withSignals({ attention: ["NEEDS YOU"] });
+      expect(classifyAgentTitle("claude", "NEEDS YOU", a)).toBe("attention");
+      expect(classifyAgentTitle("claude", "⠋ thinking", a)).toBe("busy");
+      expect(classifyAgentTitle("claude", "✳ Ready", a)).toBe("idle");
+    });
+
+    it("an agent with no built-ins and one custom field still works", () => {
+      const a = [sigAgent("mycli", { busy: ["WORKING"] })];
+      expect(classifyAgentTitle("mycli", "WORKING", a)).toBe("busy");
+      expect(classifyAgentTitle("mycli", "anything else", a)).toBe(null);
+    });
   });
 
   it("keeps the built-in codex classifier when no signals are set", () => {

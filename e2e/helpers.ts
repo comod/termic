@@ -2,8 +2,15 @@
 // declarative by using these; when the UI changes, fix the flow in ONE place.
 // See the `e2e` skill for the full authoring guide.
 
+import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { dataDir } from "../wdio.conf.js";
+
+const socketPath = path.join(dataDir, "termic.sock");
+/** Per-boot CLI token, read fresh: the app rewrites it on every launch. */
+const cliToken = () => fs.readFileSync(path.join(dataDir, "cli-token"), "utf8").trim();
 
 const artifactsDir = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -39,7 +46,7 @@ export async function snap(name: string): Promise<void> {
  */
 export interface TermicApi {
   useApp: { getState: () => any; setState: (p: any) => void };
-  useUI: { getState: () => any };
+  useUI: { getState: () => any; setState: (p: any) => void };
   usePrefs: { getState: () => any };
   useRace: { getState: () => any };
   ipc: any;
@@ -443,6 +450,328 @@ export async function mouseDrag(handle: string, dx: number, dy = 0): Promise<voi
     dx,
     dy,
   );
+}
+
+// ── agent input + work-state badges ───────────────────────────────────────
+//
+// Specs used to drive agents by hand: reach into the store, stamp
+// `lastInputAt` (the private flag TerminalPane's work detector arms on),
+// `ipc.ptyWrite` the line, then assert `tab.workState === "working"` back out
+// of the store. That is three implementation details per case, and every one
+// of them would keep passing if the UI stopped showing anything at all.
+//
+// The helpers below close both ends: `submitToAgent` goes in through the
+// terminal's own input path (xterm → TerminalPane → PTY), and the badge
+// helpers assert on what the user actually sees.
+
+/** What a tab's status badge can be showing. Mirrors `data-work-state`. */
+export type WorkBadge = "working" | "done" | "attention" | "failed";
+
+/**
+ * Make sure the two prefs that gate work-state badges are on, so a spec can
+ * assert on the DOM. Both default to on, but they are user-toggleable and
+ * localStorage-backed — the profile is reused across spec files, so an earlier
+ * settings spec could have left either one off.
+ */
+export async function requireWorkBadges(): Promise<void> {
+  await browser.execute(() => {
+    const p = window.__termic!.usePrefs.getState();
+    p.setWorkingIndicator(true);
+    p.setSettledHighlight(true);
+  });
+}
+
+/** Wait until the task's agent tab has spawned its PTY. */
+export async function waitForAgentPty(taskId: string, timeout = 20_000): Promise<void> {
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        (id) => !!(window.__termic!.useApp.getState().tabs[id] ?? [])[0]?.ptyId,
+        taskId,
+      ),
+    { timeout, interval: 250, timeoutMsg: `agent PTY never spawned for ${taskId}` },
+  );
+}
+
+/**
+ * Wait until the agent is actually able to RECEIVE a prompt.
+ *
+ * {@link waitForAgentPty} is not enough and was the cause of a long-running CI
+ * flake: it resolves as soon as Rust reports a `ptyId`, which says the process
+ * was spawned and nothing else. Submitting then dispatches input events at an
+ * xterm that may not have wired its `_inputEvent` handler yet, so the
+ * keystrokes are dropped silently, `submitToAgent` still returns "ok", the
+ * agent never emits its OSC, and the spec fails 15s later with
+ * `[null, null]` badges. On a laptop the gap is invisible; on a loaded 3-core
+ * CI runner it is wide enough to lose the race regularly. It failed a
+ * different badge spec on nearly every run, which is exactly why it read as
+ * random rather than as one bug.
+ *
+ * The condition is `lastOutputAt`: the fixture prints its banner before the
+ * read loop, and that field is only stamped by TerminalPane's PTY data
+ * handler, which is wired in the same effect that calls `term.open()`. So
+ * output having reached the store proves the whole chain is live: process
+ * spawned, script running, xterm attached, store wired. A terminal that is
+ * delivering output is a terminal that will deliver input.
+ *
+ * Deliberately NOT `liveTitle`, which was the first attempt and is wrong:
+ * `setTabLiveTitle` drops the agent's title outright when a tab has
+ * `customTitle` set, so a legitimately-ready agent can sit at `liveTitle:
+ * null` forever. It is still accepted as an alternative signal for the case
+ * where a title arrives before the first output patch (the store coalesces
+ * `lastOutputAt` to one write per 500ms, so a fast title can win the race).
+ */
+export async function waitForAgentReady(taskId: string, timeout = 30_000): Promise<void> {
+  await waitForAgentPty(taskId, timeout);
+  let last: { out: number | null; title: string | null } = { out: null, title: null };
+  await browser
+    .waitUntil(
+      async () => {
+        last = await browser.execute((id) => {
+          const t = (window.__termic!.useApp.getState().tabs[id] ?? [])[0];
+          return { out: t?.lastOutputAt ?? null, title: t?.liveTitle ?? null };
+        }, taskId);
+        return (last.out ?? 0) > 0 || !!last.title?.trim();
+      },
+      { timeout, interval: 100 },
+    )
+    .catch(() => {
+      throw new Error(
+        `agent in ${taskId} never produced output, so it was never ready for input ` +
+          `— last {lastOutputAt, liveTitle} = ${JSON.stringify(last)}`,
+      );
+    });
+}
+
+/**
+ * Send a prompt to a task's on-screen agent terminal the way a user does:
+ * through xterm's own input path, not by writing to the PTY behind its back.
+ *
+ * Both steps are the events WKWebView itself produces for a keystroke burst:
+ *   • an `insertText` input event on the helper textarea — xterm's `_inputEvent`
+ *     forwards it to the PTY (this is the path `lib/ime.ts` documents);
+ *   • an Enter keydown — xterm turns it into a CR on `onData`, which is what
+ *     TerminalPane treats as a real submit: it stamps `lastInputAt`, arms the
+ *     work detector and re-arms done for the new turn.
+ *
+ * That last part is the point. Specs no longer patch `lastInputAt` themselves,
+ * so they stop encoding how work detection is armed — if the submit path
+ * breaks, these tests fail instead of quietly compensating for it.
+ */
+export async function submitToAgent(taskId: string, text: string): Promise<void> {
+  // What `lastInputAt` was before this submit. TerminalPane stamps it from
+  // xterm's `onData` for a CR, so it advancing is PROOF the keystrokes went
+  // through xterm and reached the PTY. Without this check a dropped submit is
+  // indistinguishable from a working one until some unrelated assertion times
+  // out much later with a useless message.
+  const before = await browser.execute(
+    (id) => (window.__termic!.useApp.getState().tabs[id] ?? [])[0]?.lastInputAt ?? 0,
+    taskId,
+  );
+
+  const result = await browser.execute(
+    (id, line) => {
+      const host = document.querySelector(`[data-task-id="${id}"]`);
+      if (!host) return "task view is not mounted";
+      // Every visited task stays mounted and inactive tabs are display:none,
+      // so take the first terminal that actually has geometry.
+      const ta = [...host.querySelectorAll<HTMLTextAreaElement>(".xterm-helper-textarea")].find(
+        (el) => {
+          const r = (el.closest(".xterm") ?? el).getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        },
+      );
+      if (!ta) return "no visible terminal in the task view";
+      ta.focus();
+      ta.dispatchEvent(
+        new InputEvent("input", { inputType: "insertText", data: line, bubbles: true }),
+      );
+      const enter = (type: string) =>
+        ta.dispatchEvent(
+          new KeyboardEvent(type, {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+          } as KeyboardEventInit),
+        );
+      enter("keydown");
+      // The keyup is NOT decoration: xterm latches `_keyDownSeen` on keydown
+      // and only clears it on keyup, and while it is latched the NEXT
+      // insertText input event is dropped as "already handled by a keydown".
+      // Skipping it makes the first submit work and every later one vanish.
+      enter("keyup");
+      return "ok";
+    },
+    taskId,
+    text,
+  );
+  if (result !== "ok") throw new Error(`could not submit to agent in ${taskId}: ${result}`);
+
+  // "ok" only means the events were dispatched, not that xterm forwarded them.
+  // Fail HERE, naming the real cause, instead of letting a badge assertion
+  // time out 15s later reporting [null, null] as though the app misbehaved.
+  await browser
+    .waitUntil(
+      async () =>
+        (await browser.execute(
+          (id) => (window.__termic!.useApp.getState().tabs[id] ?? [])[0]?.lastInputAt ?? 0,
+          taskId,
+        )) > before,
+      { timeout: 10_000, interval: 100 },
+    )
+    .catch(() => {
+      throw new Error(
+        `submit to ${taskId} was dispatched but xterm never forwarded it ` +
+          `(lastInputAt did not advance past ${before}). The terminal was not ` +
+          `ready for input — call waitForAgentReady() before submitting.`,
+      );
+    });
+}
+
+/**
+ * The work state the task's OWN tab strip is showing, or null when the tab
+ * carries no badge. Only meaningful while the task is the active one — a
+ * backgrounded task stays mounted but hidden, so read {@link sidebarBadge}
+ * for those.
+ */
+export async function taskViewBadge(taskId: string): Promise<WorkBadge | null> {
+  return browser.execute((id) => {
+    const el = document.querySelector(
+      `[data-task-id="${id}"] [data-testid="work-badge"]`,
+    ) as HTMLElement | null;
+    return (el?.dataset.workState as string | undefined) ?? null;
+  }, taskId) as Promise<WorkBadge | null>;
+}
+
+/**
+ * The work state the SIDEBAR row for a task is showing, or null when it has
+ * no badge. This is the surface that matters for a backgrounded agent: the
+ * user is looking at another task, and the sidebar row is the only place its
+ * bell / done bullet / spinner can appear. Covers both shapes of the row (the
+ * aggregate badge while collapsed, the per-tab badge while expanded).
+ */
+export async function sidebarBadge(taskId: string): Promise<WorkBadge | null> {
+  return browser.execute((id) => {
+    const el = document.querySelector(
+      `[data-sidebar-task-row="${id}"] [data-testid="work-badge"]`,
+    ) as HTMLElement | null;
+    return (el?.dataset.workState as string | undefined) ?? null;
+  }, taskId) as Promise<WorkBadge | null>;
+}
+
+/**
+ * Wait until the badge for `taskId` reads one of `want`. Looks at the task's
+ * own tab strip AND its sidebar row, so the same call works whether the task
+ * is in front or backgrounded.
+ */
+export async function waitForWorkBadge(
+  taskId: string,
+  want: WorkBadge | WorkBadge[],
+  opts: { timeout?: number; interval?: number; message?: string } = {},
+): Promise<void> {
+  const wanted = Array.isArray(want) ? want : [want];
+  // Remember what we last saw so the failure message names it — "never showed
+  // working" is a lot less useful than "showed attention instead".
+  let last: Array<WorkBadge | null> = [];
+  await browser
+    .waitUntil(
+      async () => {
+        last = await workBadges(taskId);
+        return last.some((s) => s !== null && wanted.includes(s));
+      },
+      { timeout: opts.timeout ?? 10_000, interval: opts.interval ?? 250 },
+    )
+    .catch(() => {
+      const base = opts.message ?? `${taskId} never showed a ${wanted.join("/")} badge`;
+      throw new Error(`${base} — last saw [tab strip, sidebar] = ${JSON.stringify(last)}`);
+    });
+}
+
+/** Wait until NEITHER surface shows any of `unwanted` any more. */
+export async function waitForWorkBadgeGone(
+  taskId: string,
+  unwanted: WorkBadge | WorkBadge[],
+  opts: { timeout?: number; interval?: number; message?: string } = {},
+): Promise<void> {
+  const gone = Array.isArray(unwanted) ? unwanted : [unwanted];
+  let last: Array<WorkBadge | null> = [];
+  await browser
+    .waitUntil(
+      async () => {
+        last = await workBadges(taskId);
+        return last.every((s) => s === null || !gone.includes(s));
+      },
+      { timeout: opts.timeout ?? 10_000, interval: opts.interval ?? 250 },
+    )
+    .catch(() => {
+      const base = opts.message ?? `${taskId} still shows a ${gone.join("/")} badge`;
+      throw new Error(`${base} — last saw [tab strip, sidebar] = ${JSON.stringify(last)}`);
+    });
+}
+
+/**
+ * How many messages the task's queue control says are waiting for the active
+ * agent (the "N queued" chip in the footer), or null when the control is not
+ * on screen.
+ */
+export async function queuedCount(taskId: string): Promise<number | null> {
+  return browser.execute((id) => {
+    const el = document.querySelector(
+      `[data-task-id="${id}"] [data-testid="queue-button"]`,
+    ) as HTMLElement | null;
+    if (!el) return null;
+    return Number(el.dataset.queued ?? "0");
+  }, taskId) as Promise<number | null>;
+}
+
+/** Both badge surfaces for a task: `[tab strip, sidebar row]`. */
+export async function workBadges(taskId: string): Promise<Array<WorkBadge | null>> {
+  return Promise.all([taskViewBadge(taskId), sidebarBadge(taskId)]);
+}
+
+/**
+ * One request over the REAL control socket, on a fresh connection; stream
+ * lines (heartbeats, state events) are skipped and the final Reply resolves.
+ *
+ * This is the only way a spec can read what actually landed in a PTY:
+ * `pty_logs_tail` is not a Tauri command, so `{cmd:"logs"}` here is the sole
+ * route to the agent's output ring. Terminal content is NOT in the DOM (xterm
+ * renders to a canvas), and store state only carries timestamps.
+ */
+export function cliRpc(cmd: Record<string, unknown>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const c = net.createConnection(socketPath);
+    let buf = "";
+    const to = setTimeout(() => {
+      c.destroy();
+      reject(new Error("no reply from the control socket within 30s"));
+    }, 30_000);
+    c.on("connect", () =>
+      c.write(JSON.stringify({ id: "e2e", token: cliToken(), ...cmd }) + "\n"),
+    );
+    c.on("data", d => {
+      buf += d.toString();
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line);
+        if (msg.stream) continue; // heartbeat / state / queued events
+        clearTimeout(to);
+        c.end();
+        resolve(msg);
+        return;
+      }
+    });
+    c.on("error", e => {
+      clearTimeout(to);
+      reject(e);
+    });
+  });
 }
 
 /** Assert `window.__termic` is present (i.e. the e2e build exposed state). */

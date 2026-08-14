@@ -4,7 +4,41 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [0.25.2] - 2026-07-31
+## [0.26.0] - 2026-08-11
+
+CLI tab targeting and worktree adoption, folder browsing in the editor, and image diffs.
+
+### Features
+- The Termic CLI is now stable and ON by default, so the `termic` command drives the app from any shell with no setup step: create a task, prompt an agent, wait for one to go quiet, read its result, list and archive. Every task's terminal is also handed the command in its environment, so an agent can instruct other tasks: fan a job out to several agents, wait on them, and read back what they produced, without you brokering it. Access still needs a token only your own user account can read, and agents in an enforced sandbox still never get it. Upgrading turns the CLI on once, including on profiles where it was off because that used to be the default. Switch it off after that and it stays off.
+- `termic tab` opens another tab in a task and prints its id, and every verb that talks to a task takes `--tab` to aim at one: `send --tab`, `logs --tab`, `tab -p` to open and prompt in a single call. `status` lists the strip with the same ids and 1-based indices, and a selector that misses is a typed error naming the candidates rather than a silent default. `termic agents` prints the configured agent registry. (#138, #154, #156)
+- `termic new --from <path>` adopts a worktree you created outside Termic: the project is resolved from its repo and the task name derived from its branch. `--resume <id>` on `new` and `tab` seeds an existing agent session instead of starting a fresh one, so a session you began in a terminal continues inside Termic. (#169, #171)
+- `termic rename` retitles a task from the shell. A same-project duplicate refuses with a typed conflict instead of creating a second task with the same name. (#153, #162)
+- A folder link in the markdown preview opens a GitHub-style listing in the same tab, not a dead link: rows navigate in place, `..` climbs back out, the folder's README renders underneath, and Cmd+[ / Cmd+] walk the trail you browsed. Clicking a file row keeps the listing and opens the file beside it. (#160)
+- Editor syntax theme is configured per app mode. A dark-optimized scheme no longer gets forced onto a light surface: Appearance, Editor now has an "Editor theme (dark)" and an "Editor theme (light)". Existing settings carry over as the dark theme, and light starts from the same value until you change it.
+- The terminal renderer is a three-way choice in Appearance, Terminal, on every platform: GPU (WebGL), Canvas, or DOM. It used to be a WebGL on/off toggle that macOS hid entirely, so a Mac user had no way to change renderer without hand-editing localStorage. WebGL stays the default and the right choice for almost everyone. Canvas and DOM are there for glitches, not for speed: text drawn wrong, flicker or leftover artifacts, or typing that lags on a setup running WebGL through a software rasterizer, as some Linux/WebKitGTK boxes do. Both cost more than twice the CPU of WebGL under heavy output, so there is no performance reason to move off it. Applies to terminals opened after the change; relaunch to switch the ones already open. (#140)
+- Images in a git diff render as before and after pictures instead of pages of binary garbage. (#142)
+- Protobuf and Elixir syntax highlighting, including the proto3 syntax the legacy mode missed. (#141)
+- Double-click a file in the tree to open it in the OS default app, for anything the in-app editor cannot usefully render. (#150)
+- Drag tasks to reorder them inside a project. The order persists, so a restart reads it back. (#146)
+- The PDF preview keeps its page across tab switches instead of snapping back to page 1. (#148)
+
+### Bug fixes
+- `termic archive` now asks a task's agents to stop before it kills them. It used to SIGKILL them outright, which gave an agent no chance to flush its session transcript, so archiving a task could quietly cost you the history that makes it resumable and that `termic result` reads. Anything still running after a short grace is killed as before, so the worktree is never removed under a live agent.
+- Find in the markdown preview marks the text you searched for, not the code spans around it. Stepping with Enter and Shift+Enter stays in step with the counter and wraps at both ends, a phrase the markdown source hard-wrapped still matches, and a regex metacharacter in the query is treated as literal text. (#168)
+- The editor's line-number gutter is opaque, so a long line scrolled right no longer shows through it. (#161)
+- The diff's line numbers stay level with the code when inline review comments are added. (#157)
+- Settings dropdowns no longer carry WKWebView's own bevelled gradient, which read as a stray system widget against the light theme's flat panels.
+- A run command with no label is no longer a nameless row in the Run menu and a nameless tab: it shows the command itself, clipped if it runs long, and the Settings label field previews what you'll get. Custom run tabs are keyed by label or by command, never both, so two unlabelled commands can't land on the same tab. (#177)
+- A resume override no longer has its session renamed out from under it: `--name` is skipped whenever a verbatim resume override is active, so the second relaunch can still find the session. The Resume override dialog says so.
+
+### Thanks
+- Michael Hohlios (@MHohlios) for the CLI tab addressing, `termic rename`, worktree adoption, and the macOS GPU renderer toggle.
+- Adam Matan (@adamatan) for folder listings in the editor, open-in-default-app, task reordering, the PDF page fix, and the branch label on the dev-build pill.
+- Alex Goodman (@wagoodman) for the find-in-preview fix and both gutter fixes.
+- Bohdan Shulha (@bohdan-shulha) for image diffs and protobuf/elixir highlighting.
+- Preeti Yuankrathok (@earthpyy) for the unlabelled run command fix.
+
+## [0.25.3] - 2026-08-01
 
 A tray attention list, CLI send and attach, and several agent work-state fixes.
 
@@ -17,6 +51,7 @@ A tray attention list, CLI send and attach, and several agent work-state fixes.
 - Resume now lives behind one row in the project menu that opens a submenu of your last 5 archived sessions, instead of listing them at the top level.
 - History gets a bulk "empty the archive" action, behind a destructive confirmation naming the exact count.
 - A "Show Termic in the menu bar" toggle in Settings, General, for anyone who doesn't want a permanent icon there. On by default and applies live, no restart needed. Choosing "Keep in Menu Bar" from the close prompt turns it back on if it was off, since that button is an explicit ask for the tray as your way back in.
+- `termic quit` tears a windowless Termic down from the shell, naming what it's about to kill (agents, working tasks) and asking to confirm, or `--yes` for scripts. Windowless mode had left the menu-bar Quit as the only way to stop Termic, backwards for a CLI-driven setup.
 
 ### Bug fixes
 - Claude's questions and permission prompts are detected as needing your input instead of being marked done, and a backgrounded subagent still running no longer shows as finished.
@@ -29,7 +64,7 @@ A tray attention list, CLI send and attach, and several agent work-state fixes.
 - The termic CLI's Getting started commands in Settings can now be selected and copied.
 
 ### Thanks
-- Michael Hohlios (@MHohlios) for CLI phases 2 and 3 (send, attach, logs, result, diff, apply) and the agent signal proposer.
+- Michael Hohlios (@MHohlios) for CLI phases 2 and 3 (send, attach, logs, result, diff, apply), `termic quit`, and the agent signal proposer.
 - ghelton-procense for the CLI Getting started selectable-text fix.
 
 ## [0.24.0] - 2026-07-24

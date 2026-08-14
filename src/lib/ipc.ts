@@ -41,6 +41,11 @@ export const projectSetGroup = (ids: string[], group: string | null) =>
 // ───────────────────────────── tasks ─────────────────────────────
 
 export const tasksList    = () => invoke<Task[]>("tasks_list");
+/** Persist the sidebar order of ONE project's tasks: `ids` is that project's
+ *  visible task list top-to-bottom. Each task stores its index, so unlike
+ *  `projectReorder` (whose array order IS the order) tasks in other projects
+ *  and archived rows are left untouched. */
+export const taskReorder  = (ids: string[]) => invoke<void>("task_reorder", { ids });
 export const taskCreate   = (args: CreateTaskArgs) => invoke<Task>("task_create", { args });
 export const taskCreateMulti = (args: CreateMultiArgs) => invoke<Task>("task_create_multi", { args });
 /** Open a task in the repo's main checkout. Sandbox args mirror task_create /
@@ -53,6 +58,8 @@ export const taskOpenRepo = (
   name?: string,
   sandbox?: { enabled: boolean; mode?: SandboxMode; rwPaths: string[]; allowedHosts: string[] },
   command?: string,
+  /** Externally-started session the agent resumes on first spawn (GH #169). */
+  resumeSessionId?: string,
 ) =>
   invoke<Task>("task_open_repo", {
     projectId, cli, name, command,
@@ -60,6 +67,7 @@ export const taskOpenRepo = (
     sandboxMode: sandbox?.mode,
     sandboxRwPaths: sandbox?.rwPaths,
     sandboxAllowedHosts: sandbox?.allowedHosts,
+    resumeSessionId,
   });
 /** List a project's git worktrees not yet open as tasks (issue #5). */
 export const taskImportableWorktrees = (projectId: string) =>
@@ -73,6 +81,9 @@ export const taskImportWorktree = (
   name?: string,
   cli?: string,
   sandbox?: { enabled: boolean; mode?: SandboxMode; rwPaths: string[]; allowedHosts: string[] },
+  /** Externally-started session the agent resumes on first spawn (GH #169). */
+  resumeSessionId?: string,
+  yolo?: boolean,
 ) =>
   invoke<Task>("task_import_worktree", {
     projectId, path, name, cli,
@@ -80,6 +91,7 @@ export const taskImportWorktree = (
     sandboxMode: sandbox?.mode,
     sandboxRwPaths: sandbox?.rwPaths,
     sandboxAllowedHosts: sandbox?.allowedHosts,
+    resumeSessionId, yolo,
   });
 export const taskArchive  = (id: string, deleteBranch?: boolean) => invoke<void>("task_archive", { id, deleteBranch });
 export const taskRestore  = (id: string) => invoke<Task>("task_restore", { id });
@@ -122,13 +134,19 @@ export const taskMatchIgnoredFiles = (id: string, clicked: string) =>
 
 export interface GrepHit { path: string; line: number; col: number; preview: string }
 
+/** How the query is matched. `regex` is a POSIX ERE (git grep -E), NOT
+ *  PCRE — git is not always compiled with libpcre. Kept as one object so
+ *  the two flags can't be swapped at a call site, and so the search and
+ *  its result highlighting always read the same pair. */
+export interface GrepOpts { regex: boolean; case_sensitive: boolean }
+
 /** Start a streaming `git grep` in the task. Results arrive via
  *  `grep-result://<searchId>` events (see `onGrepResult`) and a final
  *  `grep-done://<searchId>` (`onGrepDone`). The caller generates a fresh
  *  `searchId` per keystroke so we can ignore late events from cancelled
  *  searches; Rust auto-SIGKILLs any prior grep for the same task. */
-export const taskGrepStart = (id: string, query: string, searchId: string) =>
-  invoke<void>("task_grep_start", { id, query, searchId });
+export const taskGrepStart = (id: string, query: string, searchId: string, opts: GrepOpts) =>
+  invoke<void>("task_grep_start", { id, query, searchId, opts });
 
 export const taskGrepCancel = (id: string) =>
   invoke<void>("task_grep_cancel", { id });
@@ -330,10 +348,25 @@ export const taskSpotlightStatus  = ()           => invoke<Record<string, string
 export const terminalStageFile = (taskId: string, src: string) =>
   invoke<string>("terminal_stage_file", { taskId, src });
 export const taskFileDiff = (id: string, path: string) => invoke<string>("task_file_diff", { id, path });
+/** Both sides of a file diff. `kind` picks the body the diff pane renders:
+ *  "text" carries `original`/`modified` for CodeMirror, "image" carries the
+ *  base64 of each side (+ `mime`) for an <img>, "binary" carries neither and
+ *  only the byte counts are shown. */
+export type DiffSides = {
+  original: string;
+  modified: string;
+  original_exists: boolean;
+  modified_exists: boolean;
+  fp: string;
+  kind: "text" | "image" | "binary";
+  mime?: string;
+  original_data?: string;
+  modified_data?: string;
+  original_bytes: number;
+  modified_bytes: number;
+};
 export const taskFileDiffSides = (id: string, path: string, scope?: "unstaged" | "staged") =>
-  invoke<{ original: string; modified: string; original_exists: boolean; modified_exists: boolean; fp: string }>(
-    "task_file_diff_sides", { id, path, scope: scope ?? null },
-  );
+  invoke<DiffSides>("task_file_diff_sides", { id, path, scope: scope ?? null });
 export const taskFileRead = (id: string, path: string) => invoke<string>("task_file_read", { id, path });
 /** Read a task image or PDF as base64, for the markdown preview's inline
  *  images or the file-tree preview pane (image/PDF extensions, 20 MB cap).
@@ -346,6 +379,12 @@ export const taskFileReadBase64 = (id: string, path: string, knownFp?: string) =
   invoke<{ unchanged: boolean; mime?: string; data?: string; fp: string }>(
     "task_file_read_base64", { id, path, knownFp },
   );
+/** The `mtime:len` fingerprint of a previewable file, stat only, no read.
+ *  The PDF pane uses it to tell a real rewrite from a routine agent-settle
+ *  tick: reloading the `<embed>` costs the reader their page, so the URL only
+ *  changes when this string does. `""` means missing or unreadable. */
+export const taskFileFp = (id: string, path: string) =>
+  invoke<string>("task_file_fp", { id, path });
 /** Does a task-relative path exist, and is it a directory? Tolerates a
  *  missing target (returns `{ exists: false, is_dir: false }` rather than
  *  erroring) so the markdown preview's link handler can show a real "not
@@ -438,7 +477,9 @@ export interface SpawnArgs {
    *  aux shell stays uncaged yet attachable. Omit for setup/run tabs and
    *  ad-hoc shells the CLI cannot address; role-tagged PTYs also retain
    *  an output ring Rust-side for `termic logs`. */
-  role?: { task_id: string; kind: "agent" | "aux"; is_default?: boolean };
+  /** Mirrors Rust's `PtyRole`. `tab_id` is the stable selector `--tab`
+   *  resolves to (index and title both move; the tab uuid does not). */
+  role?: { task_id: string; tab_id?: string; kind: "agent" | "aux"; is_default?: boolean };
 }
 
 /** Sandbox status returned alongside the PTY id - tells the caller
@@ -483,6 +524,16 @@ export function onPtyExit(ptyId: string, cb: (code: number | null) => void): Pro
 // ───────────────────────────── settings & discovery ─────────────────────────────
 
 export const settingsLoad  = () => invoke<Settings>("settings_load");
+/** Where a project's worktrees land with no per-project override, i.e. purely
+ *  from the global default tasks path. Placeholder for Repository → Tasks path. */
+export const projectTasksPathDefault = (projectId: string) =>
+  invoke<string>("project_tasks_path_default", { projectId });
+/** Names of the projects a candidate tasks path would break (it resolves onto
+ *  or above their repo, so task creation there would be refused). Empty = safe.
+ *  Omit `projectId` to check the value as the global default across every
+ *  project; pass one to check it as that project's override. */
+export const tasksPathConflicts = (path: string, projectId?: string) =>
+  invoke<string[]>("tasks_path_conflicts", { path, projectId: projectId ?? null });
 /** Raw custom theme files from `~/.config/termic/themes/*.json`. Unvalidated —
  *  run each through customTheme.ts's sanitizeTheme before use. */
 export const themesList = () => invoke<CustomThemeFile[]>("themes_list");
@@ -669,6 +720,12 @@ export const openPath  = (path: string) => invoke<void>("open_path", { path });
 /** Reveal an absolute path in the OS file manager (select it on macOS/Windows,
  *  open its parent on Linux). For task-relative paths use taskRevealPath. */
 export const revealPath = (path: string) => invoke<void>("reveal_path", { path });
+/** Hand an absolute FILE path to the OS default app, falling back to revealing
+ *  it when nothing is registered for the extension. Resolves to which of the
+ *  two happened; rejects only when neither worked. Unlike openPath it inspects
+ *  the launcher's exit status, so it is for files, not URLs. */
+export const openFileExternal = (path: string) =>
+  invoke<"opened" | "revealed">("open_file_external", { path });
 export const homeDir   = () => invoke<string>("home_dir");
 export const pathExists= (path: string) => invoke<boolean>("path_exists", { path });
 export const pathIsGitRepo = (path: string) => invoke<boolean>("path_is_git_repo", { path });

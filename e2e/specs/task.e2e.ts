@@ -1,7 +1,8 @@
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone } from "../helpers";
+import { archiveTask, clickByText, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible } from "../helpers";
 
 // P0: create a task through the real NewTaskDialog wizard (the primary user
 // path; the other specs take the IPC shortcut). Uses the shell ("Terminal")
@@ -425,6 +426,139 @@ describe("task lifecycle", () => {
     );
     // The sidebar reflects the new name.
     await waitForText("renamed-task");
+  });
+
+  // GH #153: task_rename refuses a live same-project duplicate (two
+  // same-name tasks make CLI name resolution ambiguous with no name-based
+  // way out), and the sidebar's inline-rename commit surfaces that refusal
+  // as a toast instead of silently snapping back.
+  it("refuses a duplicate name at the IPC layer and toasts in the inline flow", async () => {
+    const dupId = await openTask("e2e-life-dup", false);
+    cleanup.push(dupId);
+
+    // IPC layer: renaming onto "renamed-task" (live, same project) rejects.
+    const err = await browser.execute(async (i) => {
+      try {
+        await window.__termic!.ipc.taskRename(i, "renamed-task");
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    }, dupId);
+    expect(err).toContain("already exists");
+    const name = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.name,
+      dupId,
+    );
+    expect(name).toBe("e2e-life-dup");
+
+    // task_open_repo enforces the same rule: repo-root tasks have no
+    // per-name directory to collide on, so without this a second "Open
+    // repo" could mint the same-name twin rename just refused.
+    const openErr = await browser.execute(async () => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      try {
+        await t.ipc.taskOpenRepo(proj.id, "fakeagent", "renamed-task");
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    });
+    expect(openErr).toContain("already exists");
+
+    // DERIVED names take the other fork: two unnamed opens both fall back
+    // to the branch name, and the second is auto-bumped ("main-2") rather
+    // than refused, so the quick Terminal twice stays possible.
+    const [a, b] = await browser.execute(async () => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      const first = await t.ipc.taskOpenRepo(proj.id, "fakeagent", null);
+      const second = await t.ipc.taskOpenRepo(proj.id, "fakeagent", null);
+      await t.useApp.getState().loadAll();
+      return [
+        { id: first.id, name: first.name },
+        { id: second.id, name: second.name },
+      ];
+    });
+    cleanup.push(a.id, b.id);
+    expect(b.name).not.toBe(a.name);
+    expect(b.name).toMatch(/-\d+$/);
+
+    // UI layer: drive the real inline-rename commit (the palette's
+    // renameRequest mounts the input in the task's sidebar row), type the
+    // duplicate, commit, and the refusal lands as a toast.
+    await browser.execute((i) => {
+      window.__termic!.useUI.setState({ renameRequest: { taskId: i, nonce: Date.now() } });
+    }, dupId);
+    const inputSel = `[data-sidebar-task-id="${dupId}"] input`;
+    await waitVisible(inputSel);
+    await browser.execute((sel) => {
+      const input = document.querySelector<HTMLInputElement>(sel)!;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "renamed-task");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      // Blur commits, same as Enter; a synthetic keydown would not carry
+      // through React's onKeyDown -> commit path reliably.
+      input.blur();
+    }, inputSel);
+    await waitForText("already exists");
+    // The row keeps its old name once the input unmounts.
+    const after = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.name,
+      dupId,
+    );
+    expect(after).toBe("e2e-life-dup");
+    await snap("task-rename-dup-toast.png");
+  });
+
+  // task_restore mirrors the duplicate rule (GH #153): restoring an
+  // archived task whose name a live task has since taken would resurrect
+  // two same-name tasks in one project, which CLI name resolution cannot
+  // untangle. Renaming the live squatter away unblocks the restore.
+  it("refuses to restore an archived task when a live one took its name", async () => {
+    const archived = await openTask("e2e-life-restore-dup", false);
+    await archiveTask(archived);
+    const squatter = await openTask("e2e-life-squatter", false);
+    cleanup.push(squatter);
+    await browser.execute(async (i) => {
+      await window.__termic!.ipc.taskRename(i, "e2e-life-restore-dup");
+      await window.__termic!.useApp.getState().loadAll();
+    }, squatter);
+
+    const err = await browser.execute(async (i) => {
+      try {
+        await window.__termic!.ipc.taskRestore(i);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    }, archived);
+    expect(err).toContain("already exists");
+    const stillArchived = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.archived,
+      archived,
+    );
+    expect(stillArchived).toBe(true);
+
+    // Rename the squatter back; the restore now goes through.
+    await browser.execute(async (i) => {
+      await window.__termic!.ipc.taskRename(i, "e2e-life-squatter");
+      await window.__termic!.useApp.getState().loadAll();
+    }, squatter);
+    await browser.execute(async (i) => {
+      await window.__termic!.ipc.taskRestore(i);
+      await window.__termic!.useApp.getState().loadAll();
+    }, archived);
+    cleanup.push(archived);
+    const restored = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.archived,
+      archived,
+    );
+    expect(restored).toBe(false);
   });
 
   it("deletes a task permanently", async () => {
@@ -1145,5 +1279,168 @@ describe("agent race", () => {
       expect(branches).toContain(`race/${localName}/fakeagent-1`);
       expect(branches).toContain(`race/${localName}/fakeagent-2`);
     });
+  });
+});
+
+// P1: drag-to-reorder tasks inside a project (issue #144). The sidebar drag is
+// pointer-based (see helpers.pointerDrag) and lands in `task_reorder`, which
+// writes an `order` index into each task file. Cases: the live reorder; the
+// order surviving a reload from disk (what a restart reads); and the hard
+// boundary that a task never leaves its own project. Project drag-to-reorder,
+// which shares the sidebar but a different handler, stays covered by
+// projects.e2e.ts.
+describe("sidebar task drag", () => {
+  const ids: string[] = [];
+  let otherDir: string | undefined;
+  let otherProjectId: string | undefined;
+  let otherTaskId: string | undefined;
+  let fixtureProjectId: string;
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    for (const n of ["drag-a", "drag-b", "drag-c"]) ids.push(await openTask(n, false));
+    fixtureProjectId = await browser.execute(
+      (id) => window.__termic!.useApp.getState().tasks
+        .find((t: any) => t.id === id)!.project_id as string,
+      ids[0],
+    );
+    // A second project + task: the cross-project case needs a real foreign
+    // row to aim the drag at.
+    otherDir = mkdtempSync(path.join(os.tmpdir(), "e2e-taskdrag-"));
+    execSync(
+      `git -C "${otherDir}" init -q && git -C "${otherDir}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
+    );
+    const seeded = await browser.execute(async (dir) => {
+      const t = window.__termic!;
+      const proj: any = await t.ipc.projectAdd(dir);
+      const task: any = await t.ipc.taskOpenRepo(proj.id, "fakeagent", "other-task");
+      await t.useApp.getState().loadAll();
+      return { projectId: proj.id as string, taskId: task.id as string };
+    }, otherDir);
+    otherProjectId = (seeded as any).projectId;
+    otherTaskId = (seeded as any).taskId;
+    // Task rows only exist in the DOM while their project is expanded.
+    await browser.execute((a, b) => {
+      const s = window.__termic!.useApp.getState();
+      s.setProjectCollapsed(a, false);
+      s.setProjectCollapsed(b, false);
+    }, fixtureProjectId, otherProjectId);
+    await dismissOverlays();
+  });
+
+  after(async () => {
+    for (const id of [...ids, otherTaskId].filter(Boolean) as string[]) {
+      await archiveTask(id);
+    }
+    if (otherProjectId) {
+      await browser.execute(async (id) => {
+        await window.__termic!.ipc.projectRemove(id);
+        await window.__termic!.useApp.getState().loadAll();
+      }, otherProjectId);
+    }
+    if (otherDir) rmSync(otherDir, { recursive: true, force: true });
+  });
+
+  // Sidebar rows, NOT `[data-task-id]` — that one is MainArea's mounted
+  // TaskView container, and every visited task stays mounted.
+  const row = (id: string) => `[data-sidebar-task-id="${id}"]`;
+  // Sidebar order = store order, filtered to one project's visible rows.
+  const order = (projectId: string) =>
+    browser.execute(
+      (p) => window.__termic!.useApp.getState().tasks
+        .filter((t: any) => t.project_id === p && !t.archived)
+        .map((t: any) => t.id as string),
+      projectId,
+    ) as Promise<string[]>;
+  // Same list, but re-read from the task files on disk — `tasks_list` calls
+  // the very loader a cold start uses, so this is the restart check without
+  // relaunching the window.
+  const diskOrder = (projectId: string) =>
+    browser.execute(async (p) => {
+      const all: any[] = await window.__termic!.ipc.tasksList();
+      return all.filter((t) => t.project_id === p && !t.archived).map((t) => t.id as string);
+      // `as unknown as`: browser.execute types an async callback as
+      // Promise<Promise<T>>, which WDIO flattens at runtime.
+    }, projectId) as unknown as Promise<string[]>;
+  // What the user actually SEES, read off the rendered rows. Store-only
+  // assertions can't catch a surface that re-sorts the list on render — the
+  // sidebar and the Dashboard each did exactly that before this feature, and
+  // a revert of either would leave every store assertion green.
+  const domOrder = (attr: "sidebar" | "dashboard", projectId: string) =>
+    browser.execute(
+      (a, p) => [...document.querySelectorAll<HTMLElement>(`[data-${a}-task-id]`)]
+        .filter(el => el.dataset[`${a}TaskProjectId`] === p)
+        .map(el => el.dataset[`${a}TaskId`]!),
+      attr,
+      projectId,
+    ) as Promise<string[]>;
+
+  it("moves a task above its sibling and keeps the rest in place", async () => {
+    const [a, b, c] = ids;
+    // Creation order, oldest first — the behavior before this feature.
+    expect((await order(fixtureProjectId)).slice(-3)).toEqual([a, b, c]);
+
+    await waitVisible(row(c));
+    // Dropping above a row's midpoint inserts before it.
+    await pointerDrag(row(c), row(a), { land: "top" });
+    await browser.waitUntil(
+      async () => {
+        const o = await order(fixtureProjectId);
+        return o.indexOf(c) < o.indexOf(a);
+      },
+      { timeout: 8_000, timeoutMsg: "dragging a task did not reorder the sidebar" },
+    );
+    // The two rows it passed keep their relative order: a reorder, not a shuffle.
+    const after = await order(fixtureProjectId);
+    expect(after.indexOf(a)).toBeLessThan(after.indexOf(b));
+    // The SIDEBAR agrees with the store. Without this the spec passes even if
+    // the render re-sorts by `created` and the user sees no change at all.
+    expect(await domOrder("sidebar", fixtureProjectId)).toEqual(after);
+    await snap("task-drag-reordered");
+  });
+
+  it("shows the same order on the Dashboard", async () => {
+    // The Dashboard lists each project's tasks too, and used to re-sort them
+    // by creation time — same project, two different orders.
+    await browser.execute(() => window.__termic!.useApp.getState().setView("dashboard"));
+    await waitVisible(`[data-dashboard-task-id="${ids[0]}"]`);
+    expect(await domOrder("dashboard", fixtureProjectId))
+      .toEqual(await order(fixtureProjectId));
+  });
+
+  it("persists the order to disk, so a restart reads it back", async () => {
+    await browser.waitUntil(
+      async () => {
+        const [live, disk] = [await order(fixtureProjectId), await diskOrder(fixtureProjectId)];
+        return live.join() === disk.join();
+      },
+      { timeout: 8_000, timeoutMsg: "task_reorder never reached the task files" },
+    );
+    const disk = await diskOrder(fixtureProjectId);
+    expect(disk.indexOf(ids[2])).toBeLessThan(disk.indexOf(ids[0]));
+  });
+
+  it("refuses to move a task into another project", async () => {
+    const [a] = ids;
+    const foreignBefore = await order(otherProjectId!);
+
+    await waitVisible(row(otherTaskId!));
+    // Aim at a row that belongs to a DIFFERENT project. The handler only
+    // hit-tests siblings, so the row clamps to the bottom of its own list
+    // instead of defecting.
+    await pointerDrag(row(a), row(otherTaskId!), { land: "bottom" });
+
+    const projectOf = await browser.execute(
+      (id) => window.__termic!.useApp.getState().tasks
+        .find((t: any) => t.id === id)!.project_id as string,
+      a,
+    );
+    expect(projectOf).toBe(fixtureProjectId);
+    // The foreign project's list is untouched — nothing was inserted into it.
+    expect(await order(otherProjectId!)).toEqual(foreignBefore);
+    // And the drag still did something legal: last in its own project.
+    const own = await order(fixtureProjectId);
+    expect(own[own.length - 1]).toBe(a);
   });
 });

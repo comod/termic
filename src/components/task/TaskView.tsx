@@ -7,6 +7,14 @@
 // display:none (NOT visibility:hidden) is load-bearing: xterm's renderer
 // only pauses on zero geometry, so a visibility-hidden terminal still runs
 // WebGL draws for every TUI repaint. See MainArea for the full story.
+//
+// One exception, and only one: a hidden PDF tab keeps its `display` and goes
+// to opacity 0 instead (keepsDisplayWhenHidden). WKWebView tears down the
+// native PDF view inside a display:none subtree and rebuilds it at page 1,
+// and no DOM state survives to restore the reader's place. The perf argument
+// above doesn't reach it — a PDF is a static image that never repaints, so a
+// painted-but-invisible one costs a composite, not a WebGL draw loop. Do NOT
+// widen this to terminals.
 
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Task, Tab, TerminalTab } from "@/lib/types";
@@ -20,7 +28,7 @@ import { AuxTerminal } from "./AuxTerminal";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { Plus, ChevronDown, ChevronUp, ChevronRight, LocateFixed, Copy, Check, FolderOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getAllLeaves, computeLeafBounds } from "@/lib/splitTree";
+import { getAllLeaves, computeLeafBounds, focusedTabId } from "@/lib/splitTree";
 import type { PaneLeaf, Rect } from "@/lib/splitTree";
 import { openPath } from "@/lib/ipc";
 import { fileIconUrl } from "@/lib/explorer/iconResolver";
@@ -28,11 +36,12 @@ import { ResizeHandle } from "@/components/ui/ResizeHandle";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent } from "@/components/ui/ContextMenu";
 import { CopyPathItems } from "./CopyPathItems";
 import { dirnamePosix, MARKDOWN_EXT_RE } from "@/lib/markdownPaths";
-import { previewKindForPath } from "@/lib/previewPaths";
+import { keepsDisplayWhenHidden, previewKindForPath } from "@/lib/previewPaths";
 const EditorPane = lazy(() => import("./EditorPane").then(m => ({ default: m.EditorPane })));
 const DiffPane   = lazy(() => import("./DiffPane").then(m => ({ default: m.DiffPane })));
 const MarkdownPane = lazy(() => import("./MarkdownPane").then(m => ({ default: m.MarkdownPane })));
 const PreviewPane  = lazy(() => import("./PreviewPane").then(m => ({ default: m.PreviewPane })));
+const DirListingPane = lazy(() => import("./DirListingPane").then(m => ({ default: m.DirListingPane })));
 // Lightweight extension check so we don't import the (lazy) MarkdownPane
 // module just to ask whether a path is markdown. Shared with the markdown
 // preview's link handler (markdownPaths.ts) so both agree on what counts.
@@ -192,6 +201,14 @@ export function TaskView({ task }: { task: Task }) {
   const mainDimOpacity = (splitPaneDim && splitRoot && !isMainActive) ? splitPaneDimAmount / 100 : 0;
   const mainTabs = tabs.filter(t => !(t as TerminalTab).paneId);
 
+  // The one tab in the whole app whose ⌘F should work. Stricter than the
+  // `tabActive` below, which is per-task: MainArea keeps every visited task
+  // mounted, so a background task's preview would answer yes too. Modals are
+  // NOT handled here — the preview's own listener checks the focus trap, which
+  // covers every dialog plus the hand-rolled Settings overlay in one place.
+  const keyboardTabId = focusedTabId(splitRoot, splitActivePaneId, activeId);
+  const taskUpFront = useApp(s => s.activeTaskId === task.id);
+
   // Chrome heights the content must sit below. When there's no split, the
   // TabBar + breadcrumb render ABOVE hRow, so main content fills hRow whole.
   // With a split they render inside the main wrapper: TabBar h-9 (36px) plus
@@ -325,18 +342,40 @@ export function TaskView({ task }: { task: Task }) {
               const tabActive = leaf
                 ? splitActivePaneId === leaf.id && t.id === leaf.activeTabId
                 : t.id === activeId;
+              // Terminals and editors want the per-task answer above: they use
+              // it to focus themselves, and a background task refocusing its
+              // own editor is harmless. The preview needs the app-wide one,
+              // because it claims a window-level ⌘F with stopPropagation.
+              // Necessary but not sufficient: this says nothing about the
+              // bottom split or the right panel, which aren't in the tree, so
+              // the preview also checks where focus actually is.
+              const ownsFind = taskUpFront && t.id === keyboardTabId;
               const attrs = leaf
                 ? { "data-split-leaf": "", "data-pane-id": leaf.id, "data-tab-id": t.id }
                 : { "data-main-content": "", "data-main-tab-id": t.id };
+              // A hidden PDF tab is the one exception to display:none (see
+              // file header): opacity 0 keeps its native <embed> in the
+              // render tree, and with it the page the user was reading.
+              const keepDisplay = !visible && keepsDisplayWhenHidden(t);
               return (
                 <div
                   key={t.id}
                   {...attrs}
                   tabIndex={-1}
+                  // inert only ever applies to a hidden pane: an invisible
+                  // PDF is still a real element, and must take neither focus
+                  // nor a stray click.
+                  inert={keepDisplay}
                   className="pointer-events-auto absolute overflow-hidden outline-none"
                   // display:none, not visibility:hidden — pauses the hidden
                   // tab's xterm/CodeMirror rendering (see file header).
-                  style={{ ...style, display: visible ? undefined : "none", zIndex: visible ? 1 : 0 }}
+                  style={{
+                    ...style,
+                    ...(keepDisplay
+                      ? { opacity: 0, pointerEvents: "none" as const }
+                      : { display: visible ? undefined : "none" }),
+                    zIndex: visible ? 1 : 0,
+                  }}
                   onMouseDown={() => {
                     const target = leaf ? leaf.id : mainLeafId;
                     if (target && splitActivePaneId !== target) setActivePaneId(task.id, target);
@@ -350,11 +389,12 @@ export function TaskView({ task }: { task: Task }) {
                       {previewKindForPath(t.path)
                         ? <PreviewPane task={task} tab={t} />
                         : isMarkdownPath(t.path)
-                          ? <MarkdownPane task={task} tab={t} />
+                          ? <MarkdownPane task={task} tab={t} visible={visible} ownsFind={ownsFind} />
                           : <EditorPane task={task} tab={t} active={tabActive} />}
                     </Suspense>
                   )}
                   {t.type === "diff"     && <Suspense fallback={null}><DiffPane task={task} tab={t} /></Suspense>}
+                  {t.type === "dir"      && <Suspense fallback={null}><DirListingPane task={task} tab={t} visible={visible} ownsFind={ownsFind} /></Suspense>}
                 </div>
               );
             })}

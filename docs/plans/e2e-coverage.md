@@ -25,6 +25,14 @@ until `make e2e` is green and this file reflects it.
 | ✅ Task spawn | Task created; agent PTY comes alive; PTY write round-trips; agent OSC title reaches the app | `task.e2e.ts` |
 | ✅ Agent working | After a real submit, the agent enters the working state | `agent.e2e.ts` |
 | ✅ Agent attention | An agent you are not viewing flags completion (unread/done) when it finishes | `agent.e2e.ts` |
+| ✅ CLI tabs (unit) | `termic tab` on an UNMOUNTED task keeps every persisted agent and its session id, does not steal the default-target role, and a shell tab does not strand the task agentless | `store/cliTab.integration.test.ts` |
+| ✅ CLI tab ids end to end | Over the real control socket: `tab` returns a stable id; `logs --tab` resolves it to THAT tab's own PTY (the `PtyRole.tab_id` thread); `send --tab` delivers to the targeted tab only; `tab -p` confirms delivery into the new tab; `status` lists the strip with the same ids and 1-based indices; a missed selector is a typed not_found and a duplicate title refuses as ambiguous | `cli.e2e.ts` |
+| ✅ CLI rename end to end | Over the real control socket (GH #153): `rename` retitles by explicit name, the reply carries the persisted NEW name and old_name, the store reflects it live; a same-project duplicate refuses with a typed conflict | `cli.e2e.ts` |
+| ✅ CLI send --tab (unit) | Targeted send delivers/queues on the TARGET tab's own state, refuses vanished (unknown_tab), non-agent (not_sendable), dead (tab_not_live) targets, spawn-pending waits for the racing PTY, --resume/--fresh conflict, incapable --wait refused | `store/cliSend.integration.test.ts` |
+| ✅ CLI tab close end to end (GH #185) | Over the real socket: `tab close --tab` drops a secondary tab from the strip AND stops its PTY (its id stops resolving) while the task and its other tabs keep running; a SHELL tab is refused by `logs` (write-only) yet still closes, reporting `tab_kind` and the webview-observed `killed_pty`; the default tab refuses without `--yes` and nothing is killed on the way to the refusal; a missed selector is a typed not_found; a closed secondary leaves a `closedTabs` Resume entry; `--yes` closes the default tab, which stays durable in `persisted_tabs` | `cli.e2e.ts` |
+| ✅ CLI tab close, store side (unit) | The webview half: a secondary tab leaves the durable set but keeps its session id in `closedTabs`, a shell tab closes with `killedPty` reported from the store (the only side that knows, since it carries no PtyRole) and leaves no Resume entry, the default tab closes yet stays durable with no entry, and an UNMOUNTED task is refused without touching `persisted_tabs` (running `syncDurableTabs` there would forget every secondary agent's session id on disk); unknown-tab, split-pane and missing-id refusals carry their sentinels | `store/cliTabClose.integration.test.ts` |
+| ✅ CLI adopt worktree (GH #169) | Over the real socket: `new --from` adopts an externally-created worktree (project resolved from its repo, name derived from its branch), re-adopting the same path and a plain non-worktree dir refuse cleanly, and `--resume` on both `new` and `tab` refuses an agent without id-resume support; `--resume` SEEDING (task agent_session_ids, tab sessionId, `--resume <id>` arg composition keeping `--name`) is pinned by `cli_server.rs` tests + `agents.test.ts` + `store/cliTab.integration.test.ts` | `cli.e2e.ts` |
+| ✅ CLI prompt library (Phase 4) | Over the real socket: `prompts` lists the shipped library (ids + flags, no bodies); `prompts show` resolves ids and case-insensitive live titles, including disabled prompts, and a miss is a typed not_found; `send -P` composes body + blank line + `-p` text into the real agent; a bad `-P` on `new` fails fast with no task created. Selector precedence/ambiguity, composition, empty-body refusal and fail-fast ordering are pinned by `cli_server.rs` tests; the live-store contract by `store/cliPrompts.integration.test.ts` | `cli.e2e.ts` |
 | ✅ Windowless completion | An agent finishing while Termic is windowless still flags unread/done, even for the task that was active | `app.e2e.ts` |
 | ✅ Pending work defers done | An agent that backgrounds work and returns to its idle title holds the done badge back past byte-quiet (4s) and the settle timer (5s); done fires once its status line clears | `agent.e2e.ts` |
 | ✅ A hold that never clears ends | A status line that never clears cannot pin a tab to "working": the absolute ceiling force-clears it (shortened for the test via `localStorage.workDoneCeilingMs`) | `agent.e2e.ts` |
@@ -40,6 +48,11 @@ until `make e2e` is green and this file reflects it.
 | ✅ Git clean | Clean working-tree status for the fixture repo | `git.e2e.ts` |
 | ✅ Git dirty | Modify a file → Git panel leaves clean state, git status reports it | `git.e2e.ts` |
 | ✅ Settings | Toggling a preference lands in the prefs store + control reflects it | `settings.e2e.ts` |
+| ✅ Terminal renderer picker | Appearance → Terminal exposes the three-way webgl/canvas/dom picker on macOS (GH #140); the option list is asserted to be exactly those three, and driving the real segmented control through canvas and dom lands in prefs and keeps the legacy `terminalGpuEnabled` in sync | `settings.e2e.ts` |
+| ✅ CLI graduated | The Termic CLI page and its rail item carry NO Experimental badge (0.26.0); docs/ui.md ties the badge to being off by default, so a badge next to a shipped-enabled setting is a contradiction | `settings.e2e.ts` |
+| ✅ Editor theme per app mode | Appearance → Editor offers a dark AND a light syntax theme select, each writing only its own pref; on the rendered side the app mode selects the matching pref, the light pref repaints while the app stays light, and a write to the dark pref changes nothing until the app goes dark | `settings.e2e.ts`, `editor.e2e.ts` |
+| ✅ Select chrome | Every settings `<select>` computes `appearance: none` with the repainted chevron and reserves room for it, so WKWebView's native bevel cannot come back (one bare-element rule, all selects at once) | `settings.e2e.ts` |
+| ✅ Default tasks path | The global setting ships a real value (not an empty box); a new project's `tasks_path` starts empty so that setting applies; an absolute default lands worktrees at `<default>/<project>/<task>` and a relative one at `<repo>/<default>/<task>`, both verified on disk; a project's own tasks path overrides it; the project field shows the global-derived path as its placeholder while staying empty; the Settings → Tasks preview flips between the two halves of the rule as it is typed, and emptying the required field blocks the save | `settings.e2e.ts` |
 | ✅ Tabs | Add a terminal tab via the "+" menu; switch active tab | `tabs-layout.e2e.ts` |
 | ✅ Tab rename | Double-click inline edit commits the new name | `tabs-layout.e2e.ts` |
 | ✅ Theme | Picker switches theme; palette class applied to `<html>` | `tabs-layout.e2e.ts` |
@@ -49,15 +62,20 @@ until `make e2e` is green and this file reflects it.
 | ✅ Command palette | Opens/lists; filters; command activation closes it; Escape closes | `app.e2e.ts` |
 | ✅ File finder | ⌘P lists the repo's files; selecting one opens an editor tab | `files.e2e.ts` |
 | ✅ Git stage/unstage/commit | Stage → unstage → re-stage + commit → clean | `git.e2e.ts` |
-| ✅ Task rename/delete | Rename updates store+sidebar; delete removes the task entirely | `task.e2e.ts` |
+| ✅ Task rename/delete | Rename updates store+sidebar; duplicate name refused (IPC) + toast (inline flow, GH #153); delete removes the task entirely | `task.e2e.ts` |
 | ✅ Git diff | Open a diff tab for a changed file | `git.e2e.ts` |
-| ✅ Find in files | ⇧⌘F opens; a repo-present query returns a result row | `files.e2e.ts` |
+| ✅ Inline review comments | Select a diff line → tooltip → compose → save, three times; line numbers stay level with the code throughout (GH #157) | `git.e2e.ts` |
+| ✅ Find in files | ⇧⌘F opens; a repo-present query returns a result row; a pattern matches nothing as a literal and matches once the `.*` toggle turns regexp mode on; a differently-cased query matches until the `Aa` toggle turns match-case on (both toggles persist to prefs) | `files.e2e.ts` |
 | ✅ Markdown preview | Preview view renders the README markdown (h1) | `editor.e2e.ts` |
+| ✅ Directory links | A folder link recycles the preview tab into a listing and expands the tree; the folder README renders under it; folder rows, `..` and links inside the README navigate in place; a file row or README file link pins the listing and opens alongside it; a hidden listing's README does not claim ⌘F; ⌘[ / ⌘] walk the folder trail, are declined when focus is in the bottom drawer or right panel, and fall through to task switching once the trail runs out | `editor.e2e.ts` |
+| ✅ Find in preview | ⌘F marks exactly the query text and nothing else (asserted on the `<mark>`s and their *computed background*, never a highlight registry), including the code spans a doc contains but the query doesn't touch; Enter/⇧Enter step with the counter and wrap both ways; a second query replaces the first instead of stacking; a query inside a code span still matches; a phrase the markdown source hard-wrapped still matches; a regex metacharacter stays literal; no match clears; Escape restores the document; a theme flip that rebuilds the DOM re-marks against the fresh one | `editor.e2e.ts` |
+| ✅ ⌘F ownership | Only the tab the reader is in opens a find bar: not a background task's mounted preview, not the visible preview while a split pane holds focus, not while a modal holds the focus trap, and not under the Settings overlay (which traps nothing, so only the store flag sees it). The tab takes the key back on close, and a tab recycled onto another file drops its marks. In split view the editor keeps ⌘F while the caret is in it and the preview claims it once clicked into | `editor.e2e.ts` |
 | ✅ File tree | Create a folder → expand reveals its child → collapse hides it | `files.e2e.ts` |
 | ✅ Drag a file to a terminal | Row dragged onto a terminal sends the relative path to the PTY (no editor tab); released elsewhere types nothing; a plain click still opens the file | `files.e2e.ts` |
 | ✅ Tab drags | Reorder within the main strip; drop on a pane edge to split there; drag out of a pane back to main | `tabs-layout.e2e.ts` |
 | ✅ Resize drags | Sidebar edge widens + clamps at its minimum (persisted); split divider moves the ratio inside its clamp | `tabs-layout.e2e.ts` |
 | ✅ Sidebar project drags | Reorder two projects; drop one into a group folder; move a whole folder as one block | `projects.e2e.ts` |
+| ✅ Sidebar task drags | Reorder tasks inside a project (siblings keep their relative order); the new order persists to the task files, so a cold load reads it back; a task dragged at another project's row clamps to its own list instead of moving | `task.e2e.ts` |
 | ✅ Settings reorder drags | Prompt rows reorder by their grip (and a click without movement does not); agent pills reorder within their kind | `settings.e2e.ts` |
 | ✅ Resume submenu | The project `+` menu keeps archived sessions behind one Resume row; the submenu lists them and restores the picked one | `projects.e2e.ts` |
 | ✅ Empty archive | History's Empty archive: cancelling keeps every task, confirming deletes them all for good | `task.e2e.ts` |
@@ -75,7 +93,10 @@ until `make e2e` is green and this file reflects it.
 | ✅ Setup script | Configure + launch a Setup tab that spawns | `run.e2e.ts` |
 | ✅ Sidebar layout | Sidebar width setter persists | `tabs-layout.e2e.ts` |
 | ✅ Code editor | Open a .py file → CodeMirror renders with highlight tokens | `editor.e2e.ts` |
+| ✅ Editor h-scroll gutter | A long line scrolled fully right keeps the sticky gutter painting the host's surface, so code never shows through it (GH #161) | `editor.e2e.ts` |
 | ✅ Commit & push | Commit with push to a bare remote; remote receives it | `git.e2e.ts` |
+| ✅ Editor selection → agent | A selection raises ONE gutter icon (never the diff's pill or hover button) and retracts with the selection; the composer offers Send + Add to pending; Send ships that one comment WITH the code and skips the queue; Add to pending queues it (card in place, editor keeps the stage, nothing sent); ⇧⌘L stacks a second one and no-ops with no selection; queued comments follow their code when lines are inserted above; the batch sends as one message carrying both bodies + both SHIFTED line attributions (asserted from the agent's PTY ring) and drains the queue | `editor.e2e.ts` |
+| ✅ Multi-repo Git panel | Two member repos: the panel opens on a CHANGED repo (never the clean host) with its files listed and no click; a second dirty repo adds its pill without stealing the selection; picking a pill swaps the list and stages into that repo only | `git.e2e.ts` |
 | ✅ Discover repos | Scan a folder → returns its git repos | `projects.e2e.ts` |
 | ✅ Import worktree | Lists importable (unopened) worktrees for a project | `projects.e2e.ts` |
 | ✅ Project reorder | Reorder projects | `projects.e2e.ts` |
@@ -86,6 +107,7 @@ until `make e2e` is green and this file reflects it.
 | ✅ Project add/remove | Add a git repo as a project; remove drops it | `projects.e2e.ts` |
 | ✅ Agent settings | Disable/re-enable an agent CLI via agentsSave | `agent.e2e.ts` |
 | ✅ Run config modal | The #124 run-commands manager opens for a project | `run.e2e.ts` |
+| ✅ PDF preview | A hidden PDF tab keeps its `display` (main tab and split pane) while a hidden terminal still goes to display:none; the embed URL is fingerprint-keyed, so only a real rewrite reloads it | `editor.e2e.ts` |
 
 ## CLI control plane (Phase 1/2)
 
@@ -109,10 +131,10 @@ the real app; e2e specs to add:
 
 Lower-value or high-setup items left for later; the patterns to do them are all in place.
 
-- **Second live agent in one task / quick-create / multi-member project** — heavy fixture setup (agent-tab construction, multi-repo members) for low marginal coverage. Resume (`resume-tab`) covers the reopen path.
+- **Second live agent in one task / quick-create** — heavy fixture setup (agent-tab construction) for low marginal coverage. Resume (`resume-tab`) covers the reopen path. Multi-member projects came off this list: `git.e2e.ts` builds one (a non-git wrapper host + two throwaway repos in a tmp dir) for the multi-repo Git panel, so the fixture pattern exists to copy.
 - **Run-at-repo-root (spotlight)** — needs spotlight state; the run-tab mechanism is covered (`run`, `run-scripts` via proxy).
 - **Configured `.termic.yaml` run scripts via the Run button** — covered by proxy: `setup-script` (configured-script launch) + `run` (run-tab mechanism) + `repo-config` (config persistence). The live Run-button path has a config-cache nuance not worth the flake.
-- **Image/PDF preview, file create/rename/delete via context menu, file-tree reveal** — need binary fixtures or Radix context-menu driving (flaky, no clean IPC).
+- **File create/rename/delete via context menu, file-tree reveal** — need Radix context-menu driving (flaky, no clean IPC). Binary previews are no longer on this list: image preview is covered by `files.e2e.ts`, PDF preview by `editor.e2e.ts` (which builds a tiny valid PDF inline rather than committing a fixture).
 - **Prompts management, keybindings editor** — config-file editing, low value.
 
 ## Environment-limited (not robustly testable here)
@@ -120,9 +142,10 @@ Lower-value or high-setup items left for later; the patterns to do them are all 
 These are intentionally NOT covered by written specs — asserting them would be flaky or impossible in the occluded-window / embedded-WebDriver setup. Left as manual checks.
 
 - **OS desktop notification delivery + completion sound** on agent done — no in-webview signal to assert; the store-side attention/unread IS covered (`agent.e2e.ts`).
-- **Keyboard shortcuts into CodeMirror** (e.g. ⌘F search) don't route reliably across window-focus states — manual check. Button-driven editor actions (Preview) ARE covered.
+- **Keyboard shortcuts into CodeMirror** (e.g. its own ⌘F search panel) don't route reliably across window-focus states — manual check. Button-driven editor actions (Preview) ARE covered. This is specific to CodeMirror's keymap: the markdown preview's ⌘F is a plain window listener, so it dispatches fine as a synthetic keydown and IS covered (find-in-preview, `editor.e2e.ts`).
 - **Real keystrokes into xterm / CodeMirror** (contenteditable + WebGL canvas) — WebDriver key events don't route there reliably. Covered by proxy: PTY round-trips via `ipc.ptyWrite` (`task-spawn`, `message-queue`) and editor edits via the CodeMirror view API (`editor-save`).
 - **Commit-and-push / setup script / resume-closed-tab** — need mock-remote / `.termic.yaml` / multi-agent-tab infra with careful fixture cleanup; deferred, tracked above.
+- **The page a PDF is scrolled to** — it lives in WKWebView's native PDF view, which exposes nothing to the DOM. The spec asserts the two mechanisms that keep that view (and its page) alive; the page itself is a manual check.
 
 ## Known harness gotchas (read before writing a spec)
 
