@@ -44,7 +44,7 @@
           npmDeps = pkgs.fetchNpmDeps {
             name = "${pname}-${version}-npm-deps";
             src = self;
-            hash = "sha256-yRPzIVWG9qmPzaMs7/l8yzIFgHd9O2KmPqSyJZimMLg=";
+            hash = "sha256-tsuOBm//k9s9reGRfGoVup8F9r1uIDo70bspwbOijxY=";
           };
 
           # No updater artifacts in the Nix build: they must be signed with the
