@@ -61,6 +61,12 @@
           ];
           buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux linuxDeps ++ darwinDeps;
 
+          # tray-icon dlopen()s libayatana-appindicator3 at runtime, which the
+          # ELF RUNPATH does not cover, so the wrapper has to carry it.
+          preFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            gappsWrapperArgs+=(--prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath linuxDeps}")
+          '';
+
           # Unit tests shell out to a real git with identity/network assumptions;
           # they run via `cargo test` in the dev shell, not inside the sandbox.
           doCheck = false;
