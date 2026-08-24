@@ -7,7 +7,7 @@ members = ["../termic-proto", "../termic-cli"]
 
 [package]
 name = "termic"
-version = "0.26.0"
+version = "0.29.0"
 description = "Run claude, gemini, and codex in parallel — each in its own git worktree."
 authors = ["Simion Agavriloaei"]
 edition = "2021"
@@ -61,6 +61,19 @@ base64 = "0.22"
 # it direct doesn't change resolution.
 percent-encoding = "2"
 tauri-plugin-clipboard-manager = "2.3.2"
+# Format-preserving TOML, for writing our own table into the user's
+# codex config without disturbing their comments, ordering, or the rest
+# of the file. Hand-editing that text produced invalid TOML for shapes a
+# line scan does not recognise (a quoted table header, a dotted key),
+# and an invalid config makes codex fail to load ALL of it, not just our
+# entry. Already in the dependency tree, so pinning it direct does not
+# change resolution.
+toml_edit = "0.25"
+# `termic://` URL scheme (GH #192): lets external systems open Termic on a
+# pre-filled New Task dialog. Registers CFBundleURLTypes on macOS and the
+# registry key on Windows, and hands us the URL through one callback for
+# both the cold-start and already-running cases.
+tauri-plugin-deep-link = "2"
 # Wire types + framing for the CLI control socket (cli_server.rs). The
 # same crate termic-cli links, so server and client cannot drift.
 termic-proto = { path = "../termic-proto" }
@@ -83,6 +96,11 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRe
 
 [dev-dependencies]
 tempfile = "3"
+# Parity test only (mcp_server): asserts every MCP tool and param maps
+# onto the clap surface machine_help() reflects, so the two presentations
+# cannot drift silently. NEVER a runtime dependency: the app must not
+# link the CLI (clap, socket client); the dependency stays test-only.
+termic-cli = { path = "../termic-cli" }
 
 # The WebdriverIO e2e harness, behind an opt-in feature so it is NEVER in a
 # normal dev or release build. `tauri-plugin-wdio-webdriver` embeds a W3C

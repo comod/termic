@@ -5,13 +5,20 @@ The canonical instructions for teaching ANY coding agent to use the
 `AGENTS.md` (read by codex, gemini, cursor and friends), a `CLAUDE.md`,
 or any agent's instruction channel, unchanged. The runtime discovery
 floor needs none of this: spawned task PTYs carry `TERMIC_CLI` (binary
-path) and `TERMIC_CLI_HELP` (a two-line version of these rules), and
+path) and `TERMIC_CLI_HELP` (a condensed version of these rules), and
 `termic help --json` returns the whole surface machine-readably.
 
 Distribution (a Settings action that appends/installs the block for
-the user's agent setup) is still pending (see docs/plans/cli.md,
-"Agents as users"). Until then, users paste it. Keep this file in
-lockstep with `termic help`.
+the user's agent setup) is still pending; the plan that tracked it was
+retired when the CLI shipped. Until then, users paste it. To point ONE
+agent at ONE task there is a short fragment instead: the task menu's
+"Copy agent CLI briefing" (`src/lib/agentBriefing.ts`), which carries
+the address and nothing else. Keep this file in lockstep with `termic
+help`.
+
+Why caged agents are excluded from all of this, and why the narrow
+versions of "just let them report back" do not work either, is settled
+in [sandbox.md](sandbox.md) ("Settled"). Do not reopen it here.
 
 Everything between the markers is the instructions content, verbatim.
 
@@ -30,43 +37,103 @@ code. `$TERMIC_TASK` / `$TERMIC_TASK_ID` name the task you are running
 inside, if any; prefer the id for self-reference (names can be renamed
 or reused).
 
+### Talking to another agent: prompt, do not wait
+
+Every task is an agent with an inbox, and `send` is how you reach it.
+Two agents coordinate by prompting each other, NOT by blocking on each
+other. When you hand out work, end the prompt with the command you want
+run once that work is done, and let the receiving agent pick the moment:
+
+    "$TERMIC_CLI" send review-auth -p "<your prompt here: what you want it
+    to do>. When done: \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p 'done:
+    <what you did>'"
+
+The outer DOUBLE quotes are load-bearing: YOUR shell expands
+`$TERMIC_TASK_ID` at send time, so the other agent receives a literal
+address it can just run. Single quotes there would block expansion and
+leave it guessing at where to reply. `\$TERMIC_CLI` is escaped for the
+opposite reason: the OTHER agent expands its own copy of that one.
+
+A prompt arriving in your own terminal is one of those reports; act on
+it and reply the same way. This is the preferred protocol because it
+costs neither side its liveness, and because it does not depend on
+work-done detection.
+
+Prefer it over `--wait`. `--wait` blocks you on a heuristic (a settled
+terminal is a guess, not a finished job), and a blocked agent can answer
+nothing else meanwhile. Use it only for a short, self-contained step you
+genuinely have nothing else to do during, and branch on its exit codes:
+0 = settled done, 3 = stopped needing input, 7 = your --timeout expired
+(the task keeps running), 9 = the prompt was never delivered. Never
+assume 0, and remember exit 0 means the agent STOPPED, not that the work
+is right.
+
+If you are NOT running inside a Termic task you have no inbox to be
+prompted back at. Then ask for a file (below) and read it when you next
+have a reason to, rather than blocking.
+
+A task sandboxed in `enforce` / `enforce-fs` cannot take part at all: the
+cage denies it the control plane, so it can neither be asked to report
+back nor do so. That is deliberate and permanent, not a bug to work
+around - a cage with a text channel to an uncaged agent is not a cage.
+Ask such a task for a file in its worktree and read that yourself, or
+run it in `monitor` (which reaches the CLI by contract) or uncaged.
+
+The sidebar's task menu has "Copy agent CLI briefing", which puts one
+task's id, directory and that exact command shape on the clipboard as a
+short fragment, ready to paste into a prompt for another agent. It
+deliberately does NOT repeat the protocol above, because you are reading
+it here and in `$TERMIC_CLI_HELP` already. It keeps exactly one sentence
+the help does not have: leave the outer double quotes and
+`$TERMIC_TASK_ID` alone. The reader is an agent that rewrites the line
+to slot its own prompt in, and mangling either kills the reply address
+with no error.
+
 ### Creating a task that produces a result
 
 The file-drop convention is the reliable floor: instruct the created
 agent, in the prompt, to write its deliverable to a named file, then
-read that file after the wait succeeds. (`result` and `logs` below can
-read a claude agent's last message / the rendered terminal stream, but
-the file you asked for is the deliverable you verify.)
+read that file. (`result` and `logs` below can read a claude agent's last
+message / the rendered terminal stream, but the file you asked for is
+the deliverable you verify.)
+
+Note which half of the protocol applies. A CAGED task cannot report
+back, so the file is the whole channel and you read it on your own
+schedule:
 
     out=$("$TERMIC_CLI" new review-auth --project myproj \
-      --sandbox enforce --json --wait \
+      --sandbox enforce --json \
       -p "Review the auth module. Write your complete findings to
           RESULT.md in the repo root. Make no other changes.")
-    code=$?
     path=$(echo "$out" | jq -r .task.path)
-    [ "$code" -eq 0 ] && cat "$path/RESULT.md"
+    # Caged, so nothing will arrive to tell you it finished: get on with
+    # your own work and read "$path/RESULT.md" when you next need it.
+
+An UNCAGED task (or `--sandbox monitor`) can do both: write the file AND
+tell you it did, so you are not left checking.
+
+    "$TERMIC_CLI" new review-auth --project myproj --yolo \
+      -p "Review the auth module. Write RESULT.md, change nothing else.
+          When done: \"\$TERMIC_CLI\" send $TERMIC_TASK_ID -p 'done:
+          <what you did>'"
 
 Rules that matter:
 
 - Unattended tasks need `--sandbox enforce` (permission prompts
   self-approve inside the sandbox) or `--yolo` (no sandbox, skips
   permissions; prefer the sandbox). Otherwise the agent stops at its
-  first permission prompt.
-- `--wait` exit codes are the contract: 0 = agent settled done,
-  3 = agent stopped and needs input, 7 = your --timeout expired
-  (task keeps running), 9 = the prompt was never delivered. Branch on
-  them; never assume 0.
-- Exit 0 means the agent STOPPED, not that the work is correct.
-  Verify the deliverable file exists and says what you need.
+  first permission prompt. The sandbox costs you the report-back, per
+  the section above: that is the trade, pick per task.
 - Task names must be unique per project; a duplicate name is a clean
   error, so pick a fresh name or archive the old task first.
 
 ### Driving an existing task
 
-- `"$TERMIC_CLI" send <task> -p "<text>" --wait` - prompt the RUNNING
+- `"$TERMIC_CLI" send <task> -p "<text>"` - prompt the RUNNING
   agent (queues if it is mid-turn). With no agent running, add
   `--resume` (restore the last session) or `--fresh` (new agent, no
-  context). `-p -` reads stdin. Same exit-code contract as `new --wait`.
+  context). `-p -` reads stdin. This is the notification channel above:
+  ask for a report back rather than adding `--wait`.
 - A task can hold SEVERAL agent tabs. `"$TERMIC_CLI" tab <task>
   --agent <id> -p "<text>"` opens one and prompts it; record the
   printed tab id and pass `--tab <id>` to `send`/`wait`/`logs` to keep
@@ -97,7 +164,8 @@ Rules that matter:
 - `"$TERMIC_CLI" list --json` - all tasks with live work state
   (working / waiting / done / idle / inactive).
 - `"$TERMIC_CLI" wait <task> --timeout 10m` - block until an existing
-  task's agent is quiescent (settled AND empty message queue).
+  task's agent is quiescent (settled AND empty message queue). Last
+  resort; see "Talking to another agent" above for why.
 - `"$TERMIC_CLI" status <task> --json` - one task in depth.
 - `"$TERMIC_CLI" prompts --json` - the user's prompt library. Pass a
   prompt to `new`/`send`/`tab` with `-P <id>` (e.g. `-P builtin:review`);

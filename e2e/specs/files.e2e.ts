@@ -20,7 +20,7 @@ declare global {
 // unreliable and Tauri intercepts it for file drops), so the spec can drive it
 // with synthetic pointer events through the app's real handlers.
 describe("drag a file onto a terminal", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
   });
@@ -180,7 +180,7 @@ describe("drag a file onto a terminal", () => {
 // P1: the file finder (⌘P). Cases: opens and lists the repo's files; selecting
 // a result opens an editor tab for that file.
 describe("file finder", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     await browser.execute(() =>
       window.__termic!.useUI.getState().closeFileFinder(),
@@ -230,11 +230,14 @@ describe("file finder", () => {
   });
 });
 
-// P1: find-in-files (⇧⌘F) streams git-grep results. Cases: opens with an
-// input; a query that matches the fixture README returns a result row; the
-// regexp toggle switches git grep from -F to -E; the Aa toggle drops the -i.
+// P1: find-in-files (⇧⌘F) streams results from ripgrep, or git grep where rg
+// isn't installed (GH #181). Cases: opens with an input; the dialog names the
+// backend that actually ran and offers the install hint only on the fallback;
+// a query that matches the fixture README returns a result row with the match
+// highlighted; the regexp toggle switches literal → pattern; Aa drops the
+// case folding.
 describe("find in files", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     await browser.execute(() => {
       window.__termic!.useUI.getState().closeFindInFiles();
@@ -290,6 +293,36 @@ describe("find in files", () => {
     );
   });
 
+  // Which backend runs depends on the machine (CI runners and dev Macs
+  // differ), and it's fixed for the life of the process, so the invariant
+  // worth pinning is agreement: the dialog must describe the backend that
+  // actually ran, and the "install rg" nudge must never appear to someone
+  // who already has it.
+  it("names the backend it searched with", async () => {
+    const backend = await browser.execute(async () => {
+      const info = (await window.__termic!.invoke("task_find_backend")) as {
+        backend: string;
+        settled: boolean;
+      };
+      return info.backend;
+    });
+    expect(["ripgrep", "git-grep"]).toContain(backend);
+
+    const wanted = backend === "ripgrep" ? "ripgrep" : "git grep";
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => document.querySelector('[data-testid="fif-status"]')?.textContent ?? "",
+        )).includes(wanted),
+      { timeout: 10_000, timeoutMsg: `status line never named ${wanted}` },
+    );
+
+    const hasHint = await browser.execute(
+      () => !!document.querySelector('[data-testid="fif-rg-hint"]'),
+    );
+    expect(hasHint).toBe(backend === "git-grep");
+  });
+
   it("returns a match for a query present in the repo", async () => {
     // "fixture" is in the committed README ("# e2e fixture").
     await type("fixture");
@@ -299,6 +332,17 @@ describe("find in files", () => {
       timeoutMsg: "no result row for the query",
     });
     await snap("find-in-files.png");
+  });
+
+  // The match ranges come from ripgrep itself and from a JS re-match on the
+  // git grep fallback. Either way the row has to paint the hit, so this
+  // guards the seam without caring which side produced it.
+  it("highlights the matched text inside the row", async () => {
+    const marks = await browser.execute(() =>
+      [...document.querySelectorAll('[data-testid="fif-results"] [data-row] b')]
+        .map((b) => b.textContent?.toLowerCase() ?? ""),
+    );
+    expect(marks).toContain("fixture");
   });
 
   // "^# e2e" only matches the committed README as a pattern; as a literal
@@ -358,7 +402,7 @@ describe("find in files", () => {
 const fixture = process.env.E2E_FIXTURE ?? path.join(process.cwd(), ".e2e", "fixture-repo");
 
 describe("file tree", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
     execSync(`git -C "${fixture}" clean -fd`);
@@ -455,6 +499,168 @@ describe("file tree", () => {
     expect(await rowExists("e2e-refresh/one.txt")).toBe(true);
   });
 
+  // GH #159: a directory read that fails must not leave the row showing
+  // "Loading…" forever. Two halves of the same invariant, both driven by
+  // chmod 000 (read_dir fails with EACCES, deterministically):
+  //   - a failure on a settle reload keeps the listing the tree already had,
+  //     instead of dropping the key and rendering a spinner with nothing coming,
+  //   - a failure on first expand says so and offers a retry.
+  it("keeps a folder's contents when a settle reload cannot read it", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = taskId ?? (await openTask("e2e-tree"));
+
+    const dir = path.join(fixture, "e2e-unreadable");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "kid.txt"), "k\n");
+    await browser.execute(
+      (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
+      taskId,
+    );
+    await browser.waitUntil(() => rowExists("e2e-unreadable"), {
+      timeout: 10_000,
+      timeoutMsg: "the new folder never appeared in the tree",
+    });
+
+    await clickRow("e2e-unreadable");
+    await browser.waitUntil(() => rowExists("e2e-unreadable/kid.txt"), {
+      timeout: 8_000,
+      timeoutMsg: "expanding the folder did not reveal its child",
+    });
+
+    // The folder becomes unreadable, then an agent settles. Before the fix the
+    // reload dropped the failed key from the whole-map replace and the row
+    // went to a permanent "Loading…". The sibling file is what makes this bite:
+    // the reload skips the whole update when nothing it re-read changed, so the
+    // root listing has to differ for the merge to be exercised at all.
+    execSync(`chmod 000 "${dir}"`);
+    writeFileSync(path.join(fixture, "e2e-unreadable-sibling.txt"), "s\n");
+    try {
+      await browser.execute(
+        (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
+        taskId,
+      );
+      // The sibling landing proves the reload ran and updated the tree.
+      await browser.waitUntil(() => rowExists("e2e-unreadable-sibling.txt"), {
+        timeout: 10_000,
+        timeoutMsg: "the settle reload never landed",
+      });
+      // The unreadable folder kept the listing it already had.
+      expect(await rowExists("e2e-unreadable/kid.txt")).toBe(true);
+    } finally {
+      execSync(`chmod 755 "${dir}"`);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(path.join(fixture, "e2e-unreadable-sibling.txt"), { force: true });
+  });
+
+  it("offers a retry when a folder cannot be read at all", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = taskId ?? (await openTask("e2e-tree"));
+
+    const dir = path.join(fixture, "e2e-denied");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "kid.txt"), "k\n");
+    execSync(`chmod 000 "${dir}"`);
+    try {
+      await browser.execute(
+        (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
+        taskId,
+      );
+      await browser.waitUntil(() => rowExists("e2e-denied"), {
+        timeout: 10_000,
+        timeoutMsg: "the new folder never appeared in the tree",
+      });
+
+      // Expand: the read fails (once, then the automatic retry), so the row
+      // says so instead of spinning.
+      await clickRow("e2e-denied");
+      const errorRow = () =>
+        browser.execute(
+          () => !!document.querySelector('[data-testid="dir-read-failed"][data-dir="e2e-denied"]'),
+        );
+      await browser.waitUntil(errorRow, {
+        timeout: 10_000,
+        timeoutMsg: "an unreadable folder never showed its retry row",
+      });
+
+      // And it says WHAT failed, not just that something did (GH #250): the
+      // headline names the errno and the raw message names the path.
+      const reason = await browser.execute(
+        () => {
+          const el = document.querySelector('[data-testid="dir-read-failed"][data-dir="e2e-denied"]') as HTMLElement;
+          return { short: el.dataset.reason, title: el.title };
+        },
+      );
+      expect(reason.short).toBe("Permission denied");
+      expect(reason.title).toContain("e2e-denied");
+      expect(reason.title).toContain("os error 13");
+
+      // Make it readable and click Retry: the contents arrive, no collapse
+      // and re-expand needed.
+      execSync(`chmod 755 "${dir}"`);
+      await browser.execute(() =>
+        (document.querySelector('[data-testid="dir-read-failed"][data-dir="e2e-denied"]') as HTMLElement).click(),
+      );
+      await browser.waitUntil(() => rowExists("e2e-denied/kid.txt"), {
+        timeout: 8_000,
+        timeoutMsg: "Retry did not load the folder once it was readable again",
+      });
+    } finally {
+      execSync(`chmod 755 "${dir}"`);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A folder that is a symlink OUT of the task reads as a directory but can
+  // never be listed: safe_task_path canonicalizes and rejects it. Retrying is
+  // hopeless, so the row has to say why (GH #250). This is also the shape a
+  // permanently-stuck folder takes in a real repo (a linked vendor dir, a
+  // shared cache), which is the leading suspect for that report.
+  it("says a folder links outside the task instead of offering a pointless retry", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = taskId ?? (await openTask("e2e-tree"));
+
+    const outside = path.join(fixture, "..", "e2e-outside-target");
+    const link = path.join(fixture, "e2e-escaped");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(path.join(outside, "secret.txt"), "s\n");
+    execSync(`ln -sfn "${outside}" "${link}"`);
+    try {
+      await browser.execute(
+        (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
+        taskId,
+      );
+      await browser.waitUntil(() => rowExists("e2e-escaped"), {
+        timeout: 10_000,
+        timeoutMsg: "the symlinked folder never appeared in the tree",
+      });
+
+      await clickRow("e2e-escaped");
+      await browser.waitUntil(
+        () =>
+          browser.execute(
+            () => !!document.querySelector('[data-testid="dir-read-failed"][data-dir="e2e-escaped"]'),
+          ),
+        { timeout: 10_000, timeoutMsg: "the escaping folder never showed its error row" },
+      );
+      const reason = await browser.execute(
+        () => {
+          const el = document.querySelector('[data-testid="dir-read-failed"][data-dir="e2e-escaped"]') as HTMLElement;
+          return { short: el.dataset.reason, title: el.title };
+        },
+      );
+      expect(reason.short).toBe("This folder links outside the task");
+      expect(reason.title).toContain("path escapes task");
+      expect(reason.title).toContain("e2e-outside-target");
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   // Clicking an image in the tree must render the picture, not an empty pane:
   // the tab routes to PreviewPane (previewKindForPath) and the bytes arrive as
   // base64 over taskFileReadBase64. The fixture's committed shot.png is the
@@ -516,7 +722,7 @@ describe("file tree", () => {
 // `open_file_external` in lib.rs): the suite must not launch Blender, and the
 // reveal fallback would pop a Finder window over the window under test.
 describe("open a file in its default app", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   const openedLog = path.join(process.cwd(), ".e2e", "profile", "e2e-opened.log");
 
   after(async () => {

@@ -1,8 +1,38 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { archiveTask, clickByText, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible } from "../helpers";
+import { archiveTask, clickByText, clickMenuItem, clickWhenVisible, dismissOverlays, ensureActiveTask, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitForWorkBadge, waitGone, waitVisible } from "../helpers";
+
+// Click a button by its exact text inside the NewTaskDialog specifically
+// (scoped via the name input's dialog — there can be more than one
+// [role="dialog"] in the DOM). Waits for the button first: the dialog renders
+// progressively (the mode toggle lands after an async worktree scan). Module
+// scope so both "create task wizard" and "worktree task" below can drive the
+// real dialog instead of the IPC shortcut.
+async function clickDialogButton(text: string): Promise<void> {
+  await browser.waitUntil(
+    () =>
+      browser.execute((t) => {
+        const dlg = document
+          .querySelector('input[placeholder="fix login bug"]')
+          ?.closest('[role="dialog"]');
+        return [...(dlg?.querySelectorAll("button") ?? [])].some(
+          (b) => b.textContent?.trim() === t,
+        );
+      }, text),
+    { timeout: 8_000, timeoutMsg: `dialog button never appeared: ${text}` },
+  );
+  await browser.execute((t) => {
+    const dlg = document
+      .querySelector('input[placeholder="fix login bug"]')
+      ?.closest('[role="dialog"]');
+    const btn = [...(dlg?.querySelectorAll("button") ?? [])].find(
+      (b) => b.textContent?.trim() === t,
+    );
+    (btn as HTMLElement).click();
+  }, text);
+}
 
 // P0: create a task through the real NewTaskDialog wizard (the primary user
 // path; the other specs take the IPC shortcut). Uses the shell ("Terminal")
@@ -10,38 +40,10 @@ import { archiveTask, clickByText, dismissOverlays, openTask, pointerDrag, requi
 // Everything is scoped to the dialog: the app footer also has a "Terminal"
 // button, so an unscoped text match would hit the wrong control.
 describe("create task wizard", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
   });
-
-  // Click a button by its exact text inside the NewTaskDialog specifically
-  // (scoped via the name input's dialog — there can be more than one
-  // [role="dialog"] in the DOM). Waits for the button first: the dialog renders
-  // progressively (the mode toggle lands after an async worktree scan).
-  const clickDialogButton = async (text: string) => {
-    await browser.waitUntil(
-      () =>
-        browser.execute((t) => {
-          const dlg = document
-            .querySelector('input[placeholder="fix login bug"]')
-            ?.closest('[role="dialog"]');
-          return [...(dlg?.querySelectorAll("button") ?? [])].some(
-            (b) => b.textContent?.trim() === t,
-          );
-        }, text),
-      { timeout: 8_000, timeoutMsg: `dialog button never appeared: ${text}` },
-    );
-    await browser.execute((t) => {
-      const dlg = document
-        .querySelector('input[placeholder="fix login bug"]')
-        ?.closest('[role="dialog"]');
-      const btn = [...(dlg?.querySelectorAll("button") ?? [])].find(
-        (b) => b.textContent?.trim() === t,
-      );
-      (btn as HTMLElement).click();
-    }, text);
-  };
 
   it("creates a repo-root shell task via NewTaskDialog", async () => {
     await waitForAppShell();
@@ -104,6 +106,79 @@ describe("create task wizard", () => {
 
     await snap("create-wizard.png");
   });
+
+  // GH #242: worktree creation used to lock the whole window behind this
+  // dialog until `git worktree add` + the file copy finished. Prove the fix
+  // at the UI level — the dialog is gone the instant Create is clicked, not
+  // once the worktree is actually ready. Worktree mode this time (not
+  // repo-root): that's the path that used to block.
+  it("closes the dialog immediately on Create, before the worktree is ready", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+
+    await browser.execute(() => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      window.__termic!.useUI.getState().openNewTask(proj.id);
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          () =>
+            !!document.querySelector(
+              '[role="dialog"] input[placeholder="fix login bug"]',
+            ),
+        ),
+      { timeout: 8_000, timeoutMsg: "NewTaskDialog never opened" },
+    );
+
+    await clickDialogButton("Worktree");
+    await browser.execute(() => {
+      const input = document.querySelector(
+        '[role="dialog"] input[placeholder="fix login bug"]',
+      ) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "e2e-wizard-wt");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await clickDialogButton("Terminal");
+    await clickDialogButton("Create");
+
+    // The dialog closes synchronously with the click — it does not await
+    // `taskCreate` first. A short timeout is the point: this must not need
+    // to wait anywhere near as long as a real worktree add would take.
+    await waitGone('[role="dialog"] input[placeholder="fix login bug"]', 2_000);
+
+    // ...and the worktree still lands once it's actually ready.
+    await browser.waitUntil(
+      () =>
+        browser.execute(() =>
+          window.__termic!.useApp
+            .getState()
+            .tasks.some((t: any) => t.name === "e2e-wizard-wt" && !t.archived),
+        ),
+      { timeout: 15_000, timeoutMsg: "worktree task never landed after the dialog closed early" },
+    );
+    const wtTaskId: string = await browser.execute(
+      () =>
+        window.__termic!.useApp
+          .getState()
+          .tasks.find((t: any) => t.name === "e2e-wizard-wt" && !t.archived)?.id,
+    );
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskArchive(id, true); // deleteBranch
+      await window.__termic!.useApp.getState().loadAll();
+    }, wtTaskId);
+    try {
+      execSync(`git -C "${fixture}" worktree prune`);
+    } catch {
+      /* already gone */
+    }
+  });
 });
 
 // The single most important flow in termic: create a task in a project and
@@ -111,7 +186,7 @@ describe("create task wizard", () => {
 // git-worktree/checkout setup, the Rust PTY spawn, and tab/store wiring.
 // Uses `fakeagent` (a claude-like fixture CLI, zero tokens).
 describe("task spawn", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
 
   // Keep the profile clean across repeated runs: archive the task we created
   // (kills its PTY, moves it off the active board). Repo-root task, so archive
@@ -285,6 +360,330 @@ describe("task archive", () => {
   });
 });
 
+// P0: the archive confirmation's "Show this every time" opt-out (issue #102 -
+// ticked by default, unticking is what opts out). All three halves are pinned
+// here: backing out must NOT store the opt-out, confirming with it unticked
+// must store BOTH it and the delete-branch answer, and a later archive must
+// then run silently with that stored branch answer.
+describe("archive confirmation", () => {
+  const ARCHIVE_REPO = path.join(process.cwd(), ".e2e", "fixture-repo");
+  // Deliberately NOT the task names below: the dialog title is
+  // `Archive "<task name>"?`, so a branch named after its task would satisfy
+  // the "names the branch" assertion even if the branch code block never
+  // rendered at all.
+  const BRANCH_A = "wt-ask-alpha";
+  const BRANCH_B = "wt-silent-beta";
+  let prefsOriginal: { confirm: boolean; deleteBranch: boolean } | undefined;
+  // The first case creates it and backs out of archiving it; the second one
+  // then archives that same task for real.
+  let askTaskId = "";
+
+  /** Create a worktree task on `branch` and make it the active one, so the
+   *  unified bar's archive button acts on it. A worktree task (not a repo-root
+   *  entry) is what puts the delete-branch checkbox in the dialog. */
+  const createWorktreeTask = (name: string, branch: string) =>
+    browser.execute(async (n, b) => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      const task = await t.ipc.taskCreate({
+        project_id: proj.id, name: n, cli: "fakeagent", base_branch: "main", branch: b,
+      });
+      await t.useApp.getState().loadAll();
+      t.useApp.getState().setActiveTask((task as any).id);
+      return (task as any).id as string;
+    }, name, branch);
+
+  /** The archive dialog, found by its title. Never a bare [role="dialog"]:
+   *  a closing dialog from an earlier case can still be in the DOM. */
+  const dialogText = () =>
+    browser.execute(() =>
+      [...document.querySelectorAll('[role="dialog"]')]
+        .find((d) => d.textContent?.includes("Archive \""))?.textContent ?? "");
+
+  /** Click a control inside the archive dialog by testid. */
+  const clickInDialog = (testid: string) =>
+    browser.execute((id) => {
+      const dlg = [...document.querySelectorAll('[role="dialog"]')]
+        .find((d) => d.textContent?.includes("Archive \""));
+      if (!dlg) throw new Error("archive dialog not open");
+      const el = dlg.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
+      if (!el) throw new Error(`no ${id} in the archive dialog`);
+      el.click();
+    }, testid);
+
+  const waitForArchiveDialog = () =>
+    browser.waitUntil(async () => (await dialogText()).includes("Archive \""), {
+      timeout: 10_000, timeoutMsg: "archive dialog never opened",
+    });
+
+  const archivePrefs = () =>
+    browser.execute(() => {
+      const p = window.__termic!.usePrefs.getState();
+      return { confirm: p.confirmBeforeArchiveTask, deleteBranch: p.archiveDeleteBranch };
+    });
+
+  const isArchived = (id: string) =>
+    browser.execute((i) =>
+      window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.archived === true, id);
+
+  const branchExists = (branch: string) => {
+    try {
+      execSync(`git -C "${ARCHIVE_REPO}" rev-parse --verify refs/heads/${branch}`, { stdio: "ignore" });
+      return true;
+    } catch { return false; }
+  };
+
+  /** Drop this describe's two branches and any worktree still registered for
+   *  them. Runs BEFORE as well as after: an interrupted run leaves the branch
+   *  behind, and `task_create` then fails on a name it cannot reuse. */
+  const dropBranches = () => {
+    try { execSync(`git -C "${ARCHIVE_REPO}" worktree prune`); } catch { /* nothing to prune */ }
+    for (const b of [BRANCH_A, BRANCH_B]) {
+      try { execSync(`git -C "${ARCHIVE_REPO}" branch -D ${b}`, { stdio: "ignore" }); } catch { /* already gone */ }
+    }
+  };
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    prefsOriginal = await archivePrefs();
+    dropBranches();
+  });
+
+  after(async () => {
+    // Prefs persist to the shared profile — a leaked opt-out would make every
+    // later archive in the run skip its dialog.
+    if (prefsOriginal) {
+      await browser.execute((o) => {
+        const p = window.__termic!.usePrefs.getState();
+        p.setConfirmBeforeArchiveTask(o.confirm);
+        p.setArchiveDeleteBranch(o.deleteBranch);
+      }, prefsOriginal);
+    }
+    dropBranches();
+  });
+
+  it("keeps asking when the user unticks the box but then cancels", async () => {
+    await browser.execute(() => {
+      const p = window.__termic!.usePrefs.getState();
+      p.setConfirmBeforeArchiveTask(true);
+      p.setArchiveDeleteBranch(false);
+    });
+    askTaskId = await createWorktreeTask("e2e-archive-ask", BRANCH_A);
+    expect(branchExists(BRANCH_A)).toBe(true);
+
+    await clickWhenVisible('[data-testid="archive-task"]');
+    await waitForArchiveDialog();
+    // The worktree variant offers the branch by name, so the user can see
+    // exactly what "Delete the git branch" would remove.
+    expect(await dialogText()).toContain(BRANCH_A);
+
+    // Unticking "Show this every time" is the opt-out; the branch box is the
+    // separate delete-the-branch answer.
+    await clickInDialog("confirm-show-every-time");
+    await clickInDialog("confirm-checkbox");
+    await clickInDialog("confirm-cancel");
+
+    // Nothing was archived, and nothing was remembered: the dialog reports the
+    // checkbox state at dismissal, so a cancelled archive must not store it.
+    expect(await isArchived(askTaskId)).toBe(false);
+    expect(await archivePrefs()).toEqual({ confirm: true, deleteBranch: false });
+    await snap("archive-confirm-cancelled.png");
+  });
+
+  it("stores the opt-out and the branch answer when the archive goes through", async () => {
+    await ensureActiveTask(askTaskId);
+
+    await clickWhenVisible('[data-testid="archive-task"]');
+    await waitForArchiveDialog();
+    await clickInDialog("confirm-show-every-time");
+    await clickInDialog("confirm-checkbox");
+    await clickInDialog("confirm-ok");
+
+    await browser.waitUntil(() => isArchived(askTaskId), {
+      timeout: 15_000, timeoutMsg: "task never became archived",
+    });
+    expect(await archivePrefs()).toEqual({ confirm: false, deleteBranch: true });
+    expect(branchExists(BRANCH_A)).toBe(false);
+  });
+
+  it("archives with no dialog afterwards, honouring the stored branch answer", async () => {
+    const taskId = await createWorktreeTask("e2e-archive-silent", BRANCH_B);
+    expect(branchExists(BRANCH_B)).toBe(true);
+
+    await clickWhenVisible('[data-testid="archive-task"]');
+
+    await browser.waitUntil(() => isArchived(taskId), {
+      timeout: 15_000, timeoutMsg: "silent archive never landed",
+    });
+    // No confirmation was ever shown, and the branch went with it because
+    // that is what the user answered when they unticked "Show this every
+    // time".
+    expect(await dialogText()).toBe("");
+    expect(branchExists(BRANCH_B)).toBe(false);
+    // With no dialog, the toast is the only feedback and the only pointer to
+    // where the task went (issue #102). Assert the rendered toast, not the
+    // store: the [role="status"] node is the part the user actually reads.
+    await browser.waitUntil(
+      () =>
+        browser.execute(() =>
+          [...document.querySelectorAll('[role="status"]')].some((t) =>
+            (t as HTMLElement).innerText.includes("History"),
+          ),
+        ),
+      { timeout: 10_000, timeoutMsg: "a silent archive showed no toast pointing at History" },
+    );
+    await snap("archive-silent.png");
+  });
+});
+
+// P0: archiving must not lock the window (GH #246). It used to raise the same
+// full-screen `fixed inset-0` click-blocker `ui.setBusy` puts up for anything
+// else, and hold it for the whole archive: the project's archive script, then
+// `git worktree remove`, then an `fs::remove_dir_all` over node_modules. Every
+// other task's agent kept working behind it, unreachable. Two halves are
+// pinned here: a real archive never raises the overlay, and while one is in
+// flight the task's own sidebar row is what says so.
+describe("non-blocking archive (GH #246)", () => {
+  const ARCHIVE_REPO = path.join(process.cwd(), ".e2e", "fixture-repo");
+  const BRANCH = "wt-nonblocking-archive";
+  let prefsOriginal: { confirm: boolean; deleteBranch: boolean } | undefined;
+  let taskId = "";
+
+  const createWorktreeTask = (name: string, branch: string) =>
+    browser.execute(async (n, b) => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      const task = await t.ipc.taskCreate({
+        project_id: proj.id, name: n, cli: "fakeagent", base_branch: "main", branch: b,
+      });
+      await t.useApp.getState().loadAll();
+      t.useApp.getState().setActiveTask((task as any).id);
+      return (task as any).id as string;
+    }, name, branch);
+
+  const isArchived = (id: string) =>
+    browser.execute((i) =>
+      window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.archived === true, id);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    prefsOriginal = await browser.execute(() => {
+      const p = window.__termic!.usePrefs.getState();
+      return { confirm: p.confirmBeforeArchiveTask, deleteBranch: p.archiveDeleteBranch };
+    });
+  });
+
+  after(async () => {
+    if (prefsOriginal) {
+      await browser.execute((o) => {
+        const p = window.__termic!.usePrefs.getState();
+        p.setConfirmBeforeArchiveTask(o.confirm);
+        p.setArchiveDeleteBranch(o.deleteBranch);
+      }, prefsOriginal);
+    }
+    // Never leave a seeded archiving flag behind: it would render every later
+    // spec's row for that task inert.
+    await browser.execute(() => {
+      const a = window.__termic!.useArchivingTasks.getState();
+      for (const id of Object.keys(a.ids)) a.end(id);
+    });
+    try { execSync(`git -C "${ARCHIVE_REPO}" worktree prune`); } catch { /* nothing to prune */ }
+    try { execSync(`git -C "${ARCHIVE_REPO}" branch -D ${BRANCH}`, { stdio: "ignore" }); } catch { /* already gone */ }
+  });
+
+  it("confirming closes the dialog and never raises the full-window overlay", async () => {
+    await browser.execute(() => {
+      const p = window.__termic!.usePrefs.getState();
+      p.setConfirmBeforeArchiveTask(true);
+      p.setArchiveDeleteBranch(true);
+    });
+    taskId = await createWorktreeTask("e2e-archive-nonblocking", BRANCH);
+
+    await clickWhenVisible('[data-testid="archive-task"]');
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() =>
+          [...document.querySelectorAll('[role="dialog"]')]
+            .some((d) => d.textContent?.includes("Archive \"")))),
+      { timeout: 10_000, timeoutMsg: "archive dialog never opened" },
+    );
+    await browser.execute(() => {
+      const dlg = [...document.querySelectorAll('[role="dialog"]')]
+        .find((d) => d.textContent?.includes("Archive \""));
+      (dlg!.querySelector('[data-testid="confirm-ok"]') as HTMLElement).click();
+    });
+
+    // Poll to completion, checking the overlay on EVERY sample rather than
+    // once at the end: the old code held it up from the confirm click until
+    // `task_archive` + `loadAll` had both returned, which is well over one
+    // sampling interval even on this fixture.
+    let sawOverlay = false;
+    await browser.waitUntil(
+      async () => {
+        if (await browser.execute(() => !!document.querySelector('[data-testid="busy-overlay"]'))) {
+          sawOverlay = true;
+        }
+        return await isArchived(taskId);
+      },
+      { interval: 50, timeout: 20_000, timeoutMsg: "task never became archived" },
+    );
+    expect(sawOverlay).toBe(false);
+    // The store agrees, in case the overlay ever gains an exit animation that
+    // makes the DOM check lag its state.
+    expect(await browser.execute(() => window.__termic!.useUI.getState().busyMessage)).toBe(null);
+
+    // The task's own row is what went away; the rest of the sidebar (the other
+    // projects and their tasks) is still there and still clickable.
+    await browser.waitUntil(
+      () => browser.execute((id) => !document.querySelector(`[data-sidebar-task-id="${id}"]`), taskId),
+      { timeout: 10_000, timeoutMsg: "the archived task's sidebar row never went away" },
+    );
+  });
+
+  it("shows an inert Archiving row while the archive runs", async () => {
+    // Seeded rather than raced: the fixture's worktree has no node_modules, so
+    // a real archive finishes in the time it takes to look for the row. What
+    // is being pinned is the row a slow archive leaves on screen.
+    const other = await createWorktreeTask("e2e-archiving-row", "wt-archiving-row");
+    await browser.execute((id) => {
+      window.__termic!.useArchivingTasks.getState().begin(id);
+    }, other);
+
+    const row = `[data-sidebar-task-id="${other}"]`;
+    await waitVisible(`${row}[data-task-archiving="true"]`);
+    await waitVisible('[data-testid="archiving-badge"]');
+
+    // Inert: clicking it does not select the task that is being torn down.
+    await browser.execute(() => {
+      window.__termic!.useApp.getState().setActiveTask(null);
+    });
+    await browser.execute((sel) => {
+      (document.querySelector(sel) as HTMLElement).click();
+    }, row);
+    expect(await browser.execute(() => window.__termic!.useApp.getState().activeTaskId)).toBe(null);
+    await snap("archiving-row.png");
+
+    // Clearing the flag hands the row back to the normal TaskRow, kebab and
+    // all — the archiving state is a render mode, not a one-way door.
+    await browser.execute((id) => {
+      window.__termic!.useArchivingTasks.getState().end(id);
+    }, other);
+    await browser.waitUntil(
+      () => browser.execute((sel) =>
+        !!document.querySelector(sel) && !document.querySelector(`${sel}[data-task-archiving="true"]`), row),
+      { timeout: 5_000, timeoutMsg: "the row never came back as a normal task row" },
+    );
+
+    await browser.execute(async (id) => {
+      await window.__termic!.ipc.taskArchive(id, true); // deleteBranch
+      await window.__termic!.useApp.getState().loadAll();
+    }, other);
+    try { execSync(`git -C "${ARCHIVE_REPO}" worktree prune`); } catch { /* nothing to prune */ }
+  });
+});
+
 // P1: emptying the archive from History. It's the one destructive bulk action
 // in the app, so both halves matter: the confirmation must be able to say no,
 // and saying yes must actually wipe the records (not just unlist them).
@@ -347,7 +746,7 @@ describe("empty archive", () => {
 // Completes the task lifecycle: archive -> it appears in History -> restore ->
 // it's active again. Guards the History view's filtering and the restore path.
 describe("task restore", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     // Leave it archived (out of the active board) for the next run.
     if (taskId) await archiveTask(taskId);
@@ -650,7 +1049,7 @@ const fixture = process.env.E2E_FIXTURE ?? path.join(process.cwd(), ".e2e", "fix
 const BRANCH = "e2e-wt-branch";
 
 describe("worktree task", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) {
       await browser.execute(async (id) => {
@@ -786,11 +1185,114 @@ describe("worktree task", () => {
   });
 });
 
+// GH #242: while a task is mid-creation it's represented as a "pending" entry
+// (no real Task exists yet — see src/store/pendingTasks.ts), which the
+// sidebar and main pane render specially (PendingTaskRow / CreatingTaskPane).
+// The dialog-driven case above proves the dialog itself closes immediately;
+// this covers what the app shows during the (usually sub-second, on this
+// fixture) window that leaves open. Seeded directly via usePendingTasks
+// rather than raced against the real worktree add — see the e2e skill's
+// "Reading real app state" section on why a deterministic seed beats racing
+// something this fast.
+describe("task creation, in progress (GH #242)", () => {
+  let pendingId: string | undefined;
+  afterEach(async () => {
+    if (!pendingId) return;
+    await browser.execute((id) => {
+      window.__termic!.usePendingTasks.getState().remove(id);
+    }, pendingId);
+    pendingId = undefined;
+  });
+
+  it("shows a pending sidebar row and a live log in the main pane, with no blocking dialog", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+
+    pendingId = await browser.execute(() => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      const id = crypto.randomUUID();
+      window.__termic!.usePendingTasks.getState().add({
+        id, projectId: proj.id, name: "e2e-pending", cli: "fakeagent",
+      });
+      window.__termic!.usePendingTasks.getState().appendLine(id, "Adding worktree at /tmp/e2e-pending…");
+      window.__termic!.useApp.getState().setActiveTask(id);
+      return id;
+    });
+
+    // Sidebar: a spinner-badged row for the pending task — same badge
+    // surface a real working agent uses.
+    await waitVisible(`[data-sidebar-task-id="${pendingId}"]`);
+    await waitForWorkBadge(pendingId, "working");
+
+    // Main pane: the live creation log, not the Dashboard.
+    await waitForText("e2e-pending");
+    await waitVisible('[data-testid="creating-task-log"]');
+    const logText: string = await browser.execute(
+      () => document.querySelector('[data-testid="creating-task-log"]')?.textContent ?? "",
+    );
+    expect(logText).toContain("Adding worktree");
+
+    // Nothing is blocking: creating a task opens no dialog, which is the
+    // whole point of GH #242.
+    //
+    // What counts is a MODAL dialog, and only one that was not already there.
+    // This window is shared by every spec file: a non-modal palette another
+    // file left open blocks nothing, and Radix defers a dialog's unmount
+    // until its closing animation ends, which never arrives while the window
+    // is occluded. Filtering to `data-state="open"` was still counting both,
+    // so the case failed for leftovers it does not own. A modal is the thing
+    // that would actually lock the window, and `aria-modal` is how the DOM
+    // says so.
+    const blocking = await browser.execute(() =>
+      [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+        .filter((d) => d.getAttribute("data-state") !== "closed")
+        .map((d) => (d as HTMLElement).textContent?.slice(0, 80) ?? ""),
+    );
+    expect(blocking).toEqual([]);
+
+    await snap("creating-task-pending.png");
+  });
+
+  it("turns into a dismissible error state when creation fails", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+
+    pendingId = await browser.execute(() => {
+      const proj = window.__termic!.useApp
+        .getState()
+        .projects.find((p: any) => p.name === "fixture-repo");
+      const id = crypto.randomUUID();
+      window.__termic!.usePendingTasks.getState().add({
+        id, projectId: proj.id, name: "e2e-pending-fail", cli: "fakeagent",
+      });
+      window.__termic!.usePendingTasks.getState().fail(id, "branch already checked out elsewhere");
+      window.__termic!.useApp.getState().setActiveTask(id);
+      return id;
+    });
+
+    await waitForWorkBadge(pendingId, "attention");
+    await waitForText("branch already checked out elsewhere");
+
+    // Dismiss clears both the pending entry and the active selection — no
+    // orphaned row left in the sidebar.
+    await clickByText("Dismiss");
+    await waitForTextGone("branch already checked out elsewhere");
+    const stillPending: boolean = await browser.execute(
+      (id) => id in window.__termic!.usePendingTasks.getState().pending,
+      pendingId,
+    );
+    expect(stillPending).toBe(false);
+    pendingId = undefined; // Dismiss already cleaned it up
+  });
+});
+
 // P1: resuming a closed agent tab. Seeds a closedTabs entry (the same shape the
 // close path snapshots) and drives resumeClosedTab: it must reopen a tab and
 // consume the entry.
 describe("resume closed tab", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
   });
@@ -799,8 +1301,8 @@ describe("resume closed tab", () => {
     await waitForAppShell();
     await requireTermicApi();
     taskId = await openTask("e2e-resume");
-    const before = await browser.execute(
-      (id) => (window.__termic!.useApp.getState().tabs[id] ?? []).length,
+    const before: number = await browser.execute(
+      (id) => (window.__termic!.useApp.getState().tabs[id] ?? []).length as number,
       taskId,
     );
 
@@ -839,7 +1341,19 @@ describe("resume closed tab", () => {
           before,
         ),
       { timeout: 10_000, timeoutMsg: "closed tab was not resumed" },
-    );
+    ).catch(async (e) => {
+      // Which half failed matters and a deadline does not say: the tab never
+      // appeared, or it appeared and a loadAll landing mid-resume replaced the
+      // tab list with the persisted one before the entry was consumed.
+      const state = await browser.execute((id) => {
+        const s = window.__termic!.useApp.getState();
+        return {
+          tabs: (s.tabs[id] ?? []).map((t: any) => ({ type: t.type, title: t.title, cli: t.cli })),
+          closed: (s.closedTabs[id] ?? []).map((c: any) => c.id),
+        };
+      }, taskId);
+      throw new Error(`${(e as Error).message}\n  before=${before} now: ${JSON.stringify(state)}`);
+    });
     await snap("resume-tab.png");
   });
 });
@@ -892,6 +1406,25 @@ describe("agent race", () => {
           await window.__termic!.useApp.getState().loadAll();
         }, id)
         .catch(() => {});
+    }
+    // A race that throws PART WAY through leaves racer 1 created and racer 2
+    // never attempted, and raceAndVerify only records the ids startRace
+    // RETURNS — so the loop above has nothing to delete and the worktree stays
+    // on disk. Sweep by name, which is what the ids would have pointed at.
+    // (Seen once in a full-suite run: racer 1's create reported "a worktree
+    // already lives at …" for its own path, and the directory outlived the
+    // suite.)
+    for (const stale of [remoteName, localName]) {
+      for (const dir of [
+        path.join(process.cwd(), ".e2e", "tasks", "fixture-repo"),
+        path.join(os.homedir(), "termic_dev", "tasks", "fixture-repo"),
+      ]) {
+        try {
+          for (const entry of readdirSync(dir)) {
+            if (entry.startsWith(stale)) rmSync(path.join(dir, entry), { recursive: true, force: true });
+          }
+        } catch { /* the directory may not exist on this machine */ }
+      }
     }
     // taskDelete keeps the branch (deleteBranch=false), so prune the worktrees
     // AND every race branch this describe created, or the fixture accrues them.
@@ -963,16 +1496,81 @@ describe("agent race", () => {
             ptyId: def?.ptyId ?? null,
             lastInputAt: def?.lastInputAt ?? null,
             liveTitle: def?.liveTitle ?? null,
+            // Enough to tell "the pane never mounted" from "it mounted and the
+            // spawn stalled" when this times out, which is the whole question
+            // and is not answerable after the fact from a deadline alone.
+            tabs: (app.tabs[id] ?? []).length,
+            mounted: !!document.querySelector(`[data-task-id="${id}"]`),
+            hasPane: !!document.querySelector(`[data-task-id="${id}"] .xterm`),
+            // Does the task still EXIST, and how long has this document been
+            // alive? A webview that reloaded mid-test comes back with an empty
+            // store and a performance.now() near zero, which reads exactly
+            // like "the racer never started" unless you ask.
+            taskExists: app.tasks.some((t: any) => t.id === id),
+            docAgeMs: Math.round(performance.now()),
           };
         });
       }, ids);
+
+    // Two recorders, because the first one's SILENCE turned out to be the
+    // finding. __raceLog rides in the JS context and notes every change to a
+    // racer's tab list; the token rides in sessionStorage, which survives a
+    // reload that the JS context does not. A timeout that reports an empty
+    // timeline AND a surviving token whose window-side twin is gone did not
+    // watch the tabs close: it watched the page get replaced underneath it.
+    const startedAt = Date.now();
+    await browser.execute((tabIds: string[]) => {
+      const w = window as any;
+      w.__raceLog = [];
+      w.__raceToken = String(Math.round(performance.now()));
+      sessionStorage.setItem("e2e-race-token", w.__raceToken);
+      const app = window.__termic!.useApp;
+      const seen: Record<string, number> = {};
+      w.__raceUnsub = app.subscribe((s: any) => {
+        for (const id of tabIds) {
+          const n = (s.tabs[id] ?? []).length;
+          if (seen[id] !== n) {
+            seen[id] = n;
+            w.__raceLog.push(`${Math.round(performance.now())}ms ${id.slice(0, 8)} tabs=${n} mounted=${s.mountedTasks.has(id)}`);
+          }
+        }
+      });
+    }, ids);
+
+    /** waitUntil's message, with the state that produced it — and the right
+     *  headline when the racers are innocent. */
+    const withRacerState = async (msg: string) => {
+      const page = await browser.execute(() => ({
+        // A token in sessionStorage outlives a reload; its twin on `window`
+        // does not. Disagreement means this is not the document the test
+        // started in.
+        reloaded: (window as any).__raceToken !== sessionStorage.getItem("e2e-race-token"),
+        docAgeMs: Math.round(performance.now()),
+        timeline: (window as any).__raceLog ?? [],
+      })) as { reloaded: boolean; docAgeMs: number; timeline: string[] };
+      const waited = Date.now() - startedAt;
+      const head = page.reloaded
+        ? `the webview reloaded during this test, so the store the assertions read is a fresh one`
+        : msg;
+      return `${head}\n  racers: ${JSON.stringify(await racerTabs())}`
+        + `\n  tab-list timeline: ${JSON.stringify(page.timeline)}`
+        + `\n  waited ${waited}ms, document is ${page.docAgeMs}ms old, reloaded=${page.reloaded}`
+        + (page.reloaded ? `\n  (original failure: ${msg})` : "");
+    };
 
     // 2) Both racers' agents actually spawn: their default tab acquires a live
     //    PTY. This is the "did the hidden/inactive racer boot at all" guard.
     await browser.waitUntil(
       async () => (await racerTabs()).every((t) => !!t.ptyId),
-      { timeout: 20_000, timeoutMsg: "a racer never spawned its agent PTY" },
-    );
+      // 45s, not 20: two worktrees, two PTYs and two agent boots, and this
+      // spec runs about twice as slowly inside a full suite as it does alone
+      // (43s vs 21s locally). Both halves of this wait timed out across two
+      // consecutive full runs, on a different half each time, which is what a
+      // deadline sized for an idle machine looks like rather than a bug. A
+      // generous ceiling costs nothing when it works: waitUntil returns the
+      // moment the condition holds.
+      { timeout: 45_000, timeoutMsg: "a racer never spawned its agent PTY" },
+    ).catch(async (e) => { throw new Error(await withRacerState((e as Error).message)); });
 
     // 3) Both racers receive the prompt after the settle: agentRace stamps
     //    lastInputAt when it injects. This is the core "sits there" guard — an
@@ -980,10 +1578,10 @@ describe("agent race", () => {
     await browser.waitUntil(
       async () => (await racerTabs()).every((t) => !!t.lastInputAt),
       {
-        timeout: 20_000,
+        timeout: 45_000,
         timeoutMsg: "a racer spawned but never received the race prompt",
       },
-    );
+    ).catch(async (e) => { throw new Error(await withRacerState((e as Error).message)); });
 
     // 4) The seeded terminals are real fakeagent PTYs driving claude-style OSC
     //    titles (✳ idle / Braille spinner working), not empty shells. Poll: the
@@ -994,7 +1592,7 @@ describe("agent race", () => {
           (t.liveTitle ?? "").includes("fakeagent"),
         ),
       {
-        timeout: 15_000,
+        timeout: 30_000,
         timeoutMsg: "a racer never published its fakeagent OSC title",
       },
     );
@@ -1442,5 +2040,222 @@ describe("sidebar task drag", () => {
     // And the drag still did something legal: last in its own project.
     const own = await order(fixtureProjectId);
     expect(own[own.length - 1]).toBe(a);
+  });
+});
+
+// Extra named ports (GH #196): tasks created after the project declares
+// port names freeze consecutive name→port pairs from their own block, and
+// two live tasks' blocks never overlap. Asserted on the task records:
+// ports have no DOM surface (the env vars land inside the PTY), and the
+// PTY spawn is rAF-gated on occluded CI windows (see run.e2e.ts).
+describe("extra named ports allocation", () => {
+  let projectId: string;
+  const created: string[] = [];
+
+  const setPorts = (names: string[]) =>
+    browser.execute(async (id, list) => {
+      const t = window.__termic!;
+      const p = t.useApp.getState().projects.find((x: any) => x.id === id);
+      await t.ipc.projectUpdate({ ...p, extra_named_ports: list });
+      await t.useApp.getState().loadAll();
+    }, projectId, names);
+  const taskById = (id: string) =>
+    browser.execute(
+      (tid) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === tid),
+      id,
+    );
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    projectId = await browser.execute(() =>
+      window.__termic!.useApp.getState()
+        .projects.find((p: any) => p.name === "fixture-repo").id as string,
+    );
+    await setPorts(["API_PORT", "DB_PORT"]);
+  });
+
+  after(async () => {
+    for (const id of created) await archiveTask(id);
+    await setPorts([]);
+  });
+
+  it("freezes consecutive named ports from the task's block", async () => {
+    const id = await openTask("e2e-ports-a");
+    created.push(id);
+    const task: any = await taskById(id);
+    // Single-repo task block: base ($TERMIC_PORT), extras at base+1, base+2.
+    expect(task.extra_named_ports).toEqual([
+      { name: "API_PORT", port: task.port + 1 },
+      { name: "DB_PORT",  port: task.port + 2 },
+    ]);
+  });
+
+  it("gives a second live task a non-overlapping block", async () => {
+    const id = await openTask("e2e-ports-b");
+    created.push(id);
+    const a: any = await taskById(created[0]);
+    const b: any = await taskById(id);
+    // Block = 1 base + 2 extras + 5 buffer = 8 ports; the later base must
+    // clear the earlier block entirely (either side).
+    const BLOCK = 8;
+    const clear = b.port >= a.port + BLOCK || a.port >= b.port + BLOCK;
+    expect(clear).toBe(true);
+    // And b's own pairs stay inside b's block, consecutive after its base.
+    expect(b.extra_named_ports.map((np: any) => np.port)).toEqual([b.port + 1, b.port + 2]);
+  });
+
+  it("leaves a task created after the config is cleared without extra ports", async () => {
+    await setPorts([]);
+    const id = await openTask("e2e-ports-none");
+    created.push(id);
+    const task: any = await taskById(id);
+    expect(task.extra_named_ports).toEqual([]);
+  });
+
+  // On-the-fly top-up: names configured AFTER a task exists reach it on
+  // its next spawn via task_ensure_extra_ports (the command every tab
+  // spawn calls). Asserted through the command + record because the env
+  // itself lives inside the PTY (no DOM) and PTY spawn is rAF-gated on
+  // occluded CI windows (see run.e2e.ts).
+  it("tops up an existing task with newly configured names on spawn", async () => {
+    const id = created[2]; // the extras-free task from the previous case
+    await setPorts(["LATE_PORT"]);
+    const fresh: any = await browser.execute(
+      (tid) => window.__termic!.invoke("task_ensure_extra_ports", { id: tid }),
+      id,
+    );
+    // The new name lands in the task's own buffer (base+1 for a
+    // single-repo task with no prior extras) and persists on the record.
+    expect(fresh.extra_named_ports).toEqual([{ name: "LATE_PORT", port: fresh.port + 1 }]);
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+    const stored: any = await taskById(id);
+    expect(stored.extra_named_ports).toEqual([{ name: "LATE_PORT", port: stored.port + 1 }]);
+    await setPorts([]);
+  });
+});
+
+// P1: "Copy agent CLI briefing" on the task menu — the paste-into-another-agent
+// CLI block that lets two agents drive each other (src/lib/agentBriefing.ts).
+// Cases: the item is reachable from the right-click menu; running it actually
+// reaches the clipboard; the command palette offers the same action.
+//
+// The BLOCK'S CONTENT is pinned by src/lib/agentBriefing.test.ts, not here:
+// the webview holds `clipboard-manager:allow-write-text` and no read
+// permission, so the success toast is the only observable proof the write
+// happened, and it only fires after writeText resolves.
+describe("copy agent briefing", () => {
+  let taskId!: string;
+  after(async () => {
+    await browser.execute(() => {
+      window.__termic!.useUI.getState().closeCommandPalette?.();
+      window.__termic!.useUI.setState({ toasts: [] });
+    });
+    await dismissOverlays();
+    if (taskId) await archiveTask(taskId);
+  });
+
+  // Right-click the task header row: it opens the same menu as the kebab,
+  // and unlike the kebab it is not gated on a hover-only pointer-events flip.
+  const openTaskMenu = (id: string) =>
+    browser.execute((i) => {
+      const row = document.querySelector(`[data-sidebar-task-id="${i}"]`);
+      if (!row) throw new Error(`no sidebar row for task ${i}`);
+      row.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+      );
+    }, id);
+
+  const menuLabels = () =>
+    browser.execute(() =>
+      [...document.querySelectorAll("[role='menuitem']")].map(
+        (e) => e.textContent?.trim() ?? "",
+      ),
+    );
+
+  const toasts = () =>
+    browser.execute(() =>
+      window.__termic!.useUI.getState().toasts.map((t: any) => `${t.kind}:${t.msg}`),
+    );
+
+  const clearToasts = () =>
+    browser.execute(() => window.__termic!.useUI.setState({ toasts: [] }));
+
+  const waitForCopyToast = async (what: string) => {
+    await browser.waitUntil(
+      async () => (await toasts()).includes("success:Copied agent CLI briefing"),
+      {
+        timeout: 8_000,
+        timeoutMsg: `${what}: clipboard write never confirmed`,
+      },
+    );
+  };
+
+  it("offers the briefing on the task's right-click menu", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+    taskId = await openTask("e2e-briefing");
+    await ensureActiveTask(taskId);
+
+    await openTaskMenu(taskId);
+    await browser.waitUntil(
+      async () => (await menuLabels()).includes("Copy agent CLI briefing"),
+      { timeout: 8_000, timeoutMsg: "task menu never offered Copy agent CLI briefing" },
+    );
+    const labels = await menuLabels();
+    // Sits in the copy/edit block, not off in the archive block.
+    expect(labels.indexOf("Copy agent CLI briefing")).toBeGreaterThan(
+      labels.indexOf("Rename"),
+    );
+    expect(labels.indexOf("Copy agent CLI briefing")).toBeLessThan(
+      labels.indexOf("Archive task"),
+    );
+  });
+
+  it("running it writes to the clipboard", async () => {
+    await clearToasts();
+    await clickMenuItem("Copy agent CLI briefing");
+    await waitForCopyToast("task menu");
+    await dismissOverlays();
+    await clearToasts();
+  });
+
+  // Second surface for the same action: the palette is how it is reached
+  // without hunting for the row (CommandPalette.tsx).
+  it("the command palette offers the same action", async () => {
+    await browser.execute(() =>
+      window.__termic!.useUI.getState().openCommandPalette(),
+    );
+    await waitVisible('input[placeholder*="Type a command"]', 8_000);
+    await browser.execute(() => {
+      const input = document.querySelector(
+        'input[placeholder*="Type a command"]',
+      ) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "agent CLI briefing");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          () =>
+            !!document.querySelector('[data-cmd-id="copy-agent-briefing"]'),
+        ),
+      { timeout: 8_000, timeoutMsg: "palette never listed copy-agent-briefing" },
+    );
+    await clearToasts();
+    await browser.execute(() =>
+      (
+        document.querySelector(
+          '[data-cmd-id="copy-agent-briefing"]',
+        ) as HTMLElement
+      ).click(),
+    );
+    await waitForCopyToast("command palette");
+    await clearToasts();
   });
 });

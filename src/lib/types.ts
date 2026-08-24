@@ -45,6 +45,12 @@ export interface Project {
   base_branch: string;
   remote: string;
   preview_url: string;
+  /** Per-project override of the global `Settings.preview_browser` (GH #245).
+   *  Three states: absent = follow the global setting; `""` = force the OS
+   *  default for this project even when the global names a browser; a command
+   *  = use that. Personal (projects.json), never `.termic.yaml`, because a
+   *  launch command is machine-specific. See `lib/previewBrowser.ts`. */
+  preview_browser?: string;
   files_to_copy: string[];
   setup_script: string;
   run_script: string;
@@ -99,6 +105,9 @@ export interface Project {
    *  team-shared equivalent lives in `.termic.yaml` under
    *  `scripts.run_scripts`; the two lists are merged at read time. */
   run_scripts?: RunCommand[];
+  /** Personal extra named ports (GH #196): env var names unioned with
+   *  the committed `.termic.yaml` list (yaml first, deduped). */
+  extra_named_ports?: string[];
 }
 
 /** One named extra run command (GH #124). `command` is a freeform shell
@@ -158,6 +167,13 @@ export interface TaskMember {
   setup_script?: string;
   run_script?: string;
   archive_script?: string;
+}
+
+/** One frozen extra named port (GH #196): configured env var name +
+ *  the port allocated from the task's block at creation. */
+export interface NamedPort {
+  name: string;
+  port: number;
 }
 
 export interface Task {
@@ -221,6 +237,15 @@ export interface Task {
   sandbox_allowed_hosts?: string[];
   /** Multi-repo composition. Empty for single-repo tasks. */
   composition?: TaskMember[];
+  /** Extra named ports (GH #196), frozen at creation and topped up at
+   *  spawn time from the current config (buffer slots, oldest names
+   *  keep their ports). Injected next to TERMIC_PORT everywhere, and
+   *  expanded in the preview URL. */
+  extra_named_ports?: NamedPort[];
+  /** Length of the task's port block, stored at allocation so a top-up
+   *  never grows the block into the neighbor task. 0/undefined on
+   *  records predating on-the-fly ports. */
+  port_block_len?: number;
   /** Pre-set launch command for `cli === "custom"` repo-root tasks.
    *  The default tab runs this through a login shell instead of an agent
    *  binary (e.g. `ssh box`, `npm run dev`). Null/undefined for every
@@ -260,15 +285,13 @@ export interface PersistedTab {
    *  (claude / gemini). Null for cwd-resume agents (codex) and tabs that
    *  have not minted a session yet. Owned by `taskSetTabSessionId`. */
   session_id?: string | null;
-  /** The uuid a `--resume` attempt just fast-exited on, stashed here
-   *  (instead of discarded) so it can be one-click recovered. Owned by
-   *  `taskSetTabPreviousSessionId`. */
-  previous_session_id?: string | null;
   /** Leaf ID of the split pane this tab belongs to (absent for main panel tabs). */
   pane_leaf_id?: string | null;
   /** Run pop-out tab marker (GH #54): the member dir ("" = host project)
    *  when this tab hosts the run script. Restores as a RunPane. */
   run_member?: string | null;
+  /** Pinned state, so a pinned tab comes back pinned and leftmost. */
+  pinned?: boolean;
 }
 
 /** Per-member input for `task_create_multi`. `root_path` matches a
@@ -293,6 +316,9 @@ export interface CreateMultiArgs {
   sandbox_mode?: SandboxMode;
   sandbox_rw_paths?: string[];
   sandbox_allowed_hosts?: string[];
+  /** Resume-args override for the host task, applied from the first spawn.
+   *  Same field as the task menu's "Resume override". */
+  resume_override?: string;
 }
 
 export interface CreateTaskArgs {
@@ -325,6 +351,11 @@ export interface CreateTaskArgs {
   /** Externally-started session id the agent resumes on its first spawn
    *  (GH #169): seeds `agent_session_ids[cli]`, same as an import. */
   resume_session_id?: string;
+  /** Resume-args override, applied from the FIRST spawn. Same field and
+   *  semantics as the task menu's "Resume override" (Task.resume_override):
+   *  replaces termic's default resume block, placeholders expanded per
+   *  launch. Empty / unset leaves the default logic in place. */
+  resume_override?: string;
 }
 
 export interface Agent {
@@ -472,8 +503,12 @@ export interface Settings {
    *  but it has to round-trip through the settings object the UI saves, or
    *  the migration would re-fire and undo a user's opt-out. */
   cli_default_migrated?: boolean;
+  /** "Enable MCP endpoint": binds the loopback MCP listener for outside
+   *  clients (Claude Desktop, claude mcp add). Default off; unlike the CLI
+   *  socket the listener only exists while this is on. See docs/plans/mcp.md. */
+  mcp_enabled?: boolean;
   /** What the window's close button does. Absent/"ask" = show the close
-   *  prompt (whose "Don't ask again" checkbox writes the choice back here);
+   *  prompt (whose "Show this every time" checkbox writes the choice back here);
    *  "menubar" = close to the menu bar, agents keep running; "quit" = quit
    *  Termic and kill every agent. */
   close_action?: "ask" | "menubar" | "quit";
@@ -498,6 +533,13 @@ export interface Settings {
    *  field shows a real value. Optional here only because older profiles
    *  predate it; the backend fills it in on load. */
   default_tasks_path?: string;
+  /** App-wide command that opens preview URLs and terminal links (GH #245).
+   *  Empty/absent = the OS default browser, which takes the byte-identical
+   *  code path this app used before the setting existed. A command TEMPLATE,
+   *  not an app name (`open -a "Google Chrome"`, `firefox -P work`), which is
+   *  what lets a user select a browser profile. Projects override it via
+   *  `Project.preview_browser`. */
+  preview_browser?: string;
 }
 
 /** Install state of the bundled CLI on PATH (cli_install_status). */
@@ -508,6 +550,19 @@ export interface CliInstallStatus {
   name: string;
   /** True when the installed location is on the user's login PATH. */
   on_path: boolean;
+}
+
+/** Live state of the MCP endpoint (mcp_status). */
+export interface McpStatus {
+  /** The codex config block and the claude registration command, both
+   *  rendered by the backend that also writes them, so the page cannot
+   *  drift from what the install buttons do. Null when not bound. */
+  codex_config: string | null;
+  claude_command: string | null;
+  /** Endpoint URL while the listener is bound, else null. */
+  url: string | null;
+  /** Path of the mcp-token file the client reads (never the value). */
+  token_path: string | null;
 }
 
 export interface DiscoveredRepo {
@@ -586,6 +641,36 @@ export interface GitFile {
    *  deletion. Used to auto-clear a file's "viewed" mark once the agent
    *  touches it again. See store/fileViewed.ts. */
   fp: string;
+  /** Lines added / removed. Only Compare fills these in; the staging
+   *  lists leave them undefined rather than paying for a `--numstat` process
+   *  on every status poll. Undefined also covers a binary file, whose churn
+   *  git reports as `-`. */
+  added?: number;
+  removed?: number;
+}
+
+/** Everything that differs between some ref and the working tree — the
+ *  History › Compare sub-view (issue #208). One flat list: committed, staged, unstaged and
+ *  untracked work all land in `files`, because "what does this task look like
+ *  next to that branch" doesn't care which of those a change happens to be in. */
+export interface GitCompare {
+  /** The ref as picked, echoed back for the header. */
+  base: string;
+  /** The commit every file's left side is read from — the merge base with
+   *  HEAD, or the ref's own tip in direct mode. Goes straight into each
+   *  diff tab's `base:<sha>` scope. */
+  base_sha: string;
+  base_short: string;
+  /** HEAD's branch, so the header can name both sides. "" when detached. */
+  branch: string;
+  /** Merge-base mode was asked for but the histories are unrelated, so this
+   *  fell back to the ref's tip. */
+  no_merge_base: boolean;
+  files: GitFile[];
+  added: number;
+  removed: number;
+  /** True when the list was capped at 5 000 entries. */
+  truncated: boolean;
 }
 
 export interface GitRepo {
@@ -602,12 +687,89 @@ export interface GitRepo {
   last_commit_message: string;
   /** True when the file lists were capped at 5 000 entries. */
   truncated?: boolean;
+  /** Commits the upstream does not have, i.e. what Push would send. 0 when
+   *  there is no upstream: Push then creates one rather than being disabled. */
+  ahead?: number;
 }
 
 export interface GitStatus {
   repos: GitRepo[];
   total_changed: number;
   repos_changed: number;
+}
+
+/** One row of the Commit tab's Graph section (issue #199). */
+export interface GitCommit {
+  sha: string;
+  /** Abbreviation git chose, unambiguous within the repo. */
+  short: string;
+  /** Parent shas, FIRST PARENT FIRST — lane layout depends on that order. */
+  parents: string[];
+  subject: string;
+  author: string;
+  email: string;
+  /** Author date, unix SECONDS (not ms). */
+  timestamp: number;
+  /** Decorations as git prints them: "HEAD -> main", "origin/main", "tag: v1". */
+  refs: string[];
+  /** Committed locally but not reachable from the upstream — VS Code calls
+   *  these outgoing. Always false when the branch has no upstream. */
+  unpushed: boolean;
+  /** Message below the subject, trailers included. "" for a one-line commit.
+   *  Feeds the row's hover card; co-authors are parsed out of it here rather
+   *  than in Rust, so the raw message is what crossed the wire. */
+  body?: string;
+}
+
+/** One page of `task_git_log`. */
+/** One selectable ref in the Graph section's scope picker. */
+export interface GitRef {
+  /** Short name as the user knows it: `main`, `origin/main`, `v1.2.0`. */
+  name: string;
+  /** Abbreviated sha it points at. */
+  sha: string;
+  kind: "branch" | "remote" | "tag";
+}
+
+export interface GitLogPage {
+  commits: GitCommit[];
+  has_more: boolean;
+  /** "" on a detached HEAD or an unborn branch. */
+  branch: string;
+  /** "" when the branch has no upstream; the unpushed markers stay hidden
+   *  then rather than claiming every commit is outgoing. */
+  upstream: string;
+}
+
+/** One commit referenced by a `BlameFile`, deduped across the lines it owns. */
+export interface BlameCommit {
+  sha: string;
+  /** Mailmap-resolved author name. */
+  author: string;
+  author_email: string;
+  /** Unix seconds. Formatted on this side so the relative age stays live
+   *  without re-blaming the file. */
+  author_time: number;
+  /** Subject line only. */
+  summary: string;
+  /** Git's all-zero sha: the line exists in the working tree but in no
+   *  commit yet. */
+  uncommitted: boolean;
+}
+
+/** Whole-file blame, deduped: a commit table plus one index per line.
+ *  Deliberately not one record per line, see `BlameFile` in lib.rs for the
+ *  payload sizes that forced the shape. */
+export interface BlameFile {
+  commits: BlameCommit[];
+  /** `lines[n]` indexes `commits` for 1-based line `n + 1`. `0xffffffff`
+   *  means git attributed nothing to that line. */
+  lines: number[];
+  /** HEAD at blame time, for cache keying. "" outside a repo. */
+  head: string;
+  /** File was over the line cap, so `commits`/`lines` are empty. Distinct
+   *  from "no blame data" so the UI can stay silent rather than look broken. */
+  skipped: boolean;
 }
 
 /** Result of a Git-tab branch switch. `stashed` = local work was parked and
@@ -683,7 +845,7 @@ export type { SplitDir, SplitNode, PaneLeaf, SplitTree } from "@/lib/splitTree";
 
 // ───────────────────────────── tab model (frontend only) ─────────────────────────────
 
-export type TabType = "terminal" | "diff" | "edit" | "dir";
+export type TabType = "terminal" | "diff" | "edit" | "dir" | "scratch" | "external";
 
 export interface BaseTab {
   id: string;
@@ -730,6 +892,10 @@ export interface BaseTab {
    *  main pane tab (shown in the task tab bar). Split-pane tabs are
    *  ephemeral — they are not persisted across launches. */
   paneId?: string;
+  /** Pinned tabs sort before every unpinned tab in their strip, and
+   *  "Close others" / "Close to the right" skip them. `pinTab` / `unpinTab`
+   *  own both the flag and the move that keeps that order true. */
+  pinned?: boolean;
 }
 
 export interface TerminalTab extends BaseTab {
@@ -763,6 +929,11 @@ export interface TerminalTab extends BaseTab {
   /** Wall-clock timestamps used for the idle heuristic. */
   lastInputAt?: number | null;
   lastOutputAt?: number | null;
+  /** When the CURRENT PTY first produced output, i.e. when the agent
+   *  started painting. Null until it does, and distinct from
+   *  `lastOutputAt`, which is stamped at spawn as well. See
+   *  `lib/agentReady` for why prompt injection needs the difference. */
+  firstOutputAt?: number | null;
   /** True for the auto-created default tab when entering a task.
    *  Drives the resume-on-spawn decision: default tab resumes the agent's
    *  prior conversation (if any), user-added tabs always start fresh
@@ -774,14 +945,9 @@ export interface TerminalTab extends BaseTab {
    *  launch and minted on first spawn otherwise. Distinct per tab so two
    *  agents in one task resume independently — the primary tab is no
    *  longer the only resumable one. Cleared (undefined) when a resume
-   *  attempt rapid-exits (the stored session no longer resolves — the old
-   *  uuid moves to `previousSessionId` for recovery). */
+   *  attempt rapid-exits (the stored session no longer resolves; the agent's
+   *  own picker is the way back to it). */
   sessionId?: string;
-  /** The uuid a `--resume` just fast-exited on, stashed instead of thrown
-   *  away so the user can one-click recover it (a transient failure would
-   *  otherwise lose the conversation permanently). Drives the recover
-   *  banner in TerminalPane. Restored from `persisted_tabs` on launch. */
-  previousSessionId?: string;
   /** iTerm2-style work-progress state. Authoritative signals: OSC 9;4
    *  (Claude progress), OSC 133;C/D (FinalTerm semantic prompts), OSC 0
    *  title classifier (gemini/codex). `working` → spinner; `done` →
@@ -859,10 +1025,15 @@ export interface QueueItem {
 export interface DiffTab extends BaseTab {
   type: "diff";
   path: string;
-  /** Which Git-panel pane the diff was opened from (GH #122):
+  /** Which pane the diff was opened from (GH #122):
    *  "staged" diffs HEAD→index, "unstaged" diffs index→worktree.
+   *  `commit:<sha>` diffs that commit against its parent — the Graph section
+   *  (GH #199), where BOTH sides come out of the object store.
+   *  `base:<sha>` diffs that commit against the WORKING TREE — the Compare
+   *  tab (GH #208). Its right side is the live file, so unlike `commit:` it
+   *  keeps the review affordances (viewed marks, inline comments).
    *  Absent → HEAD→worktree (the full uncommitted delta). */
-  scope?: "unstaged" | "staged";
+  scope?: "unstaged" | "staged" | `commit:${string}` | `base:${string}`;
 }
 
 /** The complete delta a task produced vs its base (`task_diff`). `diff` folds
@@ -893,6 +1064,18 @@ export interface EditTab extends BaseTab {
    *  raw CodeMirror editor, "preview" the rendered HTML, "split" both
    *  side-by-side. Undefined → "source". Ignored for non-markdown files. */
   mdView?: "source" | "preview" | "split";
+  /** Manual "Set syntax" pick (a CodeMirror registry NAME, e.g. "JSON" — see
+   *  lib/languages) — beats the extension, so a `.txt` full of JSON can be
+   *  highlighted as JSON. Session-only, like `mdView`: it does not survive a
+   *  relaunch, and it is cleared when a preview tab slot recycles to a
+   *  different file. */
+  syntax?: string;
+  /** The syntax worked out AUTOMATICALLY, written by the editor pane: the
+   *  language the path resolves to, or, when the path matches nothing (an
+   *  extension-less file, a `.txt` that is really YAML), a guess from the
+   *  content. Lower precedence than `syntax`; see `effectiveLanguageId` for
+   *  why the pane owns this rather than the main chunk re-deriving it. */
+  syntaxAuto?: string;
   /** Per-tab override: true unblocks remote (http/https) images in this
    *  document's markdown preview for the current session, without
    *  touching the global `loadRemoteImages` pref. Undefined falls back to
@@ -924,7 +1107,73 @@ export interface DirTab extends BaseTab {
   remoteImagesUnblocked?: boolean;
 }
 
-export type Tab = TerminalTab | DiffTab | EditTab | DirTab;
+/** A Sublime-style untitled buffer (GH #244): an unsaved scratchpad that
+ *  happens to survive a relaunch. Scoped to ONE TASK, stored outside the
+ *  worktree under `<data_dir>/scratch/<taskId>/`.
+ *
+ *  A distinct type rather than an `EditTab` with an empty `path`, because
+ *  `EditTab.path` is load-bearing in places a pad must opt out of: inline
+ *  blame, review comments, the changed-on-disk banner, "locate in file tree",
+ *  the breadcrumb. A separate type makes every one of those a compiler error
+ *  to answer rather than a runtime surprise.
+ *
+ *  A pad is DIRTY for its whole life. Nothing has been saved anywhere the user
+ *  chose; the debounced write to the scratch store is crash safety, not saving,
+ *  and must not clear the dot. ⌘S does not write to the store either: it
+ *  PROMOTES the buffer to a real file in the task (see `scratchPromote`), after
+ *  which this is an ordinary `edit` tab and the pad record is gone. */
+export interface ScratchTab extends BaseTab {
+  type: "scratch";
+  /** Record id under `<data_dir>/scratch/<taskId>/`. */
+  scratchId: string;
+  /** Manual "Set syntax" pick. PERSISTED (in the scratch index), unlike
+   *  EditTab's session-only one: a pad has no extension to re-derive from.
+   *  Being persisted, it is the ONE field that can still hold a pre-registry
+   *  id from an older build — `normalizeLanguageId` translates those. */
+  syntax?: string;
+  /** Syntax guessed from the CONTENT, exactly as on EditTab. Session-only:
+   *  it is re-sniffed from the buffer on every load. */
+  syntaxAuto?: string;
+  /** Source / preview / split, exactly as on EditTab, and offered on the same
+   *  terms: a pad whose syntax resolves to markdown gets the same shell a
+   *  `.md` file does. Session-only (the SYNTAX is what persists, and the view
+   *  follows from it plus the global default). */
+  mdView?: "source" | "preview" | "split";
+  /** Per-document remote-image unblock for the rendered preview, as on
+   *  EditTab (issue #69). Session-only. */
+  remoteImagesUnblocked?: boolean;
+}
+
+/** A file OUTSIDE the task, opened READ-ONLY from a cmd+clicked absolute
+ *  path in terminal output (GH #240).
+ *
+ *  A distinct type for the same reason `ScratchTab` is one: `EditTab.path` is
+ *  task-relative and load-bearing in places this must opt out of. Every one
+ *  of them is task-scoped and would be meaningless or wrong here: saving
+ *  (`task_file_write` refuses absolute paths by design), inline blame, review
+ *  comments, the changed-on-disk watcher, "locate in file tree", and the
+ *  breadcrumb's clickable trail. A separate type makes each one a compiler
+ *  error to answer rather than a runtime surprise, which is exactly the trap
+ *  a boolean flag on `EditTab` would have set.
+ *
+ *  READ-ONLY is not a UI nicety, it is the containment story. The backing
+ *  read (`file_read_external`) is the only uncontained one in the app; there
+ *  is no uncontained write to pair with it, so this tab has no save path at
+ *  all. */
+export interface ExternalTab extends BaseTab {
+  type: "external";
+  /** ABSOLUTE path on disk, outside every root of the owning task. */
+  path: string;
+  /** 1-based line + column to scroll to on mount, from a clicked
+   *  `path:line:col`. Consumed via `consumeReveal` exactly like EditTab's. */
+  revealAt?: { line: number; col?: number };
+  /** Manual "Set syntax" pick, session-only, as on EditTab. */
+  syntax?: string;
+  /** Syntax resolved from the path (content sniff second), as on EditTab. */
+  syntaxAuto?: string;
+}
+
+export type Tab = TerminalTab | DiffTab | EditTab | DirTab | ScratchTab | ExternalTab;
 
 /** Mirror of `repo_config::RepoConfig` (src-tauri/src/repo_config.rs).
  *  Parsed from the repo-root `.termic.yaml` — committed, team-shared
@@ -941,4 +1190,7 @@ export interface RepoConfig {
   /** Glob patterns hidden from the "All files" tree (committed, team-shared).
    *  Unioned with the user's personal `Settings.file_tree_exclude`. */
   exclude: string[];
+  /** Extra named ports (GH #196), team-shared: env var NAMES only.
+   *  Every new task gets a unique port per name, frozen at create. */
+  extra_named_ports: string[];
 }

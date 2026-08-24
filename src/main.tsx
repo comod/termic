@@ -12,6 +12,7 @@ import { logLine } from "@/lib/ipc";
 import { initTerminalDropHandler } from "@/lib/terminalDrop";
 import { initWindowlessMode } from "@/lib/windowlessMode";
 import { initModKeyClass } from "@/lib/modKeyClass";
+import { initUserPresence } from "@/lib/userPresence";
 
 // StrictMode disabled: it double-mounts effects in dev, which races our async
 // PTY spawn flow (first spawn gets killed by the strict teardown before its
@@ -38,7 +39,7 @@ logLine("[termic] boot build=resume-fix-v3-sidebar-bypass").catch(() => {});
 // release bundles: both flags are statically false there.
 if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
   void (async () => {
-    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, prompts, agentRace, signalLog, reviewComments] =
+    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, prompts, agentRace, signalLog, reviewComments, deepLink, previewBrowser, pendingTasks, archivingTasks, cmLanguage] =
       await Promise.all([
         import("@/store/app"),
         import("@/store/ui"),
@@ -52,6 +53,11 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
         import("@/lib/agentRace"),
         import("@/lib/agentSignalLog"),
         import("@/store/reviewComments"),
+        import("@/lib/deepLink"),
+        import("@/lib/previewBrowser"),
+        import("@/store/pendingTasks"),
+        import("@/store/archivingTasks"),
+        import("@codemirror/language"),
       ]);
     (window as unknown as Record<string, unknown>).__termic = {
       useApp: app.useApp,
@@ -66,6 +72,9 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       // can snapshot the order in before() and put it back in after() — the
       // profile must be left byte-identical (see the signal-inspector note).
       usePromptLibrary: prompts.usePromptLibrary,
+      // GH #245: the exact helper both preview buttons and the terminal link
+      // openers delegate to, so a spec exercises the real resolution path.
+      previewBrowser,
       agentRace,
       // Queued inline review comments: the e2e suite asserts what a selection
       // actually queued (line range + quote), which no DOM surface spells out
@@ -76,6 +85,24 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       // the same functions TerminalPane calls — instead of racing a live
       // agent's spinner to produce a specific title at a specific moment.
       signalLog,
+      // `termic://` deep links (GH #192). Exposed because WebDriver cannot
+      // ask macOS to open a URL scheme — the OS half is LaunchServices, not
+      // the app — so specs drive the handler with the same raw URL string
+      // Rust would have queued, exercising everything from parse onward.
+      deepLink,
+      // Tasks mid-creation (GH #242 — non-blocking worktree create). Exposed
+      // so specs can seed a synthetic pending entry directly, rather than
+      // racing the fixture repo's (near-instant) real worktree add to catch
+      // PendingTaskRow / CreatingTaskPane in their "creating" state.
+      usePendingTasks: pendingTasks.usePendingTasks,
+      // Tasks mid-archive (GH #246 — non-blocking archive). Exposed for the
+      // same reason as usePendingTasks: the fixture repo's archive finishes
+      // far too fast to catch the "Archiving…" row by racing a real one.
+      useArchivingTasks: archivingTasks.useArchivingTasks,
+      // CodeMirror's own indentation facet. Indentation is detected per file
+      // (lib/detectIndent), and the only honest way to assert what the editor
+      // decided is to read it from the state the editor actually uses.
+      cm: { indentUnit: cmLanguage.indentUnit },
     };
   })();
 }
@@ -84,6 +111,7 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
 // the hand cursor only while the modifier is down (the underline stays on
 // plain hover). See modKeyClass.ts + index.css.
 initModKeyClass();
+initUserPresence();
 
 // Mirror uncaught errors + unhandled promise rejections to the Rust-side
 // debug log so they show up in the dev terminal (`/var/folders/.../T/

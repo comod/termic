@@ -32,10 +32,13 @@ const LS_TERMINAL_FONT = "terminalFont";
 const LS_TERMINAL_SIZE = "terminalFontSize";
 const LS_EDITOR_SIZE   = "editorFontSize";
 const LS_LIGATURES     = "codeLigatures";
+const LS_INLINE_BLAME  = "inlineBlame";
 const LS_THEME         = "themeMode";
 const LS_DESKTOPNOTIF  = "desktopNotifications";
 const LS_SETTLED_HIGHLIGHT = "settledHighlight";
 const LS_CONFIRM_CLOSE_AGENT_TAB = "confirmBeforeCloseAgentTab";
+const LS_CONFIRM_ARCHIVE_TASK = "confirmBeforeArchiveTask";
+const LS_ARCHIVE_DELETE_BRANCH = "archiveDeleteBranch";
 const LS_WORKING_INDICATOR = "workingIndicator";
 const LS_DEFAULT_SANDBOX = "globalDefaultSandbox";
 const LS_SANDBOX_BYPASS  = "sandboxBypassPermissions";
@@ -49,6 +52,7 @@ const LS_TERMINAL_COPY_ON_SELECT = "terminalCopyOnSelect";
 const LS_TASK_EXPAND_MODE = "taskExpandMode";
 const LS_HIDE_INACTIVE_PROJECTS = "hideInactiveProjects";
 const LS_MD_VIEW       = "markdownDefaultView";
+const LS_SVG_VIEW      = "svgDefaultView";
 const LS_LOAD_REMOTE_IMAGES = "loadRemoteImages";
 const LS_FIND_IN_FILES_REGEX = "findInFilesRegex";
 const LS_FIND_IN_FILES_MATCH_CASE = "findInFilesMatchCase";
@@ -464,10 +468,23 @@ interface PrefsState {
   /** Whether closing a non-shell terminal/agent tab asks for confirmation
    *  first. ON by default. Once the "+" menu's Resume section makes
    *  undoing a close one click away, users who've learned that can turn
-   *  this off via the dialog's "Don't ask again" checkbox — closing then
+   *  this off by unticking the dialog's "Show this every time" box — closing then
    *  happens immediately, with a toast pointing back at Resume. Dirty
    *  edit-tab closes are never gated by this; that confirm always fires. */
   confirmBeforeCloseAgentTab: boolean;
+  /** Whether archiving a task asks for confirmation first. ON by default.
+   *  Turned off by unticking "Show this every time" in the archive dialog, which
+   *  ALSO freezes `archiveDeleteBranch` to whatever the delete-branch
+   *  checkbox said at that moment — so a silent archive still honours the
+   *  last explicit branch decision. Archiving can't be undone from inside
+   *  Termic, so both halves are re-exposed in Settings, Tasks. */
+  confirmBeforeArchiveTask: boolean;
+  /** Whether a silent archive (see `confirmBeforeArchiveTask`) also deletes
+   *  the task's git branch. OFF by default, matching the dialog checkbox's
+   *  default. Ignored while the confirm dialog is on: there the checkbox is
+   *  the answer. Never applies to main-checkout entries, which have no
+   *  worktree branch to delete. */
+  archiveDeleteBranch: boolean;
   /** Show a spinner on an agent's tab (and sidebar icon) WHILE it's
    *  working. ON by default (an explicit off in localStorage is kept). The
    *  "working" workState is always tracked internally to drive work-done
@@ -579,6 +596,13 @@ interface PrefsState {
   uiScale: number;
   /** Enable font ligatures (=>, !==, ...) in the editor. */
   codeLigatures: boolean;
+  /** Show git blame for the CURSOR'S LINE ONLY, as dimmed text after the
+   *  code (VS Code's `git.blame.editorDecoration.enabled`). OFF by default,
+   *  same as VS Code's own and the same opt-in shape as `loadRemoteImages`:
+   *  with it off nothing is fetched and the extension is never constructed.
+   *  Deliberately not a whole-file blame column either: see inlineBlameExt.ts
+   *  for why every-line annotation is the expensive shape. */
+  inlineBlame: boolean;
   /** List EVERY installed font family in the font pickers, not just the
    *  is_monospace()-detected subset. OFF by default: the wall exists because
    *  proportional fonts break terminal column math, but font-kit's monospace
@@ -602,6 +626,11 @@ interface PrefsState {
    *  New markdown tabs open in this mode, and toggling a tab's view
    *  updates it — so the app remembers however you last looked at a doc. */
   markdownDefaultView: MarkdownView;
+  /** Same three modes for SVG tabs (GH #247), tracked separately from
+   *  markdown: clicking an .svg in the file tree has always shown the
+   *  picture, so this defaults to "preview" even for someone whose markdown
+   *  default is "source". */
+  svgDefaultView: MarkdownView;
   /** Prefix prepended to auto-generated worktree branch names in the New
    *  task dialog (e.g. "feature" → "feature/my-task"). Empty means no
    *  prefix. The user can still freely edit the branch field per task. */
@@ -638,6 +667,8 @@ interface PrefsState {
   /** Bump zoom by one step in either direction (for the Cmd +/- shortcuts). */
   nudgeUiScale:       (dir: 1 | -1) => void;
   setCodeLigatures:   (v: boolean) => void;
+  setInlineBlame:     (v: boolean) => void;
+  toggleInlineBlame:  () => void;
   setShowAllInstalledFonts: (v: boolean) => void;
   /** Restore every Appearance-section pref (fonts, sizes, weight,
    *  letter-spacing, ligatures) to `APPEARANCE_DEFAULTS`. Theme is
@@ -655,6 +686,8 @@ interface PrefsState {
   setCompletionSoundId: (id: CompletionSoundId) => void;
   setSettledHighlight: (v: boolean) => void;
   setConfirmBeforeCloseAgentTab: (v: boolean) => void;
+  setConfirmBeforeArchiveTask: (v: boolean) => void;
+  setArchiveDeleteBranch: (v: boolean) => void;
   setWorkingIndicator: (v: boolean) => void;
   setLoadRemoteImages: (v: boolean) => void;
   setFindInFilesRegex: (v: boolean) => void;
@@ -665,6 +698,7 @@ interface PrefsState {
   setTaskExpandMode: (m: "chevron" | "click" | "always") => void;
   setHideInactiveProjects: (v: boolean) => void;
   setMarkdownDefaultView: (v: MarkdownView) => void;
+  setSvgDefaultView: (v: MarkdownView) => void;
   setBranchPrefix: (v: string) => void;
   setQueueMinIntervalMs: (ms: number) => void;
   setSplitPaneDim: (v: boolean) => void;
@@ -735,6 +769,7 @@ export const APPEARANCE_DEFAULTS = {
   editorFontSize:        13,
   uiScale:               100,
   codeLigatures:         true,
+  inlineBlame:           false,
   showAllInstalledFonts: false,
 } as const;
 
@@ -760,6 +795,7 @@ const initialTerminalCopyOnSelect  = lsGetBool(LS_TERMINAL_COPY_ON_SELECT, true)
 const initialEditorSize   = lsGetNum(LS_EDITOR_SIZE, APPEARANCE_DEFAULTS.editorFontSize);
 const initialUiScale      = clampUiScale(lsGetNum(LS_UI_SCALE, APPEARANCE_DEFAULTS.uiScale));
 const initialLigatures    = lsGetBool(LS_LIGATURES, APPEARANCE_DEFAULTS.codeLigatures);
+const initialInlineBlame  = lsGetBool(LS_INLINE_BLAME, APPEARANCE_DEFAULTS.inlineBlame);
 const initialShowAllFonts = lsGetBool(LS_SHOW_ALL_FONTS, APPEARANCE_DEFAULTS.showAllInstalledFonts);
 const initialTheme        = parseThemeMode(lsGet(LS_THEME, "claude"));
 const initialDesktopNotif = lsGetBool(LS_DESKTOPNOTIF, false);
@@ -775,6 +811,8 @@ const initialCompletionSoundId = readCompletionSoundId();
 // stored value when present).
 const initialSettledHighlight = lsGetBool(LS_SETTLED_HIGHLIGHT, true);
 const initialConfirmCloseAgentTab = lsGetBool(LS_CONFIRM_CLOSE_AGENT_TAB, true);
+const initialConfirmArchiveTask = lsGetBool(LS_CONFIRM_ARCHIVE_TASK, true);
+const initialArchiveDeleteBranch = lsGetBool(LS_ARCHIVE_DELETE_BRANCH, false);
 // OFF by default — experimental re-introduction of the work-in-progress
 // spinner. Opt in via Settings → General.
 const initialWorkingIndicator = lsGetBool(LS_WORKING_INDICATOR, true);
@@ -800,6 +838,10 @@ const initialMarkdownView: MarkdownView = (() => {
   const raw = lsGet(LS_MD_VIEW, "source");
   return raw === "preview" || raw === "split" ? raw : "source";
 })();
+const initialSvgView: MarkdownView = (() => {
+  const raw = lsGet(LS_SVG_VIEW, "preview");
+  return raw === "source" || raw === "split" ? raw : "preview";
+})();
 const initialBranchPrefix = lsGet(LS_BRANCH_PREFIX, "feature");
 // Clamp 0–120s. Default 10s — fast loops (or false "done" oscillation)
 // shouldn't fire prompts at the agent faster than this.
@@ -814,6 +856,8 @@ export const usePrefs = create<PrefsState>(set => ({
   completionSoundId: initialCompletionSoundId,
   settledHighlight: initialSettledHighlight,
   confirmBeforeCloseAgentTab: initialConfirmCloseAgentTab,
+  confirmBeforeArchiveTask: initialConfirmArchiveTask,
+  archiveDeleteBranch: initialArchiveDeleteBranch,
   workingIndicator: initialWorkingIndicator,
   loadRemoteImages: initialLoadRemoteImages,
   findInFilesRegex: initialFindInFilesRegex,
@@ -835,10 +879,12 @@ export const usePrefs = create<PrefsState>(set => ({
   editorFontSize: initialEditorSize,
   uiScale: initialUiScale,
   codeLigatures: initialLigatures,
+  inlineBlame: initialInlineBlame,
   showAllInstalledFonts: initialShowAllFonts,
   taskExpandMode: initialTaskExpandMode,
   hideInactiveProjects: initialHideInactiveProjects,
   markdownDefaultView: initialMarkdownView,
+  svgDefaultView: initialSvgView,
   branchPrefix: initialBranchPrefix,
   queueMinIntervalMs: initialQueueMinInterval,
   shortcuts: loadShortcuts(),
@@ -926,6 +972,14 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_LIGATURES, v ? "1" : "0"); } catch {}
     set({ codeLigatures: v });
   },
+  setInlineBlame: (v) => {
+    if (usePrefs.getState().inlineBlame === v) return;  // no-op writes re-run every selector
+    try { localStorage.setItem(LS_INLINE_BLAME, v ? "1" : "0"); } catch {}
+    set({ inlineBlame: v });
+  },
+  toggleInlineBlame: () => {
+    usePrefs.getState().setInlineBlame(!usePrefs.getState().inlineBlame);
+  },
   setShowAllInstalledFonts: (v) => {
     try { localStorage.setItem(LS_SHOW_ALL_FONTS, v ? "1" : "0"); } catch {}
     set({ showAllInstalledFonts: v });
@@ -945,6 +999,7 @@ export const usePrefs = create<PrefsState>(set => ({
     s.setEditorFontSize(d.editorFontSize);
     s.setUiScale(d.uiScale);
     s.setCodeLigatures(d.codeLigatures);
+    s.setInlineBlame(d.inlineBlame);
     s.setShowAllInstalledFonts(d.showAllInstalledFonts);
   },
   setThemeMode: (m) => {
@@ -1005,6 +1060,14 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_CONFIRM_CLOSE_AGENT_TAB, v ? "1" : "0"); } catch {}
     set({ confirmBeforeCloseAgentTab: v });
   },
+  setConfirmBeforeArchiveTask: (v) => {
+    try { localStorage.setItem(LS_CONFIRM_ARCHIVE_TASK, v ? "1" : "0"); } catch {}
+    set({ confirmBeforeArchiveTask: v });
+  },
+  setArchiveDeleteBranch: (v) => {
+    try { localStorage.setItem(LS_ARCHIVE_DELETE_BRANCH, v ? "1" : "0"); } catch {}
+    set({ archiveDeleteBranch: v });
+  },
   setWorkingIndicator: (v) => {
     try { localStorage.setItem(LS_WORKING_INDICATOR, v ? "1" : "0"); } catch {}
     set({ workingIndicator: v });
@@ -1044,6 +1107,10 @@ export const usePrefs = create<PrefsState>(set => ({
   setMarkdownDefaultView: (v) => {
     try { localStorage.setItem(LS_MD_VIEW, v); } catch {}
     set({ markdownDefaultView: v });
+  },
+  setSvgDefaultView: (v) => {
+    try { localStorage.setItem(LS_SVG_VIEW, v); } catch {}
+    set({ svgDefaultView: v });
   },
   setBranchPrefix: (v) => {
     // Store as-typed (normalization happens at the use site in

@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
@@ -38,6 +38,22 @@ mod repo_config;
 mod shell_env;
 mod automation;
 mod cli_server;
+mod mcp_server;
+// Row shapes + OS-agnostic logic (subtree walk, cpu_ratio, label_for,
+// signal_from_name) shared by every `procmon` variant below.
+mod procmon_common;
+// macOS: real libproc/mach FFI. Linux: /proc. Everything else: a stub that
+// answers "unsupported on this OS" — see procmon_other.rs's module doc.
+// The macOS FFI fails to LINK (not just behave wrong) if it ends up in a
+// non-macOS build, which is what shipped broken before this 3-way split.
+#[cfg(target_os = "macos")]
+mod procmon;
+#[cfg(target_os = "linux")]
+#[path = "procmon_linux.rs"]
+mod procmon;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[path = "procmon_other.rs"]
+mod procmon;
 use sandbox::SandboxBundle;
 
 // ───────────────────────────── data model ─────────────────────────────
@@ -70,6 +86,23 @@ pub struct Project {
     pub base_branch: String,
     pub remote: String,
     pub preview_url: String,
+    /// Per-project OVERRIDE of the global `Settings.preview_browser` (GH #245):
+    /// the command that opens this project's preview URL and terminal links.
+    ///
+    /// Three states, which is why this is an `Option` and `tasks_path` (the
+    /// other project-level override) is not:
+    ///   `None`      - follow the global setting. The normal case.
+    ///   `Some("")`  - force the OS default browser for THIS project, even
+    ///                 when the global setting names one. A plain `String`
+    ///                 could not express this: empty already means "inherit".
+    ///   `Some(cmd)` - launch `cmd` instead. See `browser_argv`.
+    ///
+    /// Personal (projects.json) on purpose, never `.termic.yaml`: a launch
+    /// command is machine-specific, so a committed `open -a "Google Chrome"`
+    /// would be silently dead for a teammate on Linux. `preview_url` is
+    /// committable precisely because a URL is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_browser: Option<String>,
     pub files_to_copy: Vec<String>,
     pub setup_script: String,
     pub run_script: String,
@@ -145,6 +178,13 @@ pub struct Project {
     /// existing rows load with an empty list.
     #[serde(default)]
     pub run_scripts: Vec<crate::repo_config::RunCommand>,
+
+    /// Personal extra named ports (GH #196), the projects.json layer.
+    /// Unioned with the committed `.termic.yaml` `extra_named_ports`
+    /// (yaml order first, deduped by name) into the effective list a
+    /// new task freezes. Serde-default so existing rows load empty.
+    #[serde(default)]
+    pub extra_named_ports: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -241,6 +281,16 @@ pub enum SandboxMode {
     EnforceFs,
 }
 
+/// One frozen extra named port (GH #196): the env var name the user
+/// configured plus the port allocated from this task's block at
+/// creation. Frozen pairs, so editing the repo config later never
+/// shifts a live task's ports.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct NamedPort {
+    pub name: String,
+    pub port: u16,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Task {
@@ -333,6 +383,21 @@ pub struct Task {
     /// + sandbox profile generator iterate this list when populated.
     #[serde(default)]
     pub composition: Vec<TaskMember>,
+    /// Extra named ports (GH #196), frozen at creation from the
+    /// project's effective list (`.termic.yaml` union personal) and
+    /// TOPPED UP at spawn time: names added to the config later are
+    /// frozen into this task's buffer slots on its next run / terminal
+    /// spawn (`top_up_extra_ports`). Once frozen a pair never moves;
+    /// names removed from the config keep injecting. Injected wherever
+    /// TERMIC_PORT is set; expanded in the preview URL.
+    pub extra_named_ports: Vec<NamedPort>,
+    /// Length of this task's port block, stored at allocation. The
+    /// block must NOT grow when a top-up consumes buffer slots (the
+    /// next task may sit right after the end), so accounting reads
+    /// THIS, never the live extras count. 0 on records predating
+    /// on-the-fly ports — `task_block_len` falls back to the computed
+    /// shape there, and the first top-up stamps it.
+    pub port_block_len: u16,
     /// Pre-set launch command for `cli == "custom"` repo-root tasks.
     /// The default tab runs this through a login shell instead of an
     /// agent binary (e.g. `ssh box`, `npm run dev`, `python`). None for
@@ -404,12 +469,6 @@ pub struct PersistedTab {
     /// clobbers a freshly minted session.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// The uuid a resume attempt just failed on, stashed here instead of
-    /// discarded so the user can one-click recover it. A transient
-    /// `--resume` fast-exit would otherwise lose the conversation for good
-    /// even though its transcript still exists on disk.
-    #[serde(default)]
-    pub previous_session_id: Option<String>,
     /// Leaf ID of the split pane this tab belongs to (None for main panel tabs).
     #[serde(default)]
     pub pane_leaf_id: Option<String>,
@@ -417,6 +476,10 @@ pub struct PersistedTab {
     /// the run script ("" = host project). Restores the RunPane in its pane.
     #[serde(default)]
     pub run_member: Option<String>,
+    /// Pinned tabs sort before the others in their strip. Persisted so a
+    /// pinned tab comes back pinned and leftmost.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Frontend payload for `task_set_tabs`. `session_id` is only honored
@@ -439,11 +502,11 @@ pub struct PersistedTabInput {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
-    pub previous_session_id: Option<String>,
-    #[serde(default)]
     pub pane_leaf_id: Option<String>,
     #[serde(default)]
     pub run_member: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl Task {
@@ -560,6 +623,13 @@ pub struct CreateTaskArgs {
     /// is unvalidated by design; the agent owns "session not found".
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Resume-args override, set at create so the FIRST spawn already
+    /// carries it. Identical storage and semantics to
+    /// `task_set_resume_override` (Task.resume_override): the string
+    /// replaces termic's default resume block, placeholders expanded per
+    /// launch. Empty / unset → default resume logic.
+    #[serde(default)]
+    pub resume_override: Option<String>,
 }
 
 // ───────────────────────────── paths ─────────────────────────────
@@ -672,7 +742,12 @@ fn check_tasks_root(root: &Path, repo: &Path) -> Result<(), String> {
 /// "not tracked".
 fn git_tracks_path(repo: &Path, path: &Path) -> bool {
     let arg = path.to_string_lossy().into_owned();
-    git(&["ls-files", "--", &arg], repo).map(|o| !o.trim().is_empty()).unwrap_or(false)
+    // `--no-optional-locks`: this runs on the blame path (a background read on a
+    // cursor move) as well as on task creation, and neither should be able to
+    // hold `index.lock` against the user's own git.
+    git(&["--no-optional-locks", "ls-files", "--", &arg], repo)
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Does this tasks path name a fixed place on disk (`/…`, `~`, `~/…`), as
@@ -764,6 +839,58 @@ fn project_tasks_root(default_path: &str, p: &Project) -> Result<PathBuf, String
     let root = project_tasks_root_with(default_path, p);
     check_tasks_root(&root, Path::new(&p.root_path))?;
     Ok(root)
+}
+
+/// Crash-safe replacement of a file: write a sibling temp file, sync it, then
+/// atomically `rename()` it over the destination, so a reader never sees a
+/// partial file. The parent dir is deliberately not fsynced: a hard power cut
+/// can lose the last write, but the file always reads as an intact version.
+pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Resolve symlinks: rename would replace the link itself with a regular
+    // file; we must write through to its target. canonicalize fails on a
+    // DANGLING link (dotfiles target not created yet), so follow links by
+    // hand in that case rather than clobbering the link.
+    let resolved = fs::canonicalize(dest).unwrap_or_else(|_| {
+        let mut cur = dest.to_path_buf();
+        for _ in 0..8 {
+            match fs::read_link(&cur) {
+                Ok(t) if t.is_absolute() => cur = t,
+                Ok(t) => cur = cur.parent().unwrap_or_else(|| Path::new(".")).join(t),
+                Err(_) => break,
+            }
+        }
+        cur
+    });
+    let dest = resolved.as_path();
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    let tmp = dir.join(format!(
+        ".{stem}.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        // A fresh temp inode gets default perms; carry the old mode so a
+        // tightened (e.g. chmod 600) file stays tightened. Log, don't fail:
+        // some mounts (FUSE/SMB) reject chmod but the write itself is fine.
+        if let Ok(meta) = fs::metadata(dest) {
+            if let Err(e) = f.set_permissions(meta.permissions()) {
+                eprintln!("[write_atomic] could not carry mode onto {}: {e}", dest.display());
+            }
+        }
+        f.write_all(bytes)?;
+        // Bytes must be durable before the rename is visible.
+        f.sync_data()?;
+        drop(f);
+        fs::rename(&tmp, dest)
+    };
+    let res = write();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
 // ───────────────────────────── projects IO ─────────────────────────────
@@ -934,7 +1061,8 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
     Ok(m)
 }
 fn save_projects(list: &[Project]) -> Result<()> {
-    fs::write(projects_file()?, serde_json::to_string_pretty(list)?)?;
+    let json = serde_json::to_string_pretty(list)?;
+    write_atomic(&projects_file()?, json.as_bytes())?;
     Ok(())
 }
 
@@ -946,7 +1074,10 @@ fn load_tasks() -> Vec<Task> {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&dir) {
         for entry in rd.flatten() {
-            if let Ok(s) = fs::read_to_string(entry.path()) {
+            let path = entry.path();
+            // Only real task records: skip write_atomic staging files, .DS_Store, etc.
+            if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+            if let Ok(s) = fs::read_to_string(&path) {
                 if let Ok(w) = serde_json::from_str::<Task>(&s) {
                     out.push(w);
                 }
@@ -955,6 +1086,184 @@ fn load_tasks() -> Vec<Task> {
     }
     sort_tasks(&mut out);
     out
+}
+
+// ── Port blocks (GH #196) ──
+// Each live task owns a consecutive block starting at its base port:
+//   1 ($TERMIC_PORT) + composition members + extra named ports
+//   + PORT_BLOCK_BUFFER (room for a future "add port to live task").
+// New tasks first-fit into the gaps left by non-archived tasks, so
+// archived blocks get reused. Replaces the old
+// `18100 + load_tasks().len()` formula, which could collide once a
+// multi-repo task's member ports (base+i+1) overlapped the next
+// count-derived base.
+const PORT_BASE: u16 = 18100;
+const PORT_BLOCK_BUFFER: u16 = 5;
+
+/// The one place the block arithmetic lives: 1 ($TERMIC_PORT) + one
+/// port per composition member + one per extra named port + the buffer.
+fn block_len(member_count: u16, extra_count: u16) -> u16 {
+    1 + member_count + extra_count + PORT_BLOCK_BUFFER
+}
+
+/// Serializes every load-occupancy -> allocate -> persist sequence
+/// (task create/import/open-repo, restore rehome, spawn top-up).
+/// Port allocation is a read-scan over the task files with no other
+/// synchronization, so two concurrent allocations against the same
+/// snapshot can pick the same block or stray. Hold this from the
+/// `load_tasks()` that feeds the scan until `save_task` has persisted
+/// the claimed ports.
+static PORT_ALLOC_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn task_block_len(task: &Task) -> u16 {
+    // Stored at allocation; the computed fallback covers records
+    // written before `port_block_len` existed (their extras count
+    // still equals the at-create shape until a top-up stamps it).
+    if task.port_block_len > 0 {
+        return task.port_block_len;
+    }
+    block_len(task.composition.len() as u16, task.extra_named_ports.len() as u16)
+}
+
+/// Every port interval a task occupies: its contiguous block plus any
+/// overflow pairs frozen OUTSIDE it (GH #196 strays, allocated one at
+/// a time once the buffer ran out). Legacy zero-port records occupy
+/// nothing.
+fn task_port_intervals(t: &Task) -> Vec<(u16, u16)> {
+    let mut v = Vec::new();
+    if t.port < PORT_BASE { return v; }
+    let end = t.port.saturating_add(task_block_len(t));
+    v.push((t.port, end));
+    for np in &t.extra_named_ports {
+        if np.port >= PORT_BASE && (np.port < t.port || np.port >= end) {
+            v.push((np.port, np.port.saturating_add(1)));
+        }
+    }
+    v
+}
+
+fn next_base_port(existing: &[Task], needed: u16) -> Result<u16, String> {
+    let mut blocks: Vec<(u16, u16)> = existing.iter()
+        .filter(|t| !t.archived)
+        .flat_map(task_port_intervals)
+        .collect();
+    blocks.sort_unstable();
+    let mut candidate = PORT_BASE;
+    for (start, end) in blocks {
+        if candidate.saturating_add(needed) <= start { break; }
+        if end > candidate { candidate = end; }
+    }
+    // Practically unreachable, but fail loudly instead of wrapping
+    // into a colliding or privileged port.
+    if candidate.checked_add(needed).is_none() {
+        return Err("no free port block below 65535".into());
+    }
+    Ok(candidate)
+}
+
+/// GH #196: archived tasks' blocks are reusable, so a task created
+/// while this one was archived may have first-fit into its block.
+/// Called on restore: when the block overlaps any LIVE task's block,
+/// move the whole thing (base, member ports, extra named ports) to a
+/// fresh allocation — otherwise two live tasks would race for the
+/// same listening ports. Returns true when the ports moved.
+fn rehome_ports_if_stolen(task: &mut Task, others: &[Task]) -> bool {
+    if task.port < PORT_BASE { return false; } // legacy record, nothing to rehome
+    // Compare full occupancy on both sides (block + overflow strays):
+    // an archived task's stray was just as invisible to allocation as
+    // its block, so either can have been claimed meanwhile.
+    let own = task_port_intervals(task);
+    let stolen = others.iter()
+        .filter(|t| !t.archived && t.id != task.id)
+        .flat_map(task_port_intervals)
+        .any(|(os, oe)| own.iter().any(|(s, e)| os < *e && *s < oe));
+    if !stolen { return false; }
+    // The fresh allocation is sized from the CURRENT extras count, so a
+    // re-home also re-compacts any strays back into one contiguous block.
+    let names: Vec<String> = task.extra_named_ports.iter().map(|np| np.name.clone()).collect();
+    let member_count = task.composition.len() as u16;
+    match allocate_task_ports(others, member_count, &names) {
+        Ok((base, extras, block_len)) => {
+            task.port = base;
+            for (i, m) in task.composition.iter_mut().enumerate() {
+                m.port = base + 1 + i as u16;
+            }
+            task.extra_named_ports = extras;
+            task.port_block_len = block_len;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// GH #196 on-the-fly ports: freeze any effective-config name this
+/// task doesn't carry yet, at spawn time. Already-frozen pairs never
+/// move; names removed from the config keep their frozen pair. New
+/// names land in the block's buffer slots first; once the buffer is
+/// exhausted they overflow to the next free SINGLE port anywhere
+/// (`task_port_intervals` counts those strays as occupied for every
+/// later allocation). `others` is the full task list for that overflow
+/// scan — a stale copy of self inside it is fine, it is filtered by
+/// id. Repeated top-ups of the SAME task are idempotent (same missing
+/// set, same slots), but that is not a concurrency guarantee: a stray
+/// allocated against a stale `others` snapshot can collide with a
+/// concurrent allocation, so callers hold PORT_ALLOC_LOCK from the
+/// `load_tasks()` that produced `others` until the task is persisted.
+/// Returns true when pairs were added (caller persists).
+fn top_up_extra_ports(task: &mut Task, proj: &Project, others: &[Task]) -> bool {
+    if task.port < PORT_BASE { return false; } // legacy record, no block
+    // Stamp the block length before consuming buffer: the computed
+    // fallback would otherwise grow with each added pair and creep
+    // into the neighbor task allocated right after this block.
+    if task.port_block_len == 0 {
+        task.port_block_len = task_block_len(task);
+    }
+    let members = task.composition.len() as u16;
+    let mut added = false;
+    for n in effective_extra_named_ports(proj) {
+        if task.extra_named_ports.iter().any(|np| np.name == n) { continue; }
+        let slot = 1 + members + task.extra_named_ports.len() as u16;
+        let port = if slot < task.port_block_len {
+            task.port + slot
+        } else {
+            // Buffer exhausted: first-fit a single stray port. Occupancy
+            // must reflect self's IN-PROGRESS state (pairs added earlier
+            // in this loop included), so swap the stale copy for a
+            // snapshot of the live one.
+            let mut occ: Vec<Task> = others.iter()
+                .filter(|t| t.id != task.id)
+                .cloned()
+                .collect();
+            occ.push(task.clone());
+            match next_base_port(&occ, 1) {
+                Ok(p) => p,
+                Err(_) => break, // port space exhausted; keep what we have
+            }
+        };
+        task.extra_named_ports.push(NamedPort { name: n, port });
+        added = true;
+    }
+    added
+}
+
+/// Allocate a new task's whole block: returns (base_port, frozen
+/// extra named ports, block_len to stamp on the task). `member_count`
+/// members occupy base+1+i; the extras follow at
+/// base + 1 + member_count + j, in list order.
+fn allocate_task_ports(
+    existing: &[Task],
+    member_count: u16,
+    extra_names: &[String],
+) -> Result<(u16, Vec<NamedPort>, u16), String> {
+    let needed = block_len(member_count, extra_names.len() as u16);
+    let base = next_base_port(existing, needed)?;
+    let extras = extra_names.iter().enumerate()
+        .map(|(j, n)| NamedPort {
+            name: n.clone(),
+            port: base + 1 + member_count + j as u16,
+        })
+        .collect();
+    Ok((base, extras, needed))
 }
 
 /// Sidebar order: manual position first, creation time as the tiebreak.
@@ -971,12 +1280,19 @@ fn sort_tasks(list: &mut [Task]) {
 }
 fn save_task(w: &Task) -> Result<()> {
     let f = tasks_dir()?.join(format!("{}.json", w.id));
-    fs::write(&f, serde_json::to_string_pretty(w)?)?;
+    let json = serde_json::to_string_pretty(w)?;
+    write_atomic(&f, json.as_bytes())?;
     Ok(())
 }
 fn delete_task_file(id: &str) -> Result<()> {
     let f = tasks_dir()?.join(format!("{id}.json"));
     let _ = fs::remove_file(f);
+    // The task record is gone for good (History's "Empty archive", or its
+    // project being removed), so its scratchpads have nowhere left to appear.
+    // ARCHIVING deliberately does not come through here: it is recoverable,
+    // and notes about the work are exactly what someone wants back when they
+    // restore a task (GH #244).
+    scratch_purge_task(id);
     Ok(())
 }
 
@@ -1078,8 +1394,14 @@ fn link_config_dir(repo: &Path, wt: &Path, name: &str) {
     let target = fs::canonicalize(&src).unwrap_or(src);
     #[cfg(unix)]
     let linked = std::os::unix::fs::symlink(&target, &dst).is_ok();
+    // Windows needs to know which kind it is up front, and the list is no
+    // longer dirs-only: `.mcp.json` is a file (GH #251).
     #[cfg(not(unix))]
-    let linked = std::os::windows::fs::symlink_dir(&target, &dst).is_ok();
+    let linked = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(&target, &dst).is_ok()
+    } else {
+        std::os::windows::fs::symlink_file(&target, &dst).is_ok()
+    };
     if linked {
         // The link is a symlink, which git's `<name>/` (directory) ignore
         // patterns do NOT match - so without this it shows as an untracked
@@ -1108,7 +1430,8 @@ fn ensure_git_excluded(repo: &Path, name: &str) {
     }
     body.push_str(name);
     body.push('\n');
-    let _ = fs::write(&exclude, body);
+    // Atomic: a torn rewrite here would eat the user's own exclude entries.
+    let _ = write_atomic(&exclude, body.as_bytes());
 }
 
 /// Write `schema_version = TASKS_SCHEMA_VERSION` into settings.json directly
@@ -1117,11 +1440,7 @@ fn ensure_git_excluded(repo: &Path, name: &str) {
 fn stamp_schema_version() {
     let mut s = settings_load();
     s.schema_version = TASKS_SCHEMA_VERSION;
-    if let Ok(f) = settings_file() {
-        if let Ok(txt) = serde_json::to_string_pretty(&s) {
-            let _ = fs::write(f, txt);
-        }
-    }
+    let _ = save_settings_inner(&s);
 }
 
 /// One-time flip of `cli_enabled` to true for profiles that predate the CLI
@@ -1569,6 +1888,23 @@ fn resolve_base_ref(repo: &Path, base: &str) -> String {
     "HEAD".to_string()
 }
 
+/// The ref a task's diff is taken against, or None when the worktree has no
+/// tracked baseline at all (a repo with no commits, where even HEAD resolves
+/// to nothing).
+///
+/// Split out from `task_diff_inner` so it can be tested: that function needs a
+/// task record on disk, and `TERMIC_DATA_DIR` is process-global (it would race
+/// parallel tests). Same reasoning as `apply_cli_default_migration`.
+fn diff_base_ref(wt: &Path, stored_base: &str) -> Option<String> {
+    let base = resolve_base_ref(wt, stored_base);
+    let exists = |r: &str| git(&["rev-parse", "--verify", "--quiet", r], wt).is_ok();
+    // HEAD as well as the base. On an unborn or orphan HEAD the base can
+    // resolve perfectly well while `git log <base>..HEAD` still fails, and
+    // reporting that as an error would bury the untracked files the scan
+    // downstream can still list.
+    (exists(&base) && exists("HEAD")).then_some(base)
+}
+
 // ───────────────────────────── PTY manager ─────────────────────────────
 
 struct PtySlot {
@@ -1600,10 +1936,58 @@ struct PtySlot {
     role: Option<PtyRole>,
     /// Retained output + live attach taps; allocated iff `role` is set.
     feed: Option<Arc<PtyFeed>>,
+    /// Purely INFORMATIONAL provenance for the Activity monitor, copied
+    /// from `SpawnArgs.owner`. Deliberately separate from both siblings
+    /// above: `task_id` doubles as the sandbox trigger and `role` makes a
+    /// PTY CLI-addressable (and allocates a retention ring), so neither
+    /// can be set on a plain shell or a run-script tab just to label it.
+    /// NOTHING may branch on this field except reporting.
+    owner: Option<PtyOwner>,
+    /// Total bytes this PTY has ever written, bumped by the reader thread.
+    /// Backs the monitor's output-rate column, which is the cheapest way to
+    /// spot a TUI repainting itself to death (docs/performance.md). Two
+    /// relaxed atomic ops per 64 KiB read, next to a mutex lock we already
+    /// take, so a quiet PTY still costs nothing.
+    out_bytes: Arc<AtomicU64>,
     /// Monotonic spawn order. A respawn briefly leaves the killed slot
     /// in the map next to its replacement (the waiter reaps it); role
     /// resolution breaks the tie toward the NEWEST slot.
     seq: u64,
+    /// Set by `pty_attached` once the webview has registered its
+    /// `pty://<id>` listener. The flusher holds its FIRST emit until then
+    /// (see `wait_for_attach`).
+    attached: Arc<AtomicBool>,
+    /// The reader -> flusher buffer + condvar, kept here so `pty_attached`
+    /// can flip the flag and wake the flusher under the SAME mutex the
+    /// `done` handshake uses. A store outside that mutex can land between
+    /// the flusher's check and its wait, and the wakeup is lost.
+    out_buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
+}
+
+/// How long the flusher holds a PTY's first output waiting for the webview
+/// to say it is listening. Sized for "the ack is late", not "the ack never
+/// comes": the normal ack lands within milliseconds of the spawn resolving,
+/// and after the grace expires output flows anyway, so a caller that never
+/// acks costs a one-time delay rather than a wedged terminal.
+const PTY_ATTACH_GRACE: Duration = Duration::from_secs(3);
+
+/// Block until the webview acks its listener, the process dies, or the grace
+/// expires. Split out of the flusher so the three exits are unit-testable
+/// without a real PTY (`wait_for_attach_*` tests).
+fn wait_for_attach(
+    buf: &(Mutex<Vec<u8>>, Condvar),
+    attached: &AtomicBool,
+    done: &AtomicBool,
+    grace: Duration,
+) {
+    let mut b = buf.0.lock();
+    let deadline = Instant::now() + grace;
+    loop {
+        if attached.load(Ordering::Acquire) || done.load(Ordering::Acquire) { return; }
+        let now = Instant::now();
+        if now >= deadline { return; }
+        buf.1.wait_for(&mut b, deadline - now);
+    }
 }
 
 fn next_pty_seq() -> u64 {
@@ -1636,6 +2020,30 @@ pub struct PtyRole {
     /// The task's default agent tab: `attach`/`logs`' default target.
     #[serde(default)]
     pub is_default: bool,
+}
+
+/// Where a PTY came from, for reporting only (the Activity monitor groups
+/// rows by project -> task -> tab with it). Every PTY should carry one,
+/// including the ones the sandbox and the CLI deliberately ignore: a
+/// scratch shell burning a core is exactly what the user opened the
+/// monitor to find.
+///
+/// Deserialize-only, like `PtyRole`: it arrives from the webview and is
+/// never sent back in this shape (the monitor re-emits the fields inside
+/// `procmon::ProcRow`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct PtyOwner {
+    /// Task this PTY belongs to. `None` for PTYs outside any task (the
+    /// Settings font preview shell).
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// The webview tab id, so the monitor can name the row after the tab
+    /// the user is looking at. `None` for surfaces with no tab identity.
+    #[serde(default)]
+    pub tab_id: Option<String>,
+    /// What the PTY is running: "agent" | "shell" | "aux" | "run" |
+    /// "setup" | "custom". Drives the row's icon and its fallback label.
+    pub kind: String,
 }
 
 /// What an attach tap receives. `Data` is raw PTY output; `Detach` is a
@@ -2009,6 +2417,11 @@ pub struct SpawnArgs {
     /// cannot address this PTY and no output is retained for it.
     #[serde(default)]
     pub role: Option<PtyRole>,
+    /// Reporting-only provenance for the Activity monitor (see `PtyOwner`).
+    /// Absent = the PTY shows up as an unattributed row rather than under
+    /// its task, which is a labelling loss and nothing more.
+    #[serde(default)]
+    pub owner: Option<PtyOwner>,
 }
 fn default_rows() -> u16 { 40 }
 fn default_cols() -> u16 { 120 }
@@ -2112,10 +2525,61 @@ fn member_effective_script(
 /// override wins when non-empty, otherwise the repo's committed
 /// `.termic.yaml` list. Same override rule as `effective_scripts`.
 fn effective_files_to_copy(proj: &Project) -> Vec<String> {
+    effective_files_to_copy_from(&repo_config_for(proj), proj)
+}
+
+/// Same, against an already-loaded config — creation paths load
+/// `.termic.yaml` ONCE and thread it into every consumer instead of
+/// re-parsing the file per helper call.
+fn effective_files_to_copy_from(cfg: &repo_config::RepoConfig, proj: &Project) -> Vec<String> {
     if !proj.files_to_copy.is_empty() {
         return proj.files_to_copy.clone();
     }
-    repo_config_for(proj).scripts.files_to_copy
+    cfg.scripts.files_to_copy.clone()
+}
+
+/// Env var names an extra named port may NOT use (GH #196): termic's
+/// own vars (incl. every var pty_spawn injects after the env overlay:
+/// COLORTERM, TERM_PROGRAM, ...), the preview-URL tokens ($PORT), and
+/// common shell/system vars a numeric override would break. Mirrored
+/// in src/lib/namedPorts.ts for the Settings editor.
+const RESERVED_PORT_NAMES: &[&str] = &[
+    "TERMIC_PORT", "TERMIC_TASK", "TERMIC_TASK_ID", "TERMIC_WORKSPACE_NAME",
+    "TERMIC_CLI", "TERMIC_CLI_HELP", "CONDUCTOR_PORT", "CONDUCTOR_WORKSPACE_NAME",
+    "PORT", "PATH", "HOME", "SHELL", "USER", "TMPDIR", "PWD", "TERM", "LANG",
+    "COLORFGBG", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+];
+
+/// A usable extra-named-port env var name: a POSIX env key
+/// (shell_env::is_env_key), not reserved, and not in the
+/// `TERMIC_PORT_<DIR>` sibling-port namespace (a multi-repo member dir
+/// would collide with it, with opposite precedence per spawn site).
+/// Names are used verbatim (free text per GH #196, no case transform).
+fn valid_port_name(name: &str) -> bool {
+    shell_env::is_env_key(name)
+        && !RESERVED_PORT_NAMES.contains(&name)
+        && !name.starts_with("TERMIC_PORT_")
+}
+
+/// Effective extra named port NAMES for a project: the committed
+/// `.termic.yaml` list unioned with the personal projects.json list
+/// (yaml order first), deduped by exact name, invalid / reserved
+/// names dropped. Ports get allocated per task at creation.
+fn effective_extra_named_ports(proj: &Project) -> Vec<String> {
+    effective_extra_named_ports_from(&repo_config_for(proj), proj)
+}
+
+/// Same, against an already-loaded config (see
+/// `effective_files_to_copy_from` for why the split exists).
+fn effective_extra_named_ports_from(cfg: &repo_config::RepoConfig, proj: &Project) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for n in cfg.extra_named_ports.iter().chain(proj.extra_named_ports.iter()) {
+        let n = n.trim();
+        if !valid_port_name(n) { continue; }
+        if seen.insert(n.to_string()) { out.push(n.to_string()); }
+    }
+    out
 }
 
 /// Whether a PTY slot is still live. The CLI's delivery confirmation
@@ -2125,6 +2589,26 @@ fn effective_files_to_copy(proj: &Project) -> Vec<String> {
 #[tauri::command]
 fn pty_alive(state: State<'_, PtyManager>, id: String) -> bool {
     state.inner.lock().contains_key(&id)
+}
+
+/// The webview says it has registered its `pty://<id>` listener, so output
+/// may go on the wire. MUST be called by every caller of `pty_spawn`, right
+/// after `listen()` resolves: until it lands the flusher holds the child's
+/// output (bounded by `PTY_ATTACH_GRACE`), and everything emitted before a
+/// listener exists is dropped by Tauri with no trace.
+///
+/// Idempotent, and a no-op for an id that already left the map (a process
+/// that exited before the ack).
+#[tauri::command]
+fn pty_attached(state: State<'_, PtyManager>, id: String) {
+    let map = state.inner.lock();
+    let Some(slot) = map.get(&id) else { return };
+    // Under the buffer mutex, exactly like the reader's `done` store: a store
+    // outside it can land between the flusher's check and its wait, and that
+    // wakeup is lost (the terminal then waits out the whole grace).
+    let _b = slot.out_buf.0.lock();
+    slot.attached.store(true, Ordering::Release);
+    slot.out_buf.1.notify_all();
 }
 
 #[tauri::command]
@@ -2224,6 +2708,12 @@ fn pty_spawn(
     for (k, v) in &args.env {
         cmd.env(k, v);
     }
+    // INVARIANT: everything `cmd.env`'d from here down is applied AFTER
+    // the caller's overlay above, so it silently overrides any extra
+    // named port (GH #196) a user gave the same name. That is exactly
+    // what RESERVED_PORT_NAMES exists to prevent: any var added below
+    // this line must also be added to that list (both the Rust copy and
+    // the src/lib/namedPorts.ts mirror; a test pins them equal).
     // Multi-repo: expose sibling ports so the agent (or anything the
     // user runs in this PTY) can `curl localhost:$TERMIC_PORT_API`
     // without hardcoding. Same scheme as the script-stream spawn.
@@ -2266,10 +2756,12 @@ fn pty_spawn(
             // Agent-agnostic discovery hint, the TERMIC_SANDBOX_HELP
             // precedent: any agent that inspects its env learns how to
             // use the control plane without a vendor-specific skill
-            // file. Keep it to the two rules agents get wrong.
+            // file. Keep it to the rules agents get wrong, of which the
+            // biggest is reaching for `--wait` instead of asking the other
+            // agent to prompt them back (src/lib/agentBriefing.ts).
             cmd.env(
                 "TERMIC_CLI_HELP",
-                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. To create a task that returns a result: `\"$TERMIC_CLI\" new <name> --sandbox enforce --wait -p \"<task>; write your findings to RESULT.md\"`, then read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\" --wait`. Branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names).",
+                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\"`; create one with `\"$TERMIC_CLI\" new <name> --sandbox enforce -p \"<task>; write your findings to RESULT.md\"` and read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Coordinate by prompting each other, not by blocking: end every prompt you send with the command you want run when that work is done, in DOUBLE quotes so your own shell fills in your address: `\"$TERMIC_CLI\" send <task> -p \"<work>. When done: \\\"$TERMIC_CLI\\\" send $TERMIC_TASK_ID -p 'done: <what you did>'\"`. Every prompt that arrives in your own terminal is one of those reports. Prefer that over `--wait`: work-done detection is a heuristic, and a waiting agent can do nothing else meanwhile. If you do wait, branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. A task sandboxed in enforce/enforce-fs is denied the control plane by design and can never report back: ask it for a file in its worktree instead. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused). Once you know the real subject of your work (issue filed, PR opened), retitle your task so the sidebar reads well: `\"$TERMIC_CLI\" rename \"<new name>\"` renames your own task's label (branch and directory keep their names).",
             );
         }
     }
@@ -2326,10 +2818,25 @@ fn pty_spawn(
     let pty_buf: Arc<(Mutex<Vec<u8>>, Condvar)> =
         Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    // Flipped by `pty_attached`. Tauri events are fire-and-forget, so every
+    // byte the flusher emits before the webview's `listen()` resolves reaches
+    // nobody and is gone: the child starts writing the moment it is forked,
+    // while the listener costs a spawn round trip plus the renderer's own
+    // async work to register. A CLI that paints a banner and one OSC title at
+    // startup and then waits on stdin (every agent we ship) can lose BOTH and
+    // sit there blank forever, which is what the Activity spec kept hitting on
+    // a loaded CI runner.
+    let attached: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // CLI feed (ring buffer + attach taps) only for PTYs the CLI can
     // address; everything else keeps the zero-overhead path.
     let feed = args.role.as_ref().map(|_| Arc::new(PtyFeed::new()));
+
+    // Output byte counter for the Activity monitor. Unconditional (unlike
+    // `feed`): it is one atomic per read, and the PTYs with no role are
+    // exactly the ones — scratch shells, run scripts — whose output rate
+    // the user has no other way to see.
+    let out_bytes = Arc::new(AtomicU64::new(0));
 
     // Reader thread: drain PTY bytes into the shared buffer and wake the
     // flusher only when there is actually something to flush.
@@ -2339,12 +2846,15 @@ fn pty_spawn(
     let id_final = id.clone();
     let id_r = id.clone();
     let feed_r = feed.clone();
+    let out_bytes_r = out_bytes.clone();
+    let attached_r = attached.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    out_bytes_r.fetch_add(n as u64, Ordering::Relaxed);
                     buf_r.0.lock().extend_from_slice(&buf[..n]);
                     buf_r.1.notify_all();
                     if let Some(feed) = &feed_r {
@@ -2362,6 +2872,12 @@ fn pty_spawn(
         // so the waiter can fire pty-exit after all output is on the wire.
         let remaining = std::mem::take(&mut *buf_r.0.lock());
         if !remaining.is_empty() {
+            // Same gate as the flusher, for the same reason: a process that
+            // prints and exits faster than the webview can register its
+            // listener (a one-shot command in a terminal tab) would otherwise
+            // have its ENTIRE output emitted to nobody. `done` is still false
+            // here, so this waits on the ack, not on itself.
+            wait_for_attach(&buf_r, &attached_r, &done_r, PTY_ATTACH_GRACE);
             let _ = app_final.emit(&format!("pty://{}", id_final), PtyChunk { data: remaining });
         }
         // Set `done` and notify UNDER the buffer mutex. The flusher and the
@@ -2387,8 +2903,13 @@ fn pty_spawn(
     let buf_f = pty_buf.clone();
     let done_f = reader_done.clone();
     let app_f = app.clone();
+    let attached_f = attached.clone();
     thread::spawn(move || {
         let interval = Duration::from_millis(8);
+        // Nothing goes on the wire until someone is listening. The reader
+        // keeps filling the buffer meanwhile, so this delays the first paint
+        // by however long the ack takes and loses nothing.
+        wait_for_attach(&buf_f, &attached_f, &done_f, PTY_ATTACH_GRACE);
         loop {
             {
                 let mut b = buf_f.0.lock();
@@ -2483,7 +3004,11 @@ fn pty_spawn(
             task_id: args.task_id.clone(),
             role: args.role.clone(),
             feed,
+            owner: args.owner.clone(),
+            out_bytes,
             seq: next_pty_seq(),
+            attached,
+            out_buf: pty_buf,
         },
     );
 
@@ -2586,6 +3111,8 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
         remote,
         preview_url: String::new(),
+        // None = follow the global "Preview browser" setting (GH #245).
+        preview_browser: None,
         // Seeded with the patterns 99% of repos benefit from. The user can
         // tune these in Settings → Repositories → Files to copy.
         //   .env*         — local secrets git ignores. Without these the
@@ -2625,6 +3152,7 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
         // New projects start ungrouped; grouping is a sidebar action.
         group: None,
         run_scripts: Vec::new(),
+        extra_named_ports: Vec::new(),
     };
     list.push(p.clone());
     save_projects(&list).map_err(|e| e.to_string())?;
@@ -2784,6 +3312,7 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
         remote,
         preview_url: String::new(),
+        preview_browser: None,
         // No file-copy defaults for multi-repo: each member already has
         // its own copy list; the host repo is for docs/skills, not code.
         files_to_copy: Vec::new(),
@@ -2802,6 +3331,7 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
         non_git,
         group: None,
         run_scripts: Vec::new(),
+        extra_named_ports: Vec::new(),
     };
     list.push(p.clone());
     save_projects(&list).map_err(|e| e.to_string())?;
@@ -2945,6 +3475,15 @@ fn seeded_session_ids(
     ids
 }
 
+/// Normalize a create-time resume-args override the same way
+/// `task_set_resume_override` does: trimmed, and empty means "no override"
+/// rather than "override with nothing" (which would strip the resume block
+/// entirely). Kept as one function so the create paths and the edit command
+/// can't disagree about what blank means.
+fn normalized_resume_override(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Open the project's main repo checkout as a task (no git worktree).
 /// NOT idempotent: several repo-root sessions may share one checkout, so
 /// every call seeds a new task pointing at `project.root_path`. A
@@ -2967,6 +3506,7 @@ fn task_open_repo(
     sandbox_rw_paths: Option<Vec<String>>,
     sandbox_allowed_hosts: Option<Vec<String>>,
     resume_session_id: Option<String>,
+    resume_override: Option<String>,
 ) -> Result<Task, String> {
     let proj = load_projects().into_iter().find(|p| p.id == project_id)
         .ok_or("project not found")?;
@@ -2985,7 +3525,24 @@ fn task_open_repo(
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "HEAD".to_string())
     };
-    let port = 18100 + (load_tasks().len() as u16);
+    let extra_names = effective_extra_named_ports(&proj);
+    // Allocate the block against the member-count UPPER BOUND (the loop
+    // below may skip invalid / duplicate / symlink-conflicting members),
+    // but freeze the extras only AFTER the loop, offset by the ACTUAL
+    // composition length. task_block_len later derives the block from
+    // composition.len() + extras, so extras frozen at the upper-bound
+    // offset could land outside the recorded block and collide with the
+    // next task's base once skips exceed the buffer.
+    let member_count_hint = if proj.project_type == ProjectType::Multi {
+        proj.members.len() as u16
+    } else { 0 };
+    // Stamped as port_block_len below: the hint-based allocation is the
+    // recorded block even when members get skipped, so the unused tail
+    // just widens this task's buffer.
+    let port_block_len = block_len(member_count_hint, extra_names.len() as u16);
+    // Held until save_task below persists the claimed block.
+    let _port_guard = PORT_ALLOC_LOCK.lock();
+    let port = next_base_port(&load_tasks(), port_block_len)?;
 
     // Multi-repo project opened in REPO mode: drop a symlink for
     // each member into the host's working dir so the agent at the
@@ -3045,6 +3602,15 @@ fn task_open_repo(
         // the user might prefer to track these. Non-fatal.
         let _ = ensure_multirepo_gitignore(host_dir, &dir_names);
     }
+
+    // Freeze extras right after the ACTUAL members (see the allocation
+    // comment above) so they sit inside the block task_block_len records.
+    let extra_named_ports: Vec<NamedPort> = extra_names.iter().enumerate()
+        .map(|(j, n)| NamedPort {
+            name: n.clone(),
+            port: port + 1 + composition.len() as u16 + j as u16,
+        })
+        .collect();
 
     let explicit_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let derived = explicit_name.is_none();
@@ -3122,8 +3688,10 @@ fn task_open_repo(
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         composition,
+        extra_named_ports,
+        port_block_len,
         custom_command,
-        resume_override: None,
+        resume_override: normalized_resume_override(resume_override),
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
@@ -3225,6 +3793,7 @@ fn task_import_worktree(
     sandbox_rw_paths: Option<Vec<String>>,
     sandbox_allowed_hosts: Option<Vec<String>>,
     resume_session_id: Option<String>,
+    resume_override: Option<String>,
     yolo: Option<bool>,
 ) -> Result<Task, String> {
     let proj = load_projects().into_iter().find(|p| p.id == project_id)
@@ -3252,6 +3821,9 @@ fn task_import_worktree(
     // LIVE tasks only: an archived task keeps its old path on the record
     // (the dir is gone), and counting it would refuse re-adopting that
     // path forever with a wrong message.
+    // Port lock held until save_task below: `existing_tasks` also feeds
+    // the port allocation, so it must stay the authoritative occupancy.
+    let _port_guard = PORT_ALLOC_LOCK.lock();
     let existing_tasks = load_tasks();
     if existing_tasks.iter().any(|w| !w.archived && canon_str(&w.path) == wt_canon) {
         return Err("this worktree is already open as a task".into());
@@ -3261,7 +3833,11 @@ fn task_import_worktree(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     let cli = cli.unwrap_or_else(|| proj.default_cli.clone());
-    let port = 18100 + (existing_tasks.len() as u16);
+    // Parse `.termic.yaml` once for this creation (extras + sandbox below).
+    let repo_cfg = repo_config_for(&proj);
+    let extra_names = effective_extra_named_ports_from(&repo_cfg, &proj);
+    let (port, extra_named_ports, port_block_len) =
+        allocate_task_ports(&existing_tasks, 0, &extra_names)?;
     let explicit_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let derived = explicit_name.is_none();
     let ws_name = explicit_name
@@ -3293,7 +3869,7 @@ fn task_import_worktree(
         out
     };
     let sandbox_enabled = sandbox_enabled.unwrap_or(
-        proj.default_sandbox || repo_config_for(&proj).sandbox.enabled_by_default,
+        proj.default_sandbox || repo_cfg.sandbox.enabled_by_default,
     );
     let sandbox_mode = sandbox_mode.or(proj.default_sandbox_mode)
         .unwrap_or(if sandbox_enabled { SandboxMode::Enforce } else { SandboxMode::Off });
@@ -3331,8 +3907,10 @@ fn task_import_worktree(
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         composition: Vec::new(),
+        extra_named_ports,
+        port_block_len,
         custom_command: None,
-        resume_override: None,
+        resume_override: normalized_resume_override(resume_override),
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
@@ -3352,13 +3930,31 @@ fn task_import_worktree(
 /// progress modal opens (the user's exact complaint). See the
 /// "Long-running IPC discipline" section in CLAUDE.md.
 #[tauri::command]
-async fn task_create(args: CreateTaskArgs) -> Result<Task, String> {
-    tauri::async_runtime::spawn_blocking(move || task_create_sync(args))
+async fn task_create(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String> {
+    tauri::async_runtime::spawn_blocking(move || task_create_sync(app, args))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
+/// Emits one progress line on the SAME `setup-output://{id}` channel the
+/// setup script streams into after the worktree exists (see
+/// task_create_multi_sync's emits below). Reusing the channel means the
+/// frontend's single listener, registered before `task_create` is invoked,
+/// carries the whole creation timeline (worktree add → file copy → setup
+/// script) with no second event name to wire up. Progress is best-effort:
+/// a dropped event only costs a missing log line, never the creation itself.
+fn emit_create_progress(app: &AppHandle, task_id: &str, line: impl Into<String>) {
+    let _ = app.emit(&format!("setup-output://{task_id}"), serde_json::json!({ "line": line.into() }));
+}
+
+fn task_create_sync(app: AppHandle, args: CreateTaskArgs) -> Result<Task, String> {
+    // Resolved up front (not at Task construction, further down) so every
+    // progress event below — including ones emitted before the Task exists —
+    // lands on the channel the frontend is already listening on. The dialog
+    // always sends `args.id` (it generates the uuid before invoking, so it
+    // can subscribe before the race window); the fallback only matters for
+    // non-UI callers (CLI `new_task`), which don't listen anyway.
+    let task_id = args.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     let projects = load_projects();
     let proj = projects.iter().find(|p| p.id == args.project_id)
         .ok_or("project not found")?.clone();
@@ -3467,18 +4063,29 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         vec!["worktree", "add", wt_arg, &branch]
     };
     let add_result = if branch_exists {
+        emit_create_progress(&app, &task_id, format!("Branch '{branch}' already exists locally, reusing it."));
+        emit_create_progress(&app, &task_id, format!("Adding worktree at {}…", wt_path.display()));
         git(&add_args, &repo)
     } else {
         // Refresh the remote-tracking base ref first so the new branch is cut
         // from the latest remote commit, not a stale local origin/* (GH #79).
         // Best-effort and time-bounded — see git_fetch_base.
         if fetch_before_create_enabled() {
+            emit_create_progress(&app, &task_id, format!("Fetching '{base_full}' from origin…"));
             git_fetch_base(&repo, &base_full);
         }
         // Resolve to a ref that exists (local-only repos have no origin/main).
         let base_ref = resolve_base_ref(&repo, &base_full);
-        match git(&["branch", "--no-track", &branch, &base_ref], &repo) {
-            Ok(_) => git(&add_args, &repo),
+        emit_create_progress(&app, &task_id, format!("Branching '{branch}' from '{base_ref}'…"));
+        let branch_result = match git(&["branch", "--no-track", &branch, &base_ref], &repo) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        match branch_result {
+            Ok(()) => {
+                emit_create_progress(&app, &task_id, format!("Adding worktree at {}…", wt_path.display()));
+                git(&add_args, &repo)
+            }
             Err(e) => Err(e),
         }
     };
@@ -3491,6 +4098,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         }
         return Err(e.to_string());
     }
+    emit_create_progress(&app, &task_id, "Worktree added.");
 
     // git-crypt: bridge the key dir from the common .git into the new
     // worktree's per-worktree gitdir, then run a full checkout so the
@@ -3500,6 +4108,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
     // one. If anything here fails, we leave the half-checked-out
     // worktree in place and bubble up a useful error.
     if has_git_crypt {
+        emit_create_progress(&app, &task_id, "git-crypt detected, bridging the key and checking out…");
         // Per-worktree gitdir = <common>/worktrees/<slug>. Resolve via
         // `git -C <new-worktree> rev-parse --git-dir` to be robust.
         let wt_gitdir_raw = git(&["rev-parse", "--git-dir"], &wt_path)
@@ -3529,7 +4138,14 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
 
     // Copy files_to_copy (glob patterns relative to repo root) —
     // the repo's `.termic.yaml` list merged with the project override.
-    for pat in &effective_files_to_copy(&proj) {
+    // Parse `.termic.yaml` once for this creation (files here, extras +
+    // sandbox default below).
+    let repo_cfg = repo_config_for(&proj);
+    let copy_patterns = effective_files_to_copy_from(&repo_cfg, &proj);
+    if !copy_patterns.is_empty() {
+        emit_create_progress(&app, &task_id, format!("Copying {} file pattern(s): {}", copy_patterns.len(), copy_patterns.join(", ")));
+    }
+    for pat in &copy_patterns {
         copy_matching(&repo, &wt_path, pat);
     }
 
@@ -3539,11 +4155,20 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
     // (Settings.worktree_symlink_paths); each entry is linked only when it
     // exists in the repo and the checkout/copy didn't already provide it.
     for name in &globals.worktree_symlink_paths {
+        let existed = wt_path.join(name).exists();
         link_config_dir(&repo, &wt_path, name);
+        if !existed && wt_path.join(name).exists() {
+            emit_create_progress(&app, &task_id, format!("Linked {name}."));
+        }
     }
 
-    // Allocate port (18100 + index).
-    let port = 18100 + (load_tasks().len() as u16);
+    // Allocate the task's port block (base + extras + buffer).
+    // Released right after save_task below persists the claimed block.
+    emit_create_progress(&app, &task_id, "Allocating ports…");
+    let port_guard = PORT_ALLOC_LOCK.lock();
+    let extra_names = effective_extra_named_ports_from(&repo_cfg, &proj);
+    let (port, extra_named_ports, port_block_len) =
+        allocate_task_ports(&load_tasks(), 0, &extra_names)?;
 
     let cli = args.cli.unwrap_or_else(|| proj.default_cli.clone());
     // Only "custom" tasks carry a pre-set launch command; agent/shell tasks
@@ -3563,7 +4188,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
     // team-shared default; the project's local `default_sandbox`
     // (projects.json) is the personal one. Either flips it on.
     let sandbox_enabled = args.sandbox_enabled.unwrap_or(
-        proj.default_sandbox || repo_config_for(&proj).sandbox.enabled_by_default,
+        proj.default_sandbox || repo_cfg.sandbox.enabled_by_default,
     );
     let sandbox_mode = args.sandbox_mode.or(proj.default_sandbox_mode)
         .unwrap_or(if sandbox_enabled { SandboxMode::Enforce } else { SandboxMode::Off });
@@ -3595,7 +4220,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
     // task-wide flag).
     let agent_session_ids = seeded_session_ids(&cli, args.resume_session_id.as_deref());
     let task = Task {
-        id: args.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        id: task_id.clone(),
         project_id: proj.id.clone(),
         name: args.name,
         branch,
@@ -3619,10 +4244,12 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         // (task_create_multi) that populates this and re-uses
         // the same Task + sandbox plumbing.
         composition: Vec::new(),
+        extra_named_ports,
+        port_block_len,
         // Set only for `cli == "custom"` worktree tasks (quick "Custom
         // command" in worktree mode); None for agent / shell worktrees.
         custom_command,
-        resume_override: None,
+        resume_override: normalized_resume_override(args.resume_override.clone()),
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
@@ -3632,6 +4259,8 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
+    drop(port_guard);
+    emit_create_progress(&app, &task_id, format!("Worktree ready (port {port})."));
 
     // Setup no longer runs here. It used to fire in a background thread and
     // stream to the New Task dialog via setup-output/setup-done, which the
@@ -3670,6 +4299,10 @@ pub struct CreateMultiArgs {
     pub sandbox_rw_paths: Option<Vec<String>>,
     #[serde(default)]
     pub sandbox_allowed_hosts: Option<Vec<String>>,
+    /// Resume-args override for the host task, set at create so the first
+    /// spawn already carries it. Same storage as `task_set_resume_override`.
+    #[serde(default)]
+    pub resume_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3710,6 +4343,10 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     if host.project_type != ProjectType::Multi {
         return Err("task_create_multi requires a multi-repo project".into());
     }
+    // Same up-front resolution as task_create_sync: the dialog always sends
+    // `args.id`, generated before invoking so it can subscribe to
+    // `setup-output://{id}` first. See emit_create_progress.
+    let task_id = args.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let slug = slugify(&args.name);
     // Same empty-slug guard as task_create_sync: an all-punctuation name
@@ -3773,6 +4410,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         // agent running at the wrapper loads them, exactly as it would
         // from a git host worktree. Members get worktree'd / symlinked
         // into the wrapper below, same as the git path.
+        emit_create_progress(&app, &task_id, "Non-git host, creating wrapper dir…");
         fs::create_dir_all(&wrapper).map_err(|e| format!("create wrapper dir failed: {e}"))?;
         for shared in &["CLAUDE.md", "AGENTS.md", "GEMINI.md", ".claude", ".gemini", ".codex"] {
             let src = host_repo.join(shared);
@@ -3792,21 +4430,28 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         // create site for the rationale.
         let branch_exists = git(&["rev-parse", "--verify", &branch], &host_repo).is_ok();
         let create_result = if branch_exists {
+            emit_create_progress(&app, &task_id, format!("Adding host worktree at {}…", wrapper.display()));
             git(&["worktree", "add", wrapper.to_str().unwrap(), &branch], &host_repo)
         } else {
             // Refresh the base ref before cutting the host branch (GH #79).
             if do_fetch {
+                emit_create_progress(&app, &task_id, format!("Fetching '{base_branch}' from origin…"));
                 git_fetch_base(&host_repo, &base_branch);
             }
             let base_ref = resolve_base_ref(&host_repo, &base_branch);
+            emit_create_progress(&app, &task_id, format!("Branching host '{branch}' from '{base_ref}'…"));
             match git(&["branch", "--no-track", &branch, &base_ref], &host_repo) {
-                Ok(_) => git(&["worktree", "add", wrapper.to_str().unwrap(), &branch], &host_repo),
+                Ok(_) => {
+                    emit_create_progress(&app, &task_id, format!("Adding host worktree at {}…", wrapper.display()));
+                    git(&["worktree", "add", wrapper.to_str().unwrap(), &branch], &host_repo)
+                }
                 Err(e) => Err(e),
             }
         };
         if let Err(e) = create_result {
             return Err(format!("host worktree add failed: {e}"));
         }
+        emit_create_progress(&app, &task_id, "Host worktree added.");
     }
 
     // Helper that tears down everything we've created so far on
@@ -3835,11 +4480,22 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     // can unwind a partial composition.
     let mut composition: Vec<TaskMember> = Vec::new();
     let mut done: Vec<(ProjectMember, CreateMultiMember, String, MemberMode, String)> = Vec::new();
-    // Per-member port counter — each member gets task.port+i+1
-    // so two members running PORT=$TERMIC_PORT npm run dev don't
-    // collide. We bumped 'port' below already by load_tasks().len()
-    // for the task itself; members live in the gap above it.
-    let ws_port = 18100 + (load_tasks().len() as u16);
+    // Allocate the task's whole port block up front (GH #196): base
+    // ($TERMIC_PORT) + one port per member + the host's extra named
+    // ports + buffer. Members get base+1+i via the counter below;
+    // the extras land right after the members. The port lock spans the
+    // member-creation loop (the record persists only after it), so a
+    // multi create briefly serializes other allocations; creates are
+    // rare enough that this beats persisting a half-built record.
+    // Reentrancy: safe to hold across the loop because members are
+    // created inline (git worktree / symlink), never via another
+    // allocation path, and PORT_ALLOC_LOCK's other takers are all
+    // frontend-invoked commands, not callees of this fn. Released
+    // right after save_task below persists the claimed block.
+    let port_guard = PORT_ALLOC_LOCK.lock();
+    let extra_names = effective_extra_named_ports(&host);
+    let (ws_port, extra_named_ports, port_block_len) =
+        allocate_task_ports(&load_tasks(), frozen.len() as u16, &extra_names)?;
     let mut next_member_port = ws_port + 1;
     for (mp, spec, dir_name) in frozen.into_iter() {
         let member_port = next_member_port;
@@ -3847,6 +4503,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         let target = wrapper.join(&dir_name);
         match spec.mode {
             MemberMode::RepoRoot => {
+                emit_create_progress(&app, &task_id, format!("Linking member '{dir_name}' to its live checkout…"));
                 if let Err(e) = std::os::unix::fs::symlink(&mp.root_path, &target) {
                     rollback(&done);
                     return Err(format!("symlink {dir_name}: {e}"));
@@ -3882,14 +4539,17 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                 // the remote upstream).
                 let mexists = git(&["rev-parse", "--verify", &mbranch], &mrepo).is_ok();
                 let mres = if mexists {
+                    emit_create_progress(&app, &task_id, format!("Adding member '{dir_name}' worktree on '{mbranch}'…"));
                     git(&["worktree", "add", target.to_str().unwrap(), &mbranch], &mrepo)
                 } else {
                     // Refresh this member's base ref before cutting its branch,
                     // honoring the member's own remote/base (GH #79).
                     if do_fetch {
+                        emit_create_progress(&app, &task_id, format!("Fetching '{mbase}' for member '{dir_name}'…"));
                         git_fetch_base(&mrepo, &mbase);
                     }
                     let mbase_ref = resolve_base_ref(&mrepo, &mbase);
+                    emit_create_progress(&app, &task_id, format!("Branching member '{dir_name}' ('{mbranch}') from '{mbase_ref}'…"));
                     match git(&["branch", "--no-track", &mbranch, &mbase_ref], &mrepo) {
                         Ok(_) => git(&["worktree", "add", target.to_str().unwrap(), &mbranch], &mrepo),
                         Err(e) => Err(e),
@@ -3899,6 +4559,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                     rollback(&done);
                     return Err(format!("member {dir_name} worktree add failed: {e}"));
                 }
+                emit_create_progress(&app, &task_id, format!("Member '{dir_name}' worktree added."));
                 composition.push(TaskMember {
                     project_id: String::new(),
                     repo_path: mp.root_path.clone(),
@@ -3979,9 +4640,11 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     let sandbox_allowed_hosts = args.sandbox_allowed_hosts.unwrap_or(base_hosts);
 
     let cli = args.cli.unwrap_or_else(|| host.default_cli.clone());
-    let port = 18100 + (load_tasks().len() as u16);
+    // Block base allocated above, before the members were created.
+    let port = ws_port;
+    emit_create_progress(&app, &task_id, "Worktrees ready, finishing setup…");
     let task = Task {
-        id: args.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        id: task_id.clone(),
         project_id: host.id.clone(),
         name: args.name,
         branch,
@@ -4001,8 +4664,10 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         sandbox_rw_paths,
         sandbox_allowed_hosts,
         composition,
+        extra_named_ports,
+        port_block_len,
         custom_command: None,
-        resume_override: None,
+        resume_override: normalized_resume_override(args.resume_override.clone()),
         persisted_tabs: Vec::new(),
         right_split_tabs: Vec::new(),
                 split_layout: None,
@@ -4012,6 +4677,7 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
         archived_at: None,
     };
     save_task(&task).map_err(|e| e.to_string())?;
+    drop(port_guard);
 
     // Streamed setup: host's project.setup_script (cwd=wrapper)
     // first, then each member's setup_script (cwd=member.path) in
@@ -4056,6 +4722,10 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
             (format!("TERMIC_PORT_{sanitized}"), p)
         })
         .collect();
+    // Extra named ports (GH #196), frozen on the task above.
+    let extra_ports: Vec<(String, u16)> = task.extra_named_ports.iter()
+        .map(|np| (np.name.clone(), np.port))
+        .collect();
     if member_setups.is_empty() {
         let _ = app.emit(&format!("setup-done://{}", task.id),
             serde_json::json!({ "code": 0, "success": true }));
@@ -4084,6 +4754,9 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
                     cmd.env(k, v);
                 }
                 for (k, v) in &sibling_ports {
+                    cmd.env(k, v.to_string());
+                }
+                for (k, v) in &extra_ports {
                     cmd.env(k, v.to_string());
                 }
                 let spawn_res = cmd.spawn();
@@ -4163,7 +4836,8 @@ fn ensure_multirepo_gitignore(wrapper: &Path, member_dirs: &[String]) -> std::io
         next.push('\n');
     }
     next.push_str(END); next.push('\n');
-    fs::write(&path, next)
+    // Atomic: the file carries the user's own rules outside the managed block.
+    write_atomic(&path, next.as_bytes())
 }
 
 /// Persist the sidebar order of ONE project's tasks. `ids` is that
@@ -4291,23 +4965,22 @@ fn task_set_resume_override(id: String, command: String) -> Result<Task, String>
 fn task_set_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String> {
     let mut list = load_tasks();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
-    // Carry forward each surviving tab's session uuids by id (both the live
-    // uuid and the stashed previous one, owned by the dedicated commands).
-    let prior: std::collections::HashMap<String, (Option<String>, Option<String>)> = w
+    // Carry forward each surviving tab's session uuid by id (owned by
+    // task_set_tab_session_id, not by this payload).
+    let prior: std::collections::HashMap<String, Option<String>> = w
         .persisted_tabs
         .iter()
-        .map(|t| (t.id.clone(), (t.session_id.clone(), t.previous_session_id.clone())))
+        .map(|t| (t.id.clone(), t.session_id.clone()))
         .collect();
     let next: Vec<PersistedTab> = tabs
         .into_iter()
         .map(|t| {
-            let p = prior.get(&t.id).cloned().unwrap_or((None, None));
+            let p = prior.get(&t.id).cloned().flatten();
             PersistedTab {
                 // Stored uuid wins; only fall back to the payload's session_id
                 // for a tab we've never seen (migrating a legacy per-cli uuid
                 // onto the default tab on its first persist).
-                session_id: p.0.or(t.session_id),
-                previous_session_id: p.1.or(t.previous_session_id),
+                session_id: p.or(t.session_id),
                 id: t.id,
                 cli: t.cli,
                 title: t.title,
@@ -4316,6 +4989,7 @@ fn task_set_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String>
                 command: t.command,
                 pane_leaf_id: t.pane_leaf_id,
                 run_member: t.run_member,
+                pinned: t.pinned,
             }
         })
         .collect();
@@ -4331,9 +5005,9 @@ fn task_set_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String>
                 && a.is_default == b.is_default
                 && a.command == b.command
                 && a.session_id == b.session_id
-                && a.previous_session_id == b.previous_session_id
                 && a.pane_leaf_id == b.pane_leaf_id
                 && a.run_member == b.run_member
+                && a.pinned == b.pinned
         });
     if same {
         return Ok(());
@@ -4369,27 +5043,6 @@ fn task_set_tab_session_id(id: String, tab_id: String, uuid: String) -> Result<(
     Ok(())
 }
 
-/// Stash (or clear) the session uuid a resume attempt just failed on, so a
-/// transient `--resume` fast-exit is recoverable instead of permanently
-/// lost. Mirrors `task_set_tab_session_id`; an empty uuid clears the slot
-/// (the user dismissed the offer, or the recover succeeded).
-#[tauri::command]
-fn task_set_tab_previous_session_id(id: String, tab_id: String, uuid: String) -> Result<(), String> {
-    let mut list = load_tasks();
-    let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
-    let tab = match w.persisted_tabs.iter_mut().find(|t| t.id == tab_id) {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let next = if uuid.is_empty() { None } else { Some(uuid) };
-    if tab.previous_session_id == next {
-        return Ok(());
-    }
-    tab.previous_session_id = next;
-    save_task(w).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Persist the JSON-encoded SplitTree for a task so the split layout
 /// can be restored on the next relaunch. Pass `None` to clear (no splits).
 #[tauri::command]
@@ -4411,18 +5064,17 @@ fn task_set_split_layout(id: String, layout: Option<String>) -> Result<(), Strin
 fn task_set_right_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), String> {
     let mut list = load_tasks();
     let w = list.iter_mut().find(|w| w.id == id).ok_or("no such task")?;
-    let prior: std::collections::HashMap<String, (Option<String>, Option<String>)> = w
+    let prior: std::collections::HashMap<String, Option<String>> = w
         .right_split_tabs
         .iter()
-        .map(|t| (t.id.clone(), (t.session_id.clone(), t.previous_session_id.clone())))
+        .map(|t| (t.id.clone(), t.session_id.clone()))
         .collect();
     let next: Vec<PersistedTab> = tabs
         .into_iter()
         .map(|t| {
-            let p = prior.get(&t.id).cloned().unwrap_or((None, None));
+            let p = prior.get(&t.id).cloned().flatten();
             PersistedTab {
-                session_id: p.0.or(t.session_id),
-                previous_session_id: p.1.or(t.previous_session_id),
+                session_id: p.or(t.session_id),
                 id: t.id,
                 cli: t.cli,
                 title: t.title,
@@ -4431,6 +5083,7 @@ fn task_set_right_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), S
                 command: t.command,
                 pane_leaf_id: None,
                 run_member: None,
+                pinned: t.pinned,
             }
         })
         .collect();
@@ -4443,7 +5096,6 @@ fn task_set_right_tabs(id: String, tabs: Vec<PersistedTabInput>) -> Result<(), S
                 && a.is_default == b.is_default
                 && a.command == b.command
                 && a.session_id == b.session_id
-                && a.previous_session_id == b.previous_session_id
         });
     if same {
         return Ok(());
@@ -4647,9 +5299,7 @@ fn agent_sandbox_add_allowed_path(agent_id: String, path: String) -> Result<(), 
     if !a.sandbox_allowed_paths.iter().any(|p| p == &stored) {
         a.sandbox_allowed_paths.push(stored);
     }
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    Ok(())
+    save_settings_inner(&s)
 }
 
 #[tauri::command]
@@ -4661,9 +5311,7 @@ fn agent_sandbox_add_allowed_host(agent_id: String, host: String) -> Result<(), 
     if !a.sandbox_allowed_hosts.iter().any(|h| h == &host) {
         a.sandbox_allowed_hosts.push(host);
     }
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    Ok(())
+    save_settings_inner(&s)
 }
 
 /// Append a host to the task's `sandbox_allowed_hosts` list and
@@ -5004,6 +5652,136 @@ pub(crate) fn kill_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     count
 }
 
+// ─────────────────── Activity monitor (see procmon.rs) ───────────────────
+
+/// Window label for the Activity monitor. It is a SEPARATE window, not a
+/// modal: the whole point is watching an agent's CPU while you type at it,
+/// which a modal makes impossible. The cost is one extra WKWebView content
+/// process, so the monitor reports its own rows too rather than hiding
+/// what it added.
+const PROCMON_WINDOW: &str = "procmon";
+
+/// Copy the live PTY map into sampler inputs. The manager lock is held
+/// only long enough to clone metadata: every syscall the sampler makes
+/// happens outside it, so sweeping a few hundred processes can never stall
+/// `pty_write` on the IPC thread (docs/ipc.md).
+fn procmon_roots(manager: &PtyManager) -> Vec<procmon::Root> {
+    let mut roots: Vec<procmon::Root> = {
+        let map = manager.inner.lock();
+        map.iter()
+            .filter_map(|(id, slot)| {
+                // No pid means the spawn failed; there is nothing to sample.
+                let pid = slot.child_pid?;
+                let owner = slot.owner.as_ref();
+                let role = slot.role.as_ref();
+                Some(procmon::Root {
+                    key: format!("pty:{id}"),
+                    kind: owner
+                        .map(|o| o.kind.clone())
+                        .or_else(|| role.map(|r| r.kind.clone()))
+                        .unwrap_or_else(|| "shell".to_string()),
+                    pty_id: Some(id.clone()),
+                    // Three fallbacks, most specific first: `owner` is the
+                    // reporting field, `role` covers PTYs spawned before it
+                    // existed, and `slot.task_id` covers sandboxed agents
+                    // whose role was somehow absent. Any of them beats
+                    // stranding the row outside its task.
+                    task_id: owner
+                        .and_then(|o| o.task_id.clone())
+                        .or_else(|| role.map(|r| r.task_id.clone()))
+                        .or_else(|| slot.task_id.clone()),
+                    tab_id: owner
+                        .and_then(|o| o.tab_id.clone())
+                        .or_else(|| role.and_then(|r| r.tab_id.clone())),
+                    pid,
+                    out_bytes: Some(slot.out_bytes.load(Ordering::Relaxed)),
+                })
+            })
+            .collect()
+    };
+    // Termic itself, so our own cost sits in the same table as the agents'
+    // instead of being taken on faith. Every PTY is one of our children, so
+    // the sampler excludes their subtrees from this row.
+    roots.push(procmon::Root {
+        key: "app".into(),
+        kind: "app".into(),
+        pty_id: None,
+        task_id: None,
+        tab_id: None,
+        pid: std::process::id(),
+        out_bytes: None,
+    });
+    roots
+}
+
+#[tauri::command]
+fn procmon_start(state: State<'_, PtyManager>) -> procmon::Snapshot {
+    procmon::start(procmon_roots(&state))
+}
+
+#[tauri::command]
+fn procmon_sample(
+    state: State<'_, PtyManager>,
+    session: u64,
+) -> Result<procmon::Snapshot, String> {
+    procmon::sample(session, procmon_roots(&state))
+}
+
+#[tauri::command]
+fn procmon_stop(session: u64) {
+    procmon::stop(session);
+}
+
+/// Signal one process the monitor is showing. `procmon::signal` re-derives
+/// the process tree and refuses any pid that is not inside one of OUR PTY
+/// subtrees, so this is not a general-purpose `kill` exposed to the webview.
+#[tauri::command]
+fn procmon_signal(
+    state: State<'_, PtyManager>,
+    pid: u32,
+    signal: String,
+) -> Result<(), String> {
+    procmon::signal(&procmon_roots(&state), pid, &signal)
+}
+
+/// Open (or re-focus) the Activity window. Created from Rust so no new
+/// `core:window:allow-create` capability has to be granted to the webview.
+/// Sampling is bound to this window's lifetime: closing it drops the
+/// session, and with it every last byte of sampler state.
+#[tauri::command]
+fn procmon_open_window(app: AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window(PROCMON_WINDOW) {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let win = tauri::WebviewWindowBuilder::new(
+        &app,
+        PROCMON_WINDOW,
+        // Its own Vite entry (activity.html), NOT index.html: the monitor's
+        // webview must not load xterm / WebGL / CodeMirror to draw a table.
+        tauri::WebviewUrl::App("activity.html".into()),
+    )
+    .title("Activity")
+    .inner_size(880.0, 620.0)
+    .min_inner_size(560.0, 320.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    // A window closed by its red button never unmounts React cleanly, so
+    // the frontend's `procmon_stop` may not run. Drop the session here too:
+    // there is no thread to stop, but a stale session would keep a dead
+    // PTY's history alive until the next `start`.
+    win.on_window_event(|event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            procmon::stop_all();
+        }
+    });
+    let _ = win.set_focus();
+    Ok(())
+}
+
 /// How long a task's children get to exit on their own after SIGTERM before
 /// archive stops waiting and SIGKILLs them.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -5297,13 +6075,13 @@ fn task_archive_sync(id: String, delete_branch: bool) -> Result<(), String> {
             // via `.termic.yaml` still tears down.
             let script = member_effective_script(m, |s| s.archive.clone(), &m.archive_script);
             if !script.trim().is_empty() && Path::new(&m.path).exists() {
-                let _ = run_script(&script, Path::new(&m.path), w.port, &w.name);
+                let _ = run_script(&script, Path::new(&m.path), w.port, &w.name, &w.extra_named_ports);
             }
         }
     } else if let Some(p) = &proj {
         let archive = effective_scripts(p).2;
         if !archive.trim().is_empty() {
-            let _ = run_script(&archive, Path::new(&w.path), w.port, &w.name);
+            let _ = run_script(&archive, Path::new(&w.path), w.port, &w.name, &w.extra_named_ports);
         }
     }
 
@@ -5476,6 +6254,19 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
     // Repo-root tasks have no dedicated worktree to recreate — the task
     // IS the main checkout. Just unarchive the record and return.
     if list[idx].is_main_checkout {
+        // Fresh occupancy under the port lock (not the earlier `list`
+        // load): a create finishing in between could have claimed this
+        // task's block without appearing in the stale snapshot. Adopt
+        // the fresh on-disk record too, not just the occupancy: saving
+        // the fn-start copy would silently drop pairs a concurrent
+        // top-up persisted meanwhile. Everything restore does before
+        // this point only READS the record, so nothing is lost.
+        let _port_guard = PORT_ALLOC_LOCK.lock();
+        let snapshot = load_tasks();
+        if let Some(fresh) = snapshot.iter().find(|t| t.id == id) {
+            list[idx] = fresh.clone();
+        }
+        rehome_ports_if_stolen(&mut list[idx], &snapshot);
         list[idx].archived = false;
         list[idx].archived_at = None;
         save_task(&list[idx]).map_err(|e| e.to_string())?;
@@ -5653,16 +6444,32 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
         }
     }
 
-    // Unarchive and persist.
+    // Unarchive and persist. A task created while this one was archived
+    // may have reused its port block (GH #196) — rehome before going live.
+    // Fresh occupancy under the port lock, not the fn-start `list` load:
+    // the worktree recreation above takes long enough for a concurrent
+    // create to have claimed this block without appearing in that snapshot.
+    // Adopt the fresh on-disk record too, not just the occupancy: saving
+    // the fn-start copy would silently drop pairs a concurrent top-up
+    // persisted meanwhile. Everything restore does before this point only
+    // READS the record, so nothing is lost. Released right after the
+    // save_task below persists the (possibly re-homed) ports.
+    let port_guard = PORT_ALLOC_LOCK.lock();
+    let snapshot = load_tasks();
+    if let Some(fresh) = snapshot.iter().find(|t| t.id == id) {
+        list[idx] = fresh.clone();
+    }
+    rehome_ports_if_stolen(&mut list[idx], &snapshot);
     list[idx].archived = false;
     save_task(&list[idx]).map_err(|e| e.to_string())?;
+    drop(port_guard);
     let task = list[idx].clone();
 
     // Run setup script(s) fire-and-forget, same as creation.
     if task.composition.is_empty() {
         let (setup, _, _) = effective_scripts(&proj);
         if !setup.trim().is_empty() {
-            run_script_streaming(setup, wt_path, task.port, task.name.clone(), app, task.id.clone());
+            run_script_streaming(setup, wt_path, task.port, task.name.clone(), task.extra_named_ports.clone(), app, task.id.clone());
         }
     } else {
         for m in &task.composition {
@@ -5672,6 +6479,7 @@ fn task_restore_sync(app: AppHandle, id: String) -> Result<Task, String> {
                     PathBuf::from(&m.path),
                     if m.port > 0 { m.port } else { task.port },
                     task.name.clone(),
+                    task.extra_named_ports.clone(),
                     app.clone(),
                     task.id.clone(),
                 );
@@ -5696,7 +6504,7 @@ fn task_run_script(id: String, which: String) -> Result<String, String> {
     if script.trim().is_empty() {
         return Err("script empty".into());
     }
-    run_script(&script, Path::new(&w.path), w.port, &w.name).map_err(|e| e.to_string())
+    run_script(&script, Path::new(&w.path), w.port, &w.name, &w.extra_named_ports).map_err(|e| e.to_string())
 }
 
 /// The complete delta a task (worktree) produced vs its base, for the Agent
@@ -5729,27 +6537,48 @@ async fn task_diff(id: String) -> Result<TaskDiffSummary, String> {
 pub(crate) fn task_diff_inner(id: String) -> Result<TaskDiffSummary, String> {
     let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
     load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
-    let base = w.base_branch.clone();
     let wt = PathBuf::from(&w.path);
+    // Through resolve_base_ref like every other consumer of a stored base
+    // (task create, races, merge/archive). The stored value is a
+    // remote-tracking ref, and a repo with no remote has none of those: it is
+    // still pinned to "origin/main", because detect_default_remote names the
+    // remote it wishes existed. Diffing against that ref fails, and this
+    // function used to swallow the failure into an empty string, so every task
+    // in a local-only repo reported no changes at all.
+    //
+    // None means no tracked baseline exists (a repo with no commits); the
+    // untracked scan below still reports the files.
+    let base_ref = diff_base_ref(&wt, &w.base_branch);
 
     // Diff base..working-tree, NOT base..HEAD: a raced agent usually leaves its
     // work uncommitted, so base..HEAD would show nothing. `git diff <base>` is
     // the cumulative delta of commits + staged + unstaged (same reasoning as
     // task_send_diff_to_main) - everything the agent actually produced.
-    let commits = git(&["--no-pager", "log", "--oneline", &format!("{base}..HEAD")], &wt).unwrap_or_default();
-    let mut diff = git(&["--no-pager", "diff", &base], &wt).unwrap_or_default();
-
-    // Precise counts from --numstat (`<ins>\t<del>\t<path>` per file; binary
-    // files emit `-\t-`, which parse to 0).
-    let numstat = git(&["--no-pager", "diff", "--numstat", &base], &wt).unwrap_or_default();
+    //
+    // A failure here is reported, never folded into zeros: "no changes" and
+    // "could not work out the changes" are different answers, and only one of
+    // them is worth showing to someone deciding whether to merge.
+    let mut commits = String::new();
+    let mut diff = String::new();
     let mut files_changed = 0usize;
     let mut insertions = 0usize;
     let mut deletions = 0usize;
-    for line in numstat.lines().filter(|l| !l.trim().is_empty()) {
-        let mut cols = line.split('\t');
-        insertions += cols.next().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-        deletions += cols.next().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-        files_changed += 1;
+    if let Some(base) = base_ref {
+        let diff_failed = |what: &str, e: anyhow::Error| format!("{what} against {base}: {e}");
+        commits = git(&["--no-pager", "log", "--oneline", &format!("{base}..HEAD")], &wt)
+            .map_err(|e| diff_failed("git log", e))?;
+        diff = git(&["--no-pager", "diff", &base], &wt).map_err(|e| diff_failed("git diff", e))?;
+
+        // Precise counts from --numstat (`<ins>\t<del>\t<path>` per file; binary
+        // files emit `-\t-`, which parse to 0).
+        let numstat = git(&["--no-pager", "diff", "--numstat", &base], &wt)
+            .map_err(|e| diff_failed("git diff --numstat", e))?;
+        for line in numstat.lines().filter(|l| !l.trim().is_empty()) {
+            let mut cols = line.split('\t');
+            insertions += cols.next().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+            deletions += cols.next().and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+            files_changed += 1;
+        }
     }
 
     // Untracked (new) files, honoring .gitignore, folded in as additions so an
@@ -6108,7 +6937,7 @@ fn task_changes(id: String) -> Result<TaskChanges, String> {
 // the repo's own cwd. The frontend re-prefixes with `dir_name` only when
 // it opens a member diff.
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct GitFile {
     /// Single-character status for this side: index status for staged
     /// entries (M/A/D/R/C), worktree status for unstaged (M/D), or "?"
@@ -6121,6 +6950,14 @@ pub struct GitFile {
     /// mark once the agent touches the file again (the fingerprint moves).
     #[serde(default)]
     pub fp: String,
+    /// Lines added / removed for this path. Only Compare (GH #208) fills these
+    /// in (`--numstat` over the whole range); the staging lists leave them
+    /// unset rather than paying for a second git process per status poll.
+    /// `None` also covers a binary file, which numstat reports as `-`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<u32>,
 }
 
 /// Cheap working-tree fingerprint for change detection: modification time
@@ -6165,6 +7002,23 @@ pub struct GitRepo {
     /// than shown. Typical cause: large untracked dirs (e.g. node_modules)
     /// not in .gitignore.
     pub truncated: bool,
+    /// Commits on this branch that its upstream does not have, i.e. what a
+    /// push would send. 0 when there is no upstream, because "everything is
+    /// unpushed" is not a number worth badging: the Push button offers to
+    /// create the upstream instead.
+    pub ahead: usize,
+}
+
+/// `git rev-list --count @{upstream}..HEAD`, or 0 when the branch has no
+/// upstream or no commits. Cheap: a count, not a walk the caller sees.
+fn ahead_count(cwd: &Path) -> usize {
+    if git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd).is_err() {
+        return 0;
+    }
+    git(&["rev-list", "--count", "@{upstream}..HEAD"], cwd)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -6193,16 +7047,16 @@ fn parse_porcelain_line(line: &str) -> (Option<GitFile>, Option<GitFile>) {
 
     // Untracked: both columns are "?". Treat as a single unstaged add.
     if x == "?" {
-        return (None, Some(GitFile { status: "?".into(), path, fp: String::new() }));
+        return (None, Some(GitFile { status: "?".into(), path, ..Default::default() }));
     }
 
     let staged = if x != " " {
-        Some(GitFile { status: x.into(), path: path.clone(), fp: String::new() })
+        Some(GitFile { status: x.into(), path: path.clone(), ..Default::default() })
     } else {
         None
     };
     let unstaged = if y != " " {
-        Some(GitFile { status: y.into(), path, fp: String::new() })
+        Some(GitFile { status: y.into(), path, ..Default::default() })
     } else {
         None
     };
@@ -6250,6 +7104,7 @@ async fn task_git_status(id: String) -> Result<GitStatus, String> {
                 last_commit_message: last_msg(p),
                 staged, unstaged,
                 truncated,
+                ahead: ahead_count(p),
             }
         };
 
@@ -6802,6 +7657,936 @@ async fn task_git_update_info(id: String, dir_name: String) -> Result<UpdateInfo
     .map_err(|e| e.to_string())?
 }
 
+// ───────────────────────── git graph (issue #199) ─────────────────────────
+//
+// Committed history for the right panel's Graph tab. Agents commit a lot and
+// those commits vanished from the UI the moment the working tree went clean —
+// this is where they come back.
+//
+// One `git log` per page. Fields are separated by US (0x1f) and records by RS
+// (0x1e) rather than newlines, because a commit subject can contain anything
+// except a newline but a REF NAME can't contain either, and %D expands to a
+// comma-list whose length we can't predict.
+
+/// One row of the graph: enough to lay out lanes (`parents`) and draw the row.
+#[derive(Clone, Debug, Serialize)]
+pub struct GitCommit {
+    pub sha: String,
+    /// 7+ char abbreviation git itself chose (unambiguous in this repo).
+    pub short: String,
+    /// Parent shas, FIRST PARENT FIRST. Lane layout depends on that order.
+    pub parents: Vec<String>,
+    pub subject: String,
+    pub author: String,
+    pub email: String,
+    /// Author date, unix seconds. Formatted in the frontend so it follows the
+    /// user's locale and can re-render as "3 minutes ago" without a refetch.
+    pub timestamp: i64,
+    /// Decorations as git prints them, already split: "HEAD -> main",
+    /// "origin/main", "tag: v1.2.0", …
+    pub refs: Vec<String>,
+    /// This commit is not reachable from the branch's upstream, i.e. it is
+    /// still local-only. Drives the "unpushed" marker (VS Code calls these
+    /// outgoing changes). Always false when the branch has no upstream.
+    pub unpushed: bool,
+    /// Message below the subject, trailers included, exactly as committed.
+    /// Empty for a one-line commit. Feeds the row's hover card; the frontend
+    /// pulls `Co-authored-by:` out of it rather than git doing it here, so the
+    /// raw message stays the thing that crossed the wire.
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GitLogPage {
+    pub commits: Vec<GitCommit>,
+    /// Another page exists below this one (asked for limit+1, got it).
+    pub has_more: bool,
+    /// Branch the log was taken on, "" on a detached HEAD or unborn branch.
+    pub branch: String,
+    /// Upstream ref (`origin/feature-x`), "" when the branch has none. When
+    /// empty the frontend hides the unpushed markers entirely rather than
+    /// claiming every commit is outgoing.
+    pub upstream: String,
+}
+
+/// %H sha, %h short, %P parents, %an author, %ae email, %at date, %D refs,
+/// %s subject, %b body. RS-terminated so a record is unambiguous, which is what
+/// lets the body carry newlines and still be one field.
+///
+/// Shared by the history page and by `task_git_commit_meta`'s single-commit
+/// read, so the blame popup and the History row cannot describe one commit
+/// differently.
+const GIT_LOG_FORMAT: &str = "--pretty=format:%H\u{1f}%h\u{1f}%P\u{1f}%an\u{1f}%ae\u{1f}%at\u{1f}%D\u{1f}%s\u{1f}%b\u{1e}";
+
+/// Parse `git log`'s US/RS-delimited output into commits. Split out from the
+/// command so it can be tested without a repo.
+fn parse_git_log(out: &str, unpushed: &std::collections::HashSet<String>) -> Vec<GitCommit> {
+    let mut commits = Vec::new();
+    for rec in out.split('\u{1e}') {
+        let rec = rec.trim_start_matches('\n');
+        if rec.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = rec.split('\u{1f}').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let sha = f[0].to_string();
+        commits.push(GitCommit {
+            unpushed: unpushed.contains(&sha),
+            short: f[1].to_string(),
+            parents: f[2].split_whitespace().map(str::to_string).collect(),
+            author: f[3].to_string(),
+            email: f[4].to_string(),
+            timestamp: f[5].trim().parse().unwrap_or(0),
+            // "HEAD -> main, origin/main, tag: v1" → ["HEAD -> main", …].
+            refs: f[6]
+                .split(", ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            subject: f.get(7).copied().unwrap_or_default().to_string(),
+            // Trailing blank lines are git's, not the author's.
+            body: f.get(8).copied().unwrap_or_default().trim_end().to_string(),
+            sha,
+        });
+    }
+    commits
+}
+
+/// One selectable ref for the History tab's scope picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitRef {
+    /// Short name as the user knows it: `main`, `origin/main`, `v1.2.0`.
+    pub name: String,
+    /// Abbreviated sha it points at, shown beside the name.
+    pub sha: String,
+    /// "branch" | "remote" | "tag", so the picker can group and icon them.
+    pub kind: String,
+}
+
+/// Every ref the History scope picker may offer, which is also the ALLOWLIST
+/// the log validates against. Nothing else may reach a `git log` argv: a
+/// caller-supplied revision string is otherwise one `--upload-pack=…` away
+/// from being a flag, and rejecting anything not enumerated here is the only
+/// check that cannot be out-thought by a clever ref name.
+fn git_refs(cwd: &Path) -> Vec<GitRef> {
+    // %(refname:short) is the name a user types; %(objectname:short) the sha
+    // shown beside it. Sorted so the freshest branch is first, which is almost
+    // always the one being looked for.
+    let out = git(
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)\u{1f}%(objectname:short)\u{1f}%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+        cwd,
+    )
+    .unwrap_or_default();
+
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let name = parts.next()?.trim();
+            let sha = parts.next()?.trim();
+            let full = parts.next()?.trim();
+            if name.is_empty() || sha.is_empty() {
+                return None;
+            }
+            // `origin/HEAD` is a symbolic alias for another entry in this same
+            // list. Offering it would let the user pick the same history twice
+            // under two names.
+            if name.ends_with("/HEAD") {
+                return None;
+            }
+            let kind = if full.starts_with("refs/heads/") {
+                "branch"
+            } else if full.starts_with("refs/remotes/") {
+                "remote"
+            } else {
+                "tag"
+            };
+            Some(GitRef { name: name.to_string(), sha: sha.to_string(), kind: kind.to_string() })
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn task_git_refs(id: String, dir_name: String) -> Result<Vec<GitRef>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<GitRef>, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let cwd = repo_cwd(&w, &dir_name)?;
+        Ok(git_refs(&cwd))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Keep only refs that actually exist in `cwd`, preserving the caller's order
+/// and dropping duplicates. An allowlist, deliberately: see `git_refs`.
+fn allowed_refs(cwd: &Path, requested: &[String]) -> Vec<String> {
+    let known: std::collections::HashSet<String> =
+        git_refs(cwd).into_iter().map(|r| r.name).collect();
+    let mut seen = std::collections::HashSet::new();
+    requested
+        .iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| known.contains(r) && seen.insert(r.clone()))
+        .collect()
+}
+
+/// A page of committed history for the History tab.
+///
+/// Scope, in precedence order: `all_branches` is `--all` (every ref in the
+/// repo, siblings included); otherwise `refs` names the ones to walk, which is
+/// the picker's multi-select; otherwise the default is HEAD alone, the "what
+/// did the agent just do?" question the tab was built for.
+///
+/// Ordered `--topo-order` so a branch reads as one contiguous run of rows
+/// instead of being interleaved by commit date.
+fn git_log_page(
+    cwd: &Path,
+    skip: usize,
+    limit: usize,
+    all_branches: bool,
+    first_parent: bool,
+    grep: &str,
+    refs: &[String],
+) -> GitLogPage {
+    // Bounded: a page is a screenful-ish, and an unbounded limit from a buggy
+    // caller would walk a 200k-commit repo on the UI's behalf.
+    let limit = limit.clamp(1, 1_000);
+
+    let branch = git(&["branch", "--show-current"], cwd)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let upstream = git(
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd,
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
+    // Local-only commits, for the outgoing markers. Cheap (rev-list of the
+    // ahead range) and skipped entirely without an upstream.
+    let unpushed: std::collections::HashSet<String> = if upstream.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        git(&["rev-list", &format!("{upstream}..HEAD")], cwd)
+            .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+            .unwrap_or_default()
+    };
+
+    const FORMAT: &str = GIT_LOG_FORMAT;
+    // One extra row tells us whether a next page exists without a second
+    // walk; it is dropped before returning.
+    let max = (limit + 1).to_string();
+    let skip_s = skip.to_string();
+    let mut args: Vec<&str> = vec![
+        "--no-pager", "log", "--topo-order", FORMAT,
+        "--max-count", &max, "--skip", &skip_s,
+    ];
+    // "What landed on this branch, in order": follow only the first parent of
+    // every merge, so a merged side branch collapses into the merge commit
+    // that brought it in instead of opening a lane of its own. Every commit
+    // git reports is still a genuine ancestor either way; this only chooses
+    // how much of the topology to walk. Ignored under --all, where the point
+    // is to see every tip.
+    if first_parent && !all_branches {
+        args.push("--first-parent");
+    }
+    // Message search, done by git rather than by filtering the page already on
+    // screen: "does this branch have a commit about X" is a question about the
+    // history, and answering it from the loaded rows would make it a question
+    // about how far the user had scrolled.
+    //
+    // FIXED-STRINGS, not a regex: this is a filter box, so `[` or `*` in it is
+    // a character someone typed, not a pattern, and a half-typed regex must
+    // not turn into an error toast mid-keystroke. The query cannot reach argv
+    // as a flag either, being glued to `--grep=` in one element.
+    let grep_arg;
+    if !grep.trim().is_empty() {
+        grep_arg = format!("--grep={}", grep.trim());
+        args.push("--regexp-ignore-case");
+        args.push("--fixed-strings");
+        args.push(&grep_arg);
+    }
+    // Allowlisted before it can reach argv, and appended last so a ref can
+    // never be read as one of the flags above.
+    let picked = if all_branches { Vec::new() } else { allowed_refs(cwd, refs) };
+    if all_branches {
+        args.push("--all");
+    } else {
+        // Every requested ref was unknown (deleted branch, stale UI). Falling
+        // through to the HEAD default would silently answer a different
+        // question, so answer none: an empty page reads as "that scope is
+        // gone" instead of "here is main again".
+        if !refs.is_empty() && picked.is_empty() {
+            return GitLogPage {
+                commits: Vec::new(),
+                has_more: false,
+                branch,
+                upstream,
+            };
+        }
+        args.extend(picked.iter().map(|s| s.as_str()));
+    }
+    // An unborn branch (no commits yet) makes `git log` fail; that is an empty
+    // graph, not an error the user should see.
+    let out = git(&args, cwd).unwrap_or_default();
+    let mut commits = parse_git_log(&out, &unpushed);
+    let has_more = commits.len() > limit;
+    commits.truncate(limit);
+
+    GitLogPage { commits, has_more, branch, upstream }
+}
+
+#[tauri::command]
+async fn task_git_log(
+    id: String,
+    dir_name: String,
+    skip: usize,
+    limit: usize,
+    all_branches: bool,
+    first_parent: Option<bool>,
+    grep: Option<String>,
+    refs: Option<Vec<String>>,
+) -> Result<GitLogPage, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<GitLogPage, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let cwd = repo_cwd(&w, &dir_name)?;
+        Ok(git_log_page(
+            &cwd, skip, limit, all_branches,
+            first_parent.unwrap_or(false),
+            grep.as_deref().unwrap_or(""),
+            &refs.unwrap_or_default(),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One commit referenced by a blame result, deduped: a file whose 15k lines
+/// come from 169 commits ships 169 of these, not 15k.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct BlameCommit {
+    pub sha: String,
+    /// Author name as recorded on the commit. `.mailmap` is applied by git
+    /// (blame honours it), so this is the canonical name, not the raw one.
+    pub author: String,
+    pub author_email: String,
+    /// Author time, unix seconds. Formatted on the frontend so the relative
+    /// age stays live without re-blaming.
+    pub author_time: i64,
+    /// Commit subject (first line). NOT the body: the annotation is one line
+    /// of dimmed text, and the body would have to be truncated anyway.
+    pub summary: String,
+    /// The all-zero sha git uses for lines that are not committed yet. Split
+    /// out so the frontend does not have to know that convention.
+    pub uncommitted: bool,
+}
+
+/// Whole-file blame, shaped for a per-line lookup on the frontend.
+///
+/// The wire format is deliberately NOT one record per line. `--line-porcelain`
+/// on this repo's own `lib.rs` (15,742 lines) is 7 MB, and `--porcelain` is
+/// still 1.6 MB because it echoes the file content back. Deduping to a commit
+/// table plus a `u32` index per line puts the same information in ~63 KB, and
+/// that matters because this crosses the IPC boundary into a WKWebView.
+#[derive(Clone, Debug, Serialize)]
+pub struct BlameFile {
+    pub commits: Vec<BlameCommit>,
+    /// `lines[n]` is the index into `commits` for 1-based line `n + 1`.
+    /// `u32::MAX` means git attributed no commit to that line, which should
+    /// not happen but is cheaper to tolerate than to trust.
+    pub lines: Vec<u32>,
+    /// HEAD at blame time, so the caller can tell a stale cache entry from a
+    /// fresh one without re-running blame.
+    pub head: String,
+    /// The file was too long to blame (see `BLAME_MAX_LINES`) and `commits` /
+    /// `lines` are empty. A distinct signal from "no blame data", so the UI
+    /// can stay silent instead of looking broken.
+    pub skipped: bool,
+}
+
+/// Blame is skipped above this. It deliberately mirrors `task_file_read`'s own
+/// 2 MB text cap rather than inventing a second policy: a file the editor
+/// refuses to open has no buffer to annotate, and a file it will open is worth
+/// blaming (`lib.rs`, 15,742 lines, is ~200 ms with `--incremental`). Checked
+/// with one `metadata` call, so the guard itself costs nothing.
+const BLAME_MAX_BYTES: u64 = 2_000_000;
+
+/// Absurd-input backstop for the line index. Nothing legitimate reaches it
+/// (2 MB of one-byte lines is a million), it just stops a malformed or hostile
+/// blame header from asking for an arbitrary allocation.
+const BLAME_MAX_LINES: usize = 4_000_000;
+
+/// Parse `git blame --incremental` into the deduped shape above.
+///
+/// `--incremental` is the cheapest of the three machine formats because it
+/// emits no file content at all, and it repeats a commit's header block only
+/// on that commit's FIRST group. Groups arrive commit-major, not line-major,
+/// hence the index write per group rather than a straight push.
+///
+/// Format, per group: a `<sha> <orig-line> <result-line> <num-lines>` header,
+/// then `key value` lines (only for a commit not yet seen), then `filename`.
+fn parse_git_blame_incremental(out: &str) -> (Vec<BlameCommit>, Vec<u32>) {
+    use std::collections::HashMap;
+    let mut commits: Vec<BlameCommit> = Vec::new();
+    let mut index: HashMap<String, u32> = HashMap::new();
+    // Length comes from git's own line numbers rather than from a separate
+    // read of the file: counting newlines ourselves would mean reading every
+    // byte a second time, and a file rewritten between the two reads would
+    // give an index that disagrees with the blame.
+    let mut lines: Vec<u32> = Vec::new();
+    // The group being read: which commit, and which result lines it covers.
+    let mut cur: Option<usize> = None;
+
+    for raw in out.lines() {
+        // A group header is the only line that starts with a 40-hex sha
+        // followed by three numbers. Header keys never look like that.
+        let mut parts = raw.split(' ');
+        let first = parts.next().unwrap_or("");
+        let is_sha = first.len() == 40 && first.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_sha {
+            let nums: Vec<usize> = parts.filter_map(|p| p.parse().ok()).collect();
+            if nums.len() < 3 {
+                continue;
+            }
+            let (result_line, count) = (nums[1], nums[2]);
+            let idx = *index.entry(first.to_string()).or_insert_with(|| {
+                commits.push(BlameCommit {
+                    sha: first.to_string(),
+                    author: String::new(),
+                    author_email: String::new(),
+                    author_time: 0,
+                    summary: String::new(),
+                    uncommitted: first.bytes().all(|b| b == b'0'),
+                });
+                (commits.len() - 1) as u32
+            });
+            // `result_line` is 1-based, and groups arrive commit-major, so a
+            // later group can name an earlier line: grow to fit, never append.
+            let end = result_line.saturating_add(count);
+            if result_line >= 1 && end <= BLAME_MAX_LINES {
+                if end - 1 > lines.len() {
+                    lines.resize(end - 1, u32::MAX);
+                }
+                for n in result_line..end {
+                    lines[n - 1] = idx;
+                }
+            }
+            cur = Some(idx as usize);
+            continue;
+        }
+        let Some(ci) = cur else { continue };
+        let Some((key, val)) = raw.split_once(' ') else { continue };
+        let c = &mut commits[ci];
+        match key {
+            // Only the first group for a commit carries these, so an
+            // already-filled field must not be overwritten by a later
+            // `previous`/`boundary` line that happens to share a prefix.
+            "author" if c.author.is_empty() => c.author = val.to_string(),
+            "author-mail" if c.author_email.is_empty() => {
+                c.author_email = val.trim_start_matches('<').trim_end_matches('>').to_string();
+            }
+            "author-time" if c.author_time == 0 => c.author_time = val.parse().unwrap_or(0),
+            "summary" if c.summary.is_empty() => c.summary = val.to_string(),
+            _ => {}
+        }
+    }
+    (commits, lines)
+}
+
+/// Blame one file of a task's worktree, whole-file, in one shot.
+///
+/// Blames the WORKING TREE (no rev argument), not HEAD: the frontend lines up
+/// the result against the buffer it has on screen, and blaming HEAD would
+/// misalign every line below an uncommitted edit. Uncommitted lines come back
+/// as the all-zero sha, which is what `BlameCommit::uncommitted` marks.
+fn task_git_blame_for_task(w: &Task, path: &str) -> Result<BlameFile, String> {
+    let (cwd, rel) = resolve_task_git_path(w, path)?;
+    let abs = safe_task_path(&cwd, &rel)?;
+    // `--no-optional-locks` on every git in this path. Blame is a BACKGROUND
+    // read triggered by a cursor move, and it must never be the reason the
+    // user's own `git commit` in the embedded terminal fails on a held
+    // `index.lock`. This is what the flag exists for, and what other editors
+    // pass for their background git; it is hygiene, not a fix for a measured
+    // failure.
+    let head = git(&["--no-optional-locks", "rev-parse", "HEAD"], &cwd)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // Not a repo, or the path is not tracked: no blame, not an error. An
+    // untracked file legitimately has no history, and the editor should just
+    // show nothing rather than surface a git failure per keystroke.
+    if head.is_empty() || !git_tracks_path(&cwd, &abs) {
+        return Ok(BlameFile { commits: Vec::new(), lines: Vec::new(), head, skipped: false });
+    }
+
+    // Size guard, one metadata call, no read. Blame reads the file itself;
+    // reading it here as well just to measure it would double the IO.
+    let too_big = fs::metadata(&abs).map(|m| m.len() > BLAME_MAX_BYTES).unwrap_or(false);
+    if too_big {
+        return Ok(BlameFile { commits: Vec::new(), lines: Vec::new(), head, skipped: true });
+    }
+
+    // `--root` stops the initial commit being treated as a boundary, so the
+    // oldest lines get attributed instead of coming back bare. Same flag VS
+    // Code passes (extensions/git/src/git.ts, `blame2`).
+    let out = git(&["--no-optional-locks", "blame", "--root", "--incremental", "--", &rel], &cwd)
+        .map_err(|e| format!("git blame failed: {e}"))?;
+    let (commits, lines) = parse_git_blame_incremental(&out);
+    Ok(BlameFile { commits, lines, head, skipped: false })
+}
+
+/// Async + `spawn_blocking` per the docs/ipc.md rule: blame forks git and
+/// walks history, which on a large file is a few hundred ms. Run on the
+/// webview's thread it would freeze the window.
+#[tauri::command]
+async fn task_git_blame(id: String, path: String) -> Result<BlameFile, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<BlameFile, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        task_git_blame_for_task(&w, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One commit in full, for the blame popup's hover card: author, email, date,
+/// subject and the whole message body (trailers included, `Co-authored-by:`
+/// pulled out on the frontend by `splitTrailers`).
+///
+/// Deliberately NOT part of `task_git_blame`'s payload. A file's blame can name
+/// 169 distinct commits, and fetching every message body up front would be 169
+/// `git show`s for the one line the cursor happens to be on. This is fetched
+/// when a popup actually opens, and cached per sha on the frontend.
+///
+/// `path` resolves the repo the same member-aware way blame does, so a
+/// multi-repo task reads the member the file belongs to.
+fn task_git_commit_meta_for_task(w: &Task, path: &str, sha: &str) -> Result<GitCommit, String> {
+    if !is_commit_ish(sha) {
+        return Err("bad commit id".into());
+    }
+    let (cwd, _rel) = resolve_task_git_path(w, path)?;
+    // `--no-walk` so this reads exactly the named commit rather than starting a
+    // traversal at it, and the shared format keeps the parser the same one the
+    // history page is tested against.
+    let out = git(&["--no-optional-locks", "log", "--no-walk", GIT_LOG_FORMAT, sha], &cwd)
+        .map_err(|e| format!("git log failed: {e}"))?;
+    parse_git_log(&out, &std::collections::HashSet::new())
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no commit {sha}"))
+}
+
+#[tauri::command]
+async fn task_git_commit_meta(id: String, path: String, sha: String) -> Result<GitCommit, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<GitCommit, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        task_git_commit_meta_for_task(&w, &path, &sha)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// How far back `sha` sits from HEAD: the number of commits reachable from HEAD
+/// but not from it. That is exactly the `skip` offset the history page needs to
+/// land on it, which is what turns "show this commit in History" into one query
+/// instead of paging forward until it turns up.
+///
+/// The paging version was fine on this repo and useless on a real monorepo: a
+/// commit from two years ago is tens of thousands of rows down, and no sane page
+/// budget reaches it. `rev-list --count` answers in one walk that git is built
+/// for, and the caller then fetches ONE page around the answer.
+fn task_git_commit_offset_for_task(w: &Task, dir_name: &str, sha: &str) -> Result<usize, String> {
+    if !is_commit_ish(sha) {
+        return Err("bad commit id".into());
+    }
+    let cwd = repo_cwd(w, dir_name)?;
+    let range = format!("{sha}..HEAD");
+    let out = git(&["--no-optional-locks", "rev-list", "--count", &range], &cwd)
+        .map_err(|e| format!("git rev-list failed: {e}"))?;
+    out.trim().parse::<usize>().map_err(|e| format!("unparseable count: {e}"))
+}
+
+#[tauri::command]
+async fn task_git_commit_offset(id: String, dir_name: String, sha: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<usize, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        task_git_commit_offset_for_task(&w, &dir_name, &sha)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Files a single commit touched, as `GitFile` rows so the History tab can
+/// reuse the Commit tab's status glyphs.
+///
+/// `-m` makes a merge report files at all (plain `diff-tree` prints nothing for
+/// one), `--first-parent` aims that at the branch it merged INTO, and `--root`
+/// makes the initial commit report its files instead of nothing.
+///
+/// `-m` still emits ONE DIFF PER PARENT — `--first-parent` limits which commits
+/// are traversed, not how many diffs a merge prints — so a path touched on both
+/// sides arrives twice, in parent order. Hence the dedupe: first occurrence
+/// wins, which is precisely the first-parent diff. `--cc` would collapse them
+/// in git instead, but a combined diff omits every file that matches ANY
+/// parent, i.e. everything the merge brought in cleanly — the exact thing
+/// someone opens a merge commit to see.
+fn git_commit_files(cwd: &Path, sha: &str) -> Result<Vec<GitFile>, String> {
+    if !is_commit_ish(sha) {
+        return Err("bad commit id".into());
+    }
+    let out = git(
+        &[
+            "--no-pager", "diff-tree", "--no-commit-id", "--name-status",
+            "-r", "-m", "--first-parent", "--root", sha,
+        ],
+        cwd,
+    )
+    .unwrap_or_default();
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in out.lines() {
+        let mut parts = line.split('\t');
+        let (Some(status), Some(path)) = (parts.next(), parts.next()) else { continue };
+        // Renames/copies print "R100\told\tnew" — keep the new path, the one
+        // `git show <sha>:path` can resolve.
+        let path = parts.next().unwrap_or(path);
+        // Second and later parents of a merge repeat paths (see above). A
+        // duplicate row would also collide on the frontend's per-path key.
+        if !seen.insert(path.to_string()) {
+            continue;
+        }
+        files.push(GitFile {
+            // R100 / C075 carry a similarity score; the glyph map is keyed by
+            // the letter alone.
+            status: status.chars().next().map(|c| c.to_string()).unwrap_or_default(),
+            path: path.to_string(),
+            // A working-tree fingerprint is meaningless for a historical
+            // revision (the "viewed" marks it feeds only track live files).
+            ..Default::default()
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+#[tauri::command]
+async fn task_git_commit_files(
+    id: String,
+    dir_name: String,
+    sha: String,
+) -> Result<Vec<GitFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<GitFile>, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let cwd = repo_cwd(&w, &dir_name)?;
+        git_commit_files(&cwd, &sha)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Is `s` something safe to hand to git as a revision? Hex sha (any length git
+/// would accept) only — the History tab never passes a user-typed ref, so this
+/// stays deliberately strict rather than trying to sanitize refnames. Blocks
+/// leading-dash argument injection for free.
+fn is_commit_ish(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// ─────────────────────────── branch compare ───────────────────────────
+//
+// "How does this task read next to some other branch" (issue #208). The
+// Commit tab only ever shows the working tree, so work an agent had already
+// committed was invisible; the History tab (issue #199) shows the commits but
+// never their combined effect. This is the third view: ONE flat file list for
+// the whole delta between a ref and the working tree, committed and
+// uncommitted alike, which is what you want when an agent ate the elephant in
+// six commits and you have to judge the result.
+//
+// Deliberately generic — any local or remote-tracking ref in the repo, not
+// "the PR base". A task's own `base_branch` is only what the picker
+// preselects; comparing a spike branch against a sibling feature branch is
+// the same code path.
+
+/// Is `s` safe to hand to git as a revision? Laxer than `is_commit_ish` (hex
+/// only) because Compare passes REFNAMES a user picked, and much
+/// stricter than "anything": a leading dash reads as an option, and git's own
+/// refname rules already forbid whitespace, control characters and the glob /
+/// rev-syntax bytes. `--end-of-options` at the call site covers the dash on
+/// its own; this is the belt to that pair of braces.
+fn is_safe_rev(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+}
+
+/// Resolve a user-picked ref to a commit sha. Everything downstream — most of
+/// all the `base:<sha>` diff scope the frontend echoes back on every file
+/// click — then stays hex-only and keeps going through `is_commit_ish`, so a
+/// refname is validated exactly once, here, instead of at four call sites.
+fn resolve_rev(cwd: &Path, rev: &str) -> Result<String, String> {
+    if !is_safe_rev(rev) {
+        return Err(format!("{rev} is not a valid ref name"));
+    }
+    // `^{commit}` peels an annotated tag; --quiet turns "no such ref" into an
+    // empty stdout instead of noise on stderr.
+    let sha = git(
+        &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")],
+        cwd,
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
+    if sha.is_empty() {
+        return Err(format!("{rev} isn't a branch or commit in this repo"));
+    }
+    Ok(sha)
+}
+
+/// Parse `git diff --name-status -z` into (status letter, path) pairs.
+///
+/// -z rather than the tab-delimited default because a path may contain ANY
+/// byte except NUL — including the tab the default format delimits with, and
+/// the quoting git falls back to would have to be unescaped here instead.
+/// Records are `<status>\0<path>\0`, except R/C which carry a similarity
+/// score and TWO paths (`R075\0old\0new\0`); the new path is the one
+/// `git show <sha>:path` can resolve, so it is the one kept.
+fn parse_name_status_z(out: &str) -> Vec<(String, String)> {
+    let f: Vec<&str> = out.split('\0').collect();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < f.len() {
+        let status = f[i];
+        if status.is_empty() {
+            break; // the stream's trailing NUL
+        }
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let path_idx = if renamed { i + 2 } else { i + 1 };
+        let Some(path) = f.get(path_idx).filter(|p| !p.is_empty()) else { break };
+        // R100 / C075 carry a similarity score; the glyph map is keyed by the
+        // letter alone.
+        rows.push((status.chars().next().unwrap().to_string(), (*path).to_string()));
+        i = path_idx + 1;
+    }
+    rows
+}
+
+/// Parse `git diff --numstat -z` into (path, added, removed).
+///
+/// Records are `<add>\t<del>\t<path>\0`, except a rename, where the third
+/// tab-field is EMPTY and the two paths follow as their own NUL-terminated
+/// fields (`1\t0\t\0old\0new\0`). A binary file reports `-` for both counts,
+/// which becomes `None` rather than a misleading zero.
+fn parse_numstat_z(out: &str) -> Vec<(String, Option<u32>, Option<u32>)> {
+    let f: Vec<&str> = out.split('\0').collect();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < f.len() {
+        let rec = f[i];
+        if rec.is_empty() {
+            break; // the stream's trailing NUL
+        }
+        let mut parts = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+            break;
+        };
+        let num = |s: &str| s.parse::<u32>().ok();
+        let (path, next) = if rest.is_empty() {
+            // Rename: the destination is the second of the two path fields.
+            match f.get(i + 2).filter(|p| !p.is_empty()) {
+                Some(dst) => ((*dst).to_string(), i + 3),
+                None => break,
+            }
+        } else {
+            (rest.to_string(), i + 1)
+        };
+        rows.push((path, num(a), num(d)));
+        i = next;
+    }
+    rows
+}
+
+/// Lines in an untracked file, for its churn column. `git diff` never sees
+/// these (they aren't in any tree), and running `diff --no-index` per file
+/// would be a process each — so count here and report `None` for anything
+/// oversized or binary rather than stalling on a stray core dump someone
+/// forgot to gitignore.
+///
+/// `budget` is the bytes left to spend across the WHOLE compare, decremented
+/// as files are read. A per-file cap alone is not enough: an un-ignored
+/// `node_modules` is thousands of individually small files, and reading all of
+/// them would freeze the panel on exactly the repo that needs it most. Past
+/// the budget the counts simply stop being reported, which costs a column,
+/// not the list.
+fn untracked_added(path: &Path, budget: &mut u64) -> Option<u32> {
+    const PER_FILE_CAP: u64 = 1 << 20; // 1 MiB
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > PER_FILE_CAP || meta.len() > *budget {
+        return None;
+    }
+    *budget -= meta.len();
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None; // binary
+    }
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let nl = bytes.iter().filter(|b| **b == b'\n').count() as u32;
+    // A file not ending in a newline still has that last line.
+    Some(if bytes.last() == Some(&b'\n') { nl } else { nl + 1 })
+}
+
+/// Everything that differs between `base` and the working tree.
+#[derive(Serialize)]
+pub struct GitCompare {
+    /// The ref as the user picked it, echoed back for the header.
+    pub base: String,
+    /// The commit every file's LEFT side is read from, and the sha that goes
+    /// into the `base:<sha>` diff scope. The merge base with HEAD in
+    /// `merge_base` mode, otherwise `base`'s own tip.
+    pub base_sha: String,
+    pub base_short: String,
+    /// HEAD's branch, so the header can say which two things are being
+    /// compared. "" on a detached HEAD.
+    pub branch: String,
+    /// True when `merge_base` was asked for but the two histories share no
+    /// ancestor, so this fell back to comparing against the ref's tip. Rare
+    /// (unrelated histories), and silently diffing something else would be
+    /// worse than saying so.
+    pub no_merge_base: bool,
+    pub files: Vec<GitFile>,
+    /// Summed over `files`, so the header's diffstat matches the rows.
+    pub added: u32,
+    pub removed: u32,
+    /// True when the list was capped at MAX_COMPARE_FILES.
+    pub truncated: bool,
+}
+
+/// Same cap the staging lists use: a comparison against a very old base can
+/// legitimately run to tens of thousands of files, and the panel is a review
+/// surface, not a bulk export.
+const MAX_COMPARE_FILES: usize = 5_000;
+
+fn git_compare(cwd: &Path, base: &str, merge_base: bool) -> Result<GitCompare, String> {
+    let tip = resolve_rev(cwd, base)?;
+    // Three-dot semantics by default: "what this branch added", not "how the
+    // two tips differ". Without it, every commit made on the base since the
+    // task branched shows up inverted, as though the task had deleted work it
+    // simply doesn't have yet — the single most confusing thing a compare view
+    // can do. `merge_base: false` is the escape hatch for when the literal
+    // tip-to-tree difference is what you want.
+    let mut no_merge_base = false;
+    let base_sha = if merge_base {
+        match git(&["merge-base", &tip, "HEAD"], cwd).map(|s| s.trim().to_string()) {
+            Ok(s) if !s.is_empty() => s,
+            // Unrelated histories have no common ancestor.
+            _ => {
+                no_merge_base = true;
+                tip.clone()
+            }
+        }
+    } else {
+        tip.clone()
+    };
+
+    // Both halves of the range in one pass each: name-status for the glyph,
+    // numstat for the churn. Two processes over the same range rather than
+    // one, because git has no format that carries both.
+    let names = git(&["--no-pager", "diff", "--name-status", "-M", "-z", &base_sha], cwd)
+        .unwrap_or_default();
+    let stats = git(&["--no-pager", "diff", "--numstat", "-M", "-z", &base_sha], cwd)
+        .unwrap_or_default();
+    let churn: std::collections::HashMap<String, (Option<u32>, Option<u32>)> =
+        parse_numstat_z(&stats).into_iter().map(|(p, a, d)| (p, (a, d))).collect();
+
+    let mut files: Vec<GitFile> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (status, path) in parse_name_status_z(&names) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let (added, removed) = churn.get(&path).copied().unwrap_or((None, None));
+        files.push(GitFile {
+            status,
+            fp: file_fp(&cwd.join(&path)),
+            path,
+            added,
+            removed,
+        });
+    }
+
+    // Untracked files are part of "different from the base" even though no
+    // tree contains them — an agent's brand-new, not-yet-added file is exactly
+    // the kind of thing this view exists to surface. `git diff` can't see them,
+    // so they come from ls-files and are labelled "?" like the staging pane
+    // does it.
+    let others = git(&["ls-files", "--others", "--exclude-standard", "-z"], cwd)
+        .unwrap_or_default();
+    // Total bytes the churn counts may read across every untracked file. See
+    // untracked_added: without a shared budget an un-ignored dependency tree
+    // turns this into thousands of reads.
+    let mut budget: u64 = 8 << 20; // 8 MiB
+    for path in others.split('\0').filter(|p| !p.is_empty()) {
+        if !seen.insert(path.to_string()) {
+            continue;
+        }
+        let abs = cwd.join(path);
+        files.push(GitFile {
+            status: "?".into(),
+            path: path.to_string(),
+            fp: file_fp(&abs),
+            added: untracked_added(&abs, &mut budget),
+            removed: Some(0),
+        });
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let truncated = files.len() > MAX_COMPARE_FILES;
+    if truncated {
+        files.truncate(MAX_COMPARE_FILES);
+    }
+    // Summed AFTER the truncation so the header's total describes the rows
+    // actually on screen.
+    let added = files.iter().filter_map(|f| f.added).sum();
+    let removed = files.iter().filter_map(|f| f.removed).sum();
+
+    Ok(GitCompare {
+        base: base.to_string(),
+        base_short: base_sha.chars().take(8).collect(),
+        base_sha,
+        branch: current_branch(cwd).unwrap_or_default(),
+        no_merge_base,
+        files,
+        added,
+        removed,
+        truncated,
+    })
+}
+
+#[tauri::command]
+async fn task_git_compare(
+    id: String,
+    dir_name: String,
+    base: String,
+    merge_base: bool,
+) -> Result<GitCompare, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<GitCompare, String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let cwd = repo_cwd(&w, &dir_name)?;
+        git_compare(&cwd, &base, merge_base)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Resolve the git cwd for a stage/commit op: the host task path
 /// when `dir_name` is empty, otherwise the matching composition member.
 fn repo_cwd(w: &Task, dir_name: &str) -> Result<PathBuf, String> {
@@ -6863,20 +8648,47 @@ async fn task_commit(
         git(&args, &cwd).map_err(|e| e.to_string())?;
 
         if push {
-            // Try a plain push first (upstream already set). If it fails
-            // (most commonly: no upstream for a fresh worktree branch),
-            // fall back to `-u <remote> <branch>` to set it.
-            if git(&["push"], &cwd).is_err() {
-                let remote = detect_default_remote(&cwd);
-                let branch = git(&["branch", "--show-current"], &cwd)
-                    .map_err(|e| e.to_string())?.trim().to_string();
-                if branch.is_empty() {
-                    return Err("cannot push: detached HEAD".to_string());
-                }
-                git(&["push", "-u", &remote, &branch], &cwd).map_err(|e| e.to_string())?;
-            }
+            git_push(&cwd)?;
         }
         Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Push the current branch. Tries a plain push first (upstream already set);
+/// on failure, most commonly a fresh worktree branch with no upstream, falls
+/// back to `-u <remote> <branch>` to create it.
+///
+/// Shared by `task_commit`'s push half and the standalone Push button, so the
+/// set-upstream behaviour cannot differ between "Commit and Push" and pushing
+/// what is already committed.
+fn git_push(cwd: &Path) -> Result<(), String> {
+    if git(&["push"], cwd).is_ok() {
+        return Ok(());
+    }
+    let remote = detect_default_remote(cwd);
+    let branch = git(&["branch", "--show-current"], cwd)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err("cannot push: detached HEAD".to_string());
+    }
+    git(&["push", "-u", &remote, &branch], cwd).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Push a repo's current branch without committing anything, for the Push
+/// button beside Commit. Separate from `task_commit`'s push flag because the
+/// common case it serves is commits that are already made (an agent's, or
+/// yours from the terminal) and only need sending.
+#[tauri::command]
+async fn task_git_push(id: String, dir_name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
+        let cwd = repo_cwd(&w, &dir_name)?;
+        git_push(&cwd)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -6943,12 +8755,80 @@ fn reject_escaping_segments(rel: &str) -> Result<PathBuf, String> {
 fn safe_task_path(ws_path: &Path, rel: &str) -> Result<PathBuf, String> {
     let pb = reject_escaping_segments(rel)?;
     let target = ws_path.join(&pb);
-    let canon_base = fs::canonicalize(ws_path).map_err(|e| e.to_string())?;
-    let canon_target = fs::canonicalize(&target).map_err(|e| e.to_string())?;
+    let canon_base = fs::canonicalize(ws_path)
+        .map_err(|e| format!("{}: {e}", ws_path.display()))?;
+    // Name the path in every error. These strings surface in the file tree and
+    // in bug reports (GH #250), where "No such file or directory" on its own
+    // says nothing about WHICH path went missing.
+    let canon_target = fs::canonicalize(&target)
+        .map_err(|e| format!("{}: {e}", target.display()))?;
     if !canon_target.starts_with(&canon_base) {
-        return Err(format!("path escapes task: {rel}"));
+        // A symlink out of the task is the usual way to land here, and where it
+        // points is the whole answer, so include it.
+        return Err(format!("path escapes task: {rel} -> {}", canon_target.display()));
     }
     Ok(canon_target)
+}
+
+/// Read-only path resolution that also accepts the top-level config-dir
+/// symlinks termic itself creates into the repo root (GH #250).
+///
+/// `link_config_dir` symlinks `.claude/` and friends from the repo into every
+/// new worktree, precisely because they are commonly gitignored and so
+/// `git worktree add` leaves them out. `safe_task_path` then refused to read
+/// back through the very link we made: canonicalizing lands outside the
+/// worktree, so the folder LISTED (the parent's `read_dir` sees a dir entry)
+/// and could never be opened, with no retry or refresh able to help.
+///
+/// The bound is the PROJECT root rather than the worktree. A link resolving
+/// inside the repo the user deliberately added is theirs to read; a repo that
+/// ships `.claude -> ~/.ssh` still resolves outside it and is still refused,
+/// which is the case the containment check exists for.
+///
+/// READ paths only. `task_path_rename`, `task_path_delete` and every git path
+/// keep the strict check, so nothing can MUTATE the main checkout by writing
+/// through a link from a worktree task.
+fn safe_task_read_path(w: &Task, base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let root = load_projects()
+        .into_iter()
+        .find(|p| p.id == w.project_id)
+        .map(|p| PathBuf::from(p.root_path));
+    safe_task_read_path_in(root.as_deref(), base, rel)
+}
+
+/// The decision itself, with the project root passed in rather than looked up,
+/// so it is testable without a profile on disk.
+fn safe_task_read_path_in(project_root: Option<&Path>, base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let strict = match safe_task_path(base, rel) {
+        Ok(p) => return Ok(p),
+        Err(e) => e,
+    };
+    let pb = match reject_escaping_segments(rel) {
+        Ok(p) => p,
+        Err(_) => return Err(strict),
+    };
+    let Some(first) = pb.components().next() else { return Err(strict) };
+    // Only a symlink sitting directly in the task root qualifies: that is the
+    // shape link_config_dir creates, and it keeps a symlink buried deep in the
+    // repo from widening the check.
+    let is_link = base
+        .join(first.as_os_str())
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_link {
+        return Err(strict);
+    }
+    let Some(root) = project_root else { return Err(strict) };
+    let (Ok(canon_root), Ok(target)) = (fs::canonicalize(root), fs::canonicalize(base.join(&pb)))
+    else {
+        return Err(strict);
+    };
+    if target.starts_with(&canon_root) {
+        Ok(target)
+    } else {
+        Err(strict)
+    }
 }
 
 #[derive(Serialize)]
@@ -7042,6 +8922,44 @@ fn read_capped_file(abs: &Path, cap: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Read a text file by ABSOLUTE path, with NO task containment (GH #240).
+///
+/// This is the ONLY read in the app that is not bounded by a task root, and
+/// it exists for exactly one thing: a cmd+clicked path in terminal output
+/// that resolves OUTSIDE the task, which has no task-relative form and so
+/// cannot go through `task_file_read`. The tab it feeds is READ-ONLY; there
+/// is deliberately no absolute-path WRITE counterpart, and `task_file_write`
+/// keeps its containment check unchanged.
+///
+/// The exposure this adds is an arbitrary file READ reachable from the
+/// webview. Accepted, and bounded three ways: the same 2 MB cap as the task
+/// read, a UTF-8 requirement (so it is a text channel, not a way to pull
+/// bytes out of arbitrary binaries), and the pinned CSP, which gives an
+/// attacker who could call it nowhere to send the result. Recorded under
+/// "Known gap" in docs/sandbox.md.
+#[tauri::command]
+async fn file_read_external(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || read_external_file(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The decision itself, split out from the command so it is unit-testable.
+fn read_external_file(path: &str) -> Result<String, String> {
+    let abs = Path::new(path);
+    // A relative path here would resolve against the APP's cwd, which is
+    // nobody's task and not what any caller means. Only the frontend's
+    // out-of-task branch calls this, and it always holds an absolute path.
+    if !abs.is_absolute() {
+        return Err(format!("not an absolute path: {path}"));
+    }
+    // `read_capped_file` rejects a directory (and anything else that is not a
+    // regular file) via the fstat on the already-OPEN handle, so a clicked
+    // directory lands here as a plain error rather than a huge read.
+    let bytes = read_capped_file(abs, 2_000_000)?;
+    String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
+}
+
 #[tauri::command]
 fn task_file_read(id: String, path: String) -> Result<String, String> {
     let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
@@ -7049,7 +8967,7 @@ fn task_file_read(id: String, path: String) -> Result<String, String> {
     // (which may live outside the wrapper for repo_root members), matching
     // the diff/finder/grep path scheme.
     let (cwd, rel) = resolve_task_git_path(&w, &path)?;
-    let abs = safe_task_path(&cwd, &rel)?;
+    let abs = safe_task_read_path(&w, &cwd, &rel)?;
     // Refuse binary or huge files for now — viewer is text-only.
     let bytes = read_capped_file(&abs, 2_000_000)?;
     String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())
@@ -7104,7 +9022,7 @@ struct Base64Read {
 fn task_file_read_base64_for_task(w: &Task, path: &str, known_fp: Option<&str>) -> Result<Base64Read, String> {
     use base64::Engine as _;
     let (cwd, rel) = resolve_task_git_path(w, path)?;
-    let abs = safe_task_path(&cwd, &rel)?;
+    let abs = safe_task_read_path(w, &cwd, &rel)?;
     let mime = preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
     // Cheap pre-read stat: if it matches what the caller already has
     // cached, skip the read + base64 encode entirely. Only bother when
@@ -7161,7 +9079,7 @@ async fn task_file_read_base64(id: String, path: String, known_fp: Option<String
 /// is left to a path that resolves but won't stat.
 fn task_file_fp_for_task(w: &Task, path: &str) -> Result<String, String> {
     let (cwd, rel) = resolve_task_git_path(w, path)?;
-    let abs = safe_task_path(&cwd, &rel)?;
+    let abs = safe_task_read_path(w, &cwd, &rel)?;
     preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
     Ok(file_fp(&abs))
 }
@@ -7183,7 +9101,7 @@ fn task_file_fp(id: String, path: String) -> Result<String, String> {
 /// in-memory `Task`.
 fn read_preview_file_for_task(w: &Task, path: &str) -> Result<(Vec<u8>, &'static str), String> {
     let (cwd, rel) = resolve_task_git_path(w, path)?;
-    let abs = safe_task_path(&cwd, &rel)?;
+    let abs = safe_task_read_path(w, &cwd, &rel)?;
     let mime = preview_mime_for_ext(&abs).ok_or_else(|| format!("not previewable: {path}"))?;
     let bytes = read_capped_file(&abs, PREVIEW_CAP)?;
     Ok((bytes, mime))
@@ -7237,7 +9155,320 @@ fn task_file_write(id: String, path: String, content: String) -> Result<(), Stri
     let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
     let (cwd, rel) = resolve_task_git_path(&w, &path)?;
     let abs = safe_task_path(&cwd, &rel)?;
-    fs::write(&abs, content).map_err(|e| format!("write failed: {e}"))
+    // Atomic: uncommitted source is unrecoverable if a truncate-write tears.
+    // Tradeoff accepted: the swap installs a new inode (breaks hardlinks).
+    write_atomic(&abs, content.as_bytes()).map_err(|e| format!("write failed: {e}"))
+}
+
+// ──────────────────────────── scratchpads (GH #244) ────────────────────────
+//
+// Sublime-style untitled buffers, scoped to ONE TASK. A pad is an unsaved
+// buffer that survives a relaunch; it is NOT a file with a hidden path, and
+// ⌘S never writes here — it PROMOTES the pad into the worktree (see
+// `scratch_promote`) and the record disappears.
+//
+// Buffers live under the app data dir, never inside the worktree: a scratch
+// file in the repo shows up in `git status`, in the diff the agent reviews,
+// and eventually in a commit.
+//
+//   <data_dir>/scratch/<task_id>/index.json     one record per pad
+//   <data_dir>/scratch/<task_id>/<pad_id>.txt   the buffer
+//
+// The index carries title and syntax because a pad has no filename to
+// re-derive them from on launch, and one index read beats stat-ing N files.
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScratchRecord {
+    pub id: String,
+    pub title: String,
+    /// Manual "Set syntax" pick (a `lib/languages` id). Persisted, unlike an
+    /// edit tab's session-only one: there is no extension to re-derive it from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<String>,
+    /// Position in the task's tab strip on restore.
+    #[serde(default)]
+    pub order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Serializes the read-modify-write of one task's index. Both the buffer
+/// write and the title derivation ride the typing path and are debounced
+/// independently, so two writes CAN interleave; without this, one would read
+/// the index the other had not yet written and drop its field.
+static SCRATCH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Ids come from the renderer (`crypto.randomUUID`), and both a task id and a
+/// pad id become a path segment here. Anything outside this alphabet is
+/// refused rather than sanitized: a silently rewritten id would read a
+/// different pad than the caller asked for.
+fn scratch_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn scratch_dir(task_id: &str) -> Result<PathBuf, String> {
+    if !scratch_id_ok(task_id) {
+        return Err(format!("invalid task id: {task_id:?}"));
+    }
+    let p = data_dir().map_err(|e| e.to_string())?.join("scratch").join(task_id);
+    fs::create_dir_all(&p).map_err(|e| format!("create scratch dir failed: {e}"))?;
+    Ok(p)
+}
+
+fn scratch_buffer_path(task_id: &str, id: &str) -> Result<PathBuf, String> {
+    if !scratch_id_ok(id) {
+        return Err(format!("invalid scratchpad id: {id:?}"));
+    }
+    Ok(scratch_dir(task_id)?.join(format!("{id}.txt")))
+}
+
+/// The task's index, ordered. A missing or corrupt index reads as empty
+/// rather than erroring: the buffers are the data, and refusing to list them
+/// because one JSON file tore would strand every pad in the task.
+fn scratch_read_index(task_id: &str) -> Result<Vec<ScratchRecord>, String> {
+    let f = scratch_dir(task_id)?.join("index.json");
+    let mut list: Vec<ScratchRecord> = match fs::read_to_string(&f) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    list.sort_by_key(|r| r.order);
+    Ok(list)
+}
+
+fn scratch_write_index(task_id: &str, list: &[ScratchRecord]) -> Result<(), String> {
+    let f = scratch_dir(task_id)?.join("index.json");
+    let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    write_atomic(&f, json.as_bytes()).map_err(|e| format!("index write failed: {e}"))
+}
+
+/// Drop a task's whole pad directory. Called from `delete_task_file`, the one
+/// HARD delete: archiving is recoverable (the task stays in History), and
+/// notes about the work are exactly what a user wants back when they restore
+/// it, so an archive must leave pads alone.
+fn scratch_purge_task(task_id: &str) {
+    if !scratch_id_ok(task_id) {
+        return;
+    }
+    if let Ok(d) = data_dir() {
+        let _ = fs::remove_dir_all(d.join("scratch").join(task_id));
+    }
+}
+
+/// Containment check for a path that does NOT exist yet — `safe_task_path`
+/// canonicalizes the target itself, which errors on a missing file, so it
+/// cannot answer "where may I CREATE this?".
+///
+/// Walks up to the nearest existing ancestor, canonicalizes THAT and checks
+/// containment there (a symlink has to exist to redirect anything), then
+/// rebuilds the target underneath the canonical ancestor. Rebuilding from the
+/// canonical ancestor rather than the caller's string is the point: a
+/// `members/live -> /elsewhere` symlink is resolved before the remainder is
+/// appended, so the write lands where the check looked.
+fn safe_task_path_for_create(ws_path: &Path, rel: &str) -> Result<PathBuf, String> {
+    let pb = reject_escaping_segments(rel)?;
+    if pb.as_os_str().is_empty() {
+        return Err("empty path".into());
+    }
+    let canon_base = fs::canonicalize(ws_path).map_err(|e| format!("{}: {e}", ws_path.display()))?;
+    // Longest existing prefix of `pb`, walking from the full path backwards.
+    let comps: Vec<_> = pb.components().collect();
+    for split in (0..=comps.len()).rev() {
+        let head: PathBuf = comps[..split].iter().collect();
+        let probe = canon_base.join(&head);
+        if !probe.exists() {
+            continue;
+        }
+        let canon_head = fs::canonicalize(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
+        if !canon_head.starts_with(&canon_base) {
+            return Err(format!("path escapes task: {rel} -> {}", canon_head.display()));
+        }
+        let tail: PathBuf = comps[split..].iter().collect();
+        return Ok(canon_head.join(tail));
+    }
+    // `split == 0` is the task root itself, which always exists, so the loop
+    // above always returns.
+    Err(format!("could not resolve {rel} inside {}", ws_path.display()))
+}
+
+#[tauri::command]
+async fn scratch_list(task_id: String) -> Result<Vec<ScratchRecord>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _g = SCRATCH_LOCK.lock();
+        scratch_read_index(&task_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn scratch_read(task_id: String, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let f = scratch_buffer_path(&task_id, &id)?;
+        // A record whose buffer never got written (created, never typed in)
+        // is an empty pad, not an error.
+        Ok(fs::read_to_string(&f).unwrap_or_default())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Create-or-overwrite the buffer and stamp `updated_at`. This is CRASH
+/// SAFETY, not saving: it must never clear the tab's dirty dot, because
+/// nothing has been written anywhere the user chose.
+#[tauri::command]
+async fn scratch_write(task_id: String, id: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let f = scratch_buffer_path(&task_id, &id)?;
+        write_atomic(&f, content.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        let _g = SCRATCH_LOCK.lock();
+        let mut list = scratch_read_index(&task_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        match list.iter_mut().find(|r| r.id == id) {
+            Some(r) => r.updated_at = now,
+            None => {
+                let order = list.iter().map(|r| r.order).max().unwrap_or(-1) + 1;
+                list.push(ScratchRecord {
+                    id: id.clone(),
+                    title: String::new(),
+                    syntax: None,
+                    order,
+                    created_at: now.clone(),
+                    updated_at: now,
+                });
+            }
+        }
+        scratch_write_index(&task_id, &list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Index-only update (derived/renamed title, manual syntax pick, reorder).
+/// Every field is optional so the debounced title derivation can write the
+/// title without racing a syntax pick into a stale value.
+#[tauri::command]
+async fn scratch_set_meta(
+    task_id: String,
+    id: String,
+    title: Option<String>,
+    syntax: Option<String>,
+    order: Option<i64>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !scratch_id_ok(&id) {
+            return Err(format!("invalid scratchpad id: {id:?}"));
+        }
+        let _g = SCRATCH_LOCK.lock();
+        let mut list = scratch_read_index(&task_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rec = match list.iter_mut().find(|r| r.id == id) {
+            Some(r) => r,
+            None => {
+                let order_next = list.iter().map(|r| r.order).max().unwrap_or(-1) + 1;
+                list.push(ScratchRecord {
+                    id: id.clone(),
+                    title: String::new(),
+                    syntax: None,
+                    order: order_next,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+                list.last_mut().expect("just pushed")
+            }
+        };
+        if let Some(t) = title {
+            rec.title = t;
+        }
+        // An empty string clears the manual pick (back to path/content
+        // resolution); `None` leaves it alone.
+        if let Some(s) = syntax {
+            rec.syntax = if s.is_empty() { None } else { Some(s) };
+        }
+        if let Some(o) = order {
+            rec.order = o;
+        }
+        scratch_write_index(&task_id, &list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn scratch_delete(task_id: String, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let f = scratch_buffer_path(&task_id, &id)?;
+        let _ = fs::remove_file(&f);
+        let _g = SCRATCH_LOCK.lock();
+        let mut list = scratch_read_index(&task_id)?;
+        list.retain(|r| r.id != id);
+        scratch_write_index(&task_id, &list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The defining flow: write the pad's buffer to a task-relative path and drop
+/// the pad. ONE command on purpose. Promotion has to resolve its target
+/// through the same `resolve_task_git_path` + containment pair every other
+/// write uses (so member dirs work and nothing escapes the worktree), and
+/// doing it as "read here, write there" from TypeScript would re-implement
+/// that rule in the one place it must not be re-implemented.
+///
+/// Refuses an existing target unless `overwrite` — the caller asks first.
+#[tauri::command]
+async fn scratch_promote(
+    task_id: String,
+    id: String,
+    rel_path: String,
+    overwrite: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = load_tasks().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
+        let buf = scratch_buffer_path(&task_id, &id)?;
+        let content = fs::read_to_string(&buf).unwrap_or_default();
+        let (cwd, rel) = resolve_task_git_path(&w, &rel_path)?;
+        if rel.trim().is_empty() || rel.ends_with('/') {
+            return Err(format!("not a file path: {rel_path}"));
+        }
+        let abs = safe_task_path_for_create(&cwd, &rel)?;
+        if abs.exists() && !overwrite {
+            return Err(format!("\"{rel_path}\" already exists"));
+        }
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+        }
+        write_atomic(&abs, content.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        // Only now is the pad redundant. A failed write above leaves it
+        // exactly where it was, which is the whole point of promoting rather
+        // than moving.
+        let _ = fs::remove_file(&buf);
+        let _g = SCRATCH_LOCK.lock();
+        let mut list = scratch_read_index(&task_id)?;
+        list.retain(|r| r.id != id);
+        scratch_write_index(&task_id, &list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Does a task-relative path already exist? The save picker asks before
+/// promoting so it can offer "overwrite?" instead of failing the write.
+/// Unlike `task_path_stat` this tolerates a target whose PARENT is missing
+/// too (the picker lets you type a new folder).
+#[tauri::command]
+async fn scratch_promote_target_exists(task_id: String, rel_path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = load_tasks().into_iter().find(|w| w.id == task_id).ok_or("no task")?;
+        let (cwd, rel) = resolve_task_git_path(&w, &rel_path)?;
+        if rel.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(safe_task_path_for_create(&cwd, &rel).map(|p| p.exists()).unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Rename a file or directory in the task (file-tree context menu).
@@ -7412,10 +9643,18 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
     let (cwd, rel_path) = resolve_task_git_path(w, path)?;
     // Which two sides to compare depends on where the click came from
     // (GH #122):
-    //   "staged"   → HEAD vs index          (what `git diff --cached` shows)
-    //   "unstaged" → index vs working tree  (what `git diff` shows)
-    //   None       → HEAD vs working tree   (full uncommitted delta; the
-    //                pre-#122 behavior, kept for callers with no pane)
+    //   "staged"    → HEAD vs index          (what `git diff --cached` shows)
+    //   "unstaged"  → index vs working tree  (what `git diff` shows)
+    //   "commit:SHA"→ SHA^ vs SHA            (History tab, issue #199)
+    //   "base:SHA"  → SHA vs working tree    (History › Compare, issue #208)
+    //   None        → HEAD vs working tree   (full uncommitted delta; the
+    //                 pre-#122 behavior, kept for callers with no pane)
+    //
+    // "base:" is the only scope besides the default whose RIGHT side is the
+    // live file, which is why Compare keeps the review affordances the
+    // History tab has to drop: `fp` is a real worktree fingerprint, so a
+    // "viewed" mark clears itself when an agent touches the file again, and a
+    // review comment lands on the version somebody is about to edit.
     // Without the split, a file staged and then edited again showed the
     // full uncommitted diff from BOTH rows.
     //
@@ -7435,9 +9674,17 @@ fn task_file_diff_sides_for_task(w: &Task, path: &str, scope: Option<&str>) -> R
     };
     let show_head = || git_bytes(&["--no-pager", "show", &format!("HEAD:{rel_path}")], &cwd).ok();
     let show_index = || git_bytes(&["--no-pager", "show", &format!(":0:{rel_path}")], &cwd).ok();
-    let (original, modified) = match scope {
-        Some("staged") => (show_head(), show_index()),
-        Some("unstaged") => (show_index(), read_worktree()),
+    // A historical revision has no working-tree side at all: BOTH sides come
+    // out of the object store, and a first commit legitimately has no parent
+    // (`sha^` doesn't resolve) — that is an add, so the left side is missing.
+    let show_at = |rev: &str| git_bytes(&["--no-pager", "show", &format!("{rev}:{rel_path}")], &cwd).ok();
+    let commit_sha = scope.and_then(|s| s.strip_prefix("commit:")).filter(|s| is_commit_ish(s));
+    let base_sha = scope.and_then(|s| s.strip_prefix("base:")).filter(|s| is_commit_ish(s));
+    let (original, modified) = match (commit_sha, base_sha, scope) {
+        (Some(sha), _, _) => (show_at(&format!("{sha}^")), show_at(sha)),
+        (None, Some(sha), _) => (show_at(sha), read_worktree()),
+        (None, None, Some("staged")) => (show_head(), show_index()),
+        (None, None, Some("unstaged")) => (show_index(), read_worktree()),
         _ => (show_head(), read_worktree()),
     };
     let fp = modified_path.as_deref().map(file_fp).unwrap_or_default();
@@ -7612,16 +9859,18 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
         })
     };
     let canon_target = if rel.is_empty() {
-        fs::canonicalize(&base).map_err(|e| e.to_string())?
+        fs::canonicalize(&base).map_err(|e| format!("{}: {e}", base.display()))?
     } else if let Some((member, remainder)) = &member_hit {
         let mp = PathBuf::from(&member.path);
         if remainder.is_empty() {
-            fs::canonicalize(&mp).map_err(|e| e.to_string())?
+            fs::canonicalize(&mp).map_err(|e| format!("{}: {e}", mp.display()))?
         } else {
             safe_task_path(&mp, remainder)?
         }
     } else {
-        safe_task_path(&base, &rel)?
+        // GH #250: also resolves through the config-dir symlinks termic itself
+        // creates into the repo root, which the strict check refused.
+        safe_task_read_path(&w, &base, &rel)?
     };
     // The repo that owns this directory + the path relative to its root.
     let (owner_repo_path, local_rel): (String, &str) = match &member_hit {
@@ -7637,7 +9886,8 @@ fn task_dir_list_sync(id: String, rel: String, heal: bool) -> Result<Vec<FileEnt
     let exclude_patterns = compile_exclude_patterns(&owner_repo_path);
 
     let mut out = Vec::new();
-    let rd = fs::read_dir(&canon_target).map_err(|e| e.to_string())?;
+    let rd = fs::read_dir(&canon_target)
+        .map_err(|e| format!("{}: {e}", canon_target.display()))?;
     for e in rd.flatten() {
         let name = match e.file_name().into_string() { Ok(s) => s, Err(_) => continue };
         // Always hide .git — it's repo plumbing, never something the
@@ -7969,7 +10219,7 @@ fn simple_glob_match(pat: &str, s: &str) -> bool {
 /// dev-loop moves (npm install, docker build, kubectl apply, etc.). The
 /// aux/scratch terminal is in the same bucket; sandbox specifically
 /// targets the agent PTY.
-fn run_script(script: &str, cwd: &Path, port: u16, name: &str) -> Result<String> {
+fn run_script(script: &str, cwd: &Path, port: u16, name: &str, extra: &[NamedPort]) -> Result<String> {
     // Same login-shell environment the PTY gets (see pty_spawn). `bash -l`
     // only sources bash's OWN profile, so a PATH/EDITOR/etc. the user set
     // in their real shell (fish/zsh rc) or a tool dir like ~/.bun/bin is
@@ -7985,6 +10235,13 @@ fn run_script(script: &str, cwd: &Path, port: u16, name: &str) -> Result<String>
         .env("TERMIC_TASK", name);
     for (k, v) in inject {
         cmd.env(k, v);
+    }
+    // Extra named ports (GH #196): frozen name→port pairs, exposed
+    // under the exact names the user configured. AFTER the login-shell
+    // inject so a same-named var exported in the user's shell rc can't
+    // shadow the allocated port — matching task_run_script_stream.
+    for np in extra {
+        cmd.env(&np.name, np.port.to_string());
     }
     let out = cmd.output().with_context(|| "run script")?;
     let mut s = String::new();
@@ -8009,6 +10266,7 @@ fn run_script_streaming(
     cwd: PathBuf,
     port: u16,
     name: String,
+    extra: Vec<NamedPort>,
     app: AppHandle,
     ws_id: String,
 ) {
@@ -8037,6 +10295,13 @@ fn run_script_streaming(
             .stderr(Stdio::piped());
         for (k, v) in setup_inject {
             cmd.env(k, v);
+        }
+        // Extra named ports (GH #196): frozen name→port pairs, exposed
+        // under the exact names the user configured. AFTER the login-
+        // shell inject so a shell-rc export of the same name can't
+        // shadow the allocated port — matching task_run_script_stream.
+        for np in &extra {
+            cmd.env(&np.name, np.port.to_string());
         }
         let spawn_res = cmd.spawn();
         let mut child = match spawn_res {
@@ -8607,6 +10872,28 @@ async fn task_spotlight_resync(id: String, app: AppHandle) -> Result<(), String>
 }
 
 
+/// GH #196 on-the-fly ports: top up a task's frozen extra named ports
+/// from the current effective config and return the fresh record. The
+/// frontend calls this right before spawning any tab so names added to
+/// the config after task creation reach existing tasks; the script
+/// runner path calls `top_up_extra_ports` directly.
+#[tauri::command]
+fn task_ensure_extra_ports(id: String) -> Result<Task, String> {
+    // Held until save_task below: a stray allocated against a stale
+    // snapshot could collide with a concurrent create's block.
+    let _port_guard = PORT_ALLOC_LOCK.lock();
+    let mut list = load_tasks();
+    let idx = list.iter().position(|w| w.id == id).ok_or("no such task")?;
+    let Some(proj) = load_projects().into_iter().find(|p| p.id == list[idx].project_id) else {
+        return Ok(list[idx].clone()); // orphaned task: spawn with the frozen pairs
+    };
+    let snapshot = list.clone();
+    if top_up_extra_ports(&mut list[idx], &proj, &snapshot) {
+        save_task(&list[idx]).map_err(|e| e.to_string())?;
+    }
+    Ok(list[idx].clone())
+}
+
 /// Kick off either the project's setup or run script for a task with
 /// live stdout/stderr streaming. Emits:
 ///   script-output://<ws_id>:<kind>  { line: string }
@@ -8630,8 +10917,19 @@ fn task_run_script_stream(
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
-    let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
+    // Port lock spans load -> top-up -> save only; dropped before the
+    // script actually spawns.
+    let port_guard = PORT_ALLOC_LOCK.lock();
+    let all_tasks = load_tasks();
+    let mut w = all_tasks.iter().find(|w| w.id == id).cloned().ok_or("no such task")?;
     let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
+    // On-the-fly ports (GH #196): names configured after this task was
+    // created freeze into its buffer (or overflow to a stray port) now,
+    // so this run sees them.
+    if top_up_extra_ports(&mut w, &p, &all_tasks) {
+        let _ = save_task(&w);
+    }
+    drop(port_guard);
     let member_dir = member.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
 
     // Resolve target: empty member = host, otherwise the named
@@ -8722,6 +11020,10 @@ fn task_run_script_stream(
             (format!("TERMIC_PORT_{sanitized}"), p)
         })
         .collect();
+    // Extra named ports (GH #196), frozen on the task at creation.
+    let extra_ports: Vec<(String, u16)> = w.extra_named_ports.iter()
+        .map(|np| (np.name.clone(), np.port))
+        .collect();
 
     thread::spawn(move || {
         // Kill any prior instance for (task, member, kind) — SIGTERM to the
@@ -8772,6 +11074,9 @@ fn task_run_script_stream(
             cmd.env(k, v);
         }
         for (k, v) in &sibling_ports {
+            cmd.env(k, v.to_string());
+        }
+        for (k, v) in &extra_ports {
             cmd.env(k, v.to_string());
         }
         let spawn_res = cmd.spawn();
@@ -8832,6 +11137,189 @@ fn task_stop_script(id: String, kind: String, member: Option<String>) -> Result<
 
 // ───────────────────────────── find in files ─────────────────────────────
 
+/// Which program backs find-in-files. ripgrep when the user has it
+/// (faster on big repos, Unicode-aware, and its Rust regex is the same
+/// flavor the frontend highlights with), `git grep` otherwise, so a
+/// machine without rg keeps working exactly as before.
+#[derive(Clone, Copy, PartialEq)]
+enum FindBackend {
+    Ripgrep(&'static str),
+    GitGrep,
+}
+
+impl FindBackend {
+    /// Stable id for the frontend. Not the binary path: this crosses IPC
+    /// and only ever picks wording in the find dialog.
+    fn name(self) -> &'static str {
+        match self {
+            FindBackend::Ripgrep(_) => "ripgrep",
+            FindBackend::GitGrep => "git-grep",
+        }
+    }
+}
+
+/// First executable named `bin` in a colon-separated PATH. Hand-rolled
+/// instead of shelling out to `which` because this runs on the search
+/// path and a process spawn is the expensive part of the probe.
+fn find_on_path(bin: &str, path: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(bin))
+        .find(|p| {
+            fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// Resolve the backend, memoizing only an answer that can't get better.
+///
+/// Probed against the login-shell PATH, NOT our inherited one: a
+/// GUI-launched .app gets a bare launchd PATH with no /opt/homebrew/bin,
+/// so `rg` would look uninstalled for every Homebrew user (same reason
+/// `git_bytes` injects the resolved env).
+///
+/// That PATH arrives asynchronously though (shell_env probes a login
+/// shell off-thread and serves a static fallback until it lands), so a
+/// search fired in the first moments after launch can miss an rg that IS
+/// installed. Caching THAT verdict would pin git grep for the rest of
+/// the session, so a miss found on the fallback PATH is not cached and
+/// the next search asks again. Cached for good once either the probe has
+/// landed or we've actually found rg (a hit is authoritative: the binary
+/// is right there, however we learned of it).
+///
+/// Re-resolving costs a few `stat`s per PATH entry, no process spawn,
+/// once per search start.
+///
+/// `TERMIC_FIND_BACKEND=git-grep` pins the fallback so the e2e suite can
+/// cover both paths on a machine that has ripgrep installed.
+static FIND_BACKEND: std::sync::OnceLock<FindBackend> = std::sync::OnceLock::new();
+
+/// May this resolution be memoized for the rest of the session?
+///
+/// A hit always: rg is at that path, however we learned of it. A miss
+/// only once the PATH it was computed from is final, because the static
+/// fallback has no Homebrew/nvm/bun dirs and its "not installed" is not
+/// an answer, just an early read.
+fn backend_verdict_is_final(found_rg: bool, path_is_final: bool) -> bool {
+    found_rg || path_is_final
+}
+
+fn find_backend() -> FindBackend {
+    if let Some(b) = FIND_BACKEND.get() { return *b; }
+
+    if std::env::var("TERMIC_FIND_BACKEND").as_deref() == Ok("git-grep") {
+        return *FIND_BACKEND.get_or_init(|| FindBackend::GitGrep);
+    }
+    let (path, path_is_final) = shell_env::resolved_path_final();
+    let found = find_on_path("rg", &path).map(|p| {
+        // Leaked once per process, so the path can live in a Copy enum
+        // that gets moved into the search thread.
+        FindBackend::Ripgrep(Box::leak(p.to_string_lossy().into_owned().into_boxed_str()))
+    });
+    let backend = found.unwrap_or(FindBackend::GitGrep);
+    if backend_verdict_is_final(found.is_some(), path_is_final) {
+        return *FIND_BACKEND.get_or_init(|| backend);
+    }
+    // Provisional: search with git grep now, look for rg again next time.
+    backend
+}
+
+/// Which backend find-in-files will use, for the dialog: it words the
+/// regex tooltip from the flavor and offers the "install ripgrep" hint
+/// only on the fallback.
+///
+/// `settled` is false while the answer could still improve (the login
+/// PATH hasn't landed, so an installed rg may not be visible yet). The
+/// dialog must not memoize an unsettled answer, or it would keep
+/// offering "install ripgrep" to someone who has it.
+#[derive(Serialize)]
+pub struct FindBackendInfo {
+    backend: &'static str,
+    settled: bool,
+}
+
+/// MUST stay async: resolving can wait on the login-shell probe (up to a
+/// second right after launch), and a sync command would pay that on the
+/// main thread and freeze the webview.
+#[tauri::command]
+async fn task_find_backend() -> FindBackendInfo {
+    tauri::async_runtime::spawn_blocking(|| {
+        let backend = find_backend();
+        FindBackendInfo { backend: backend.name(), settled: FIND_BACKEND.get().is_some() }
+    })
+    .await
+    .unwrap_or(FindBackendInfo { backend: "git-grep", settled: false })
+}
+
+/// One match line, backend-agnostic.
+struct RawHit {
+    path: String,
+    line: u32,
+    col: u32,
+    preview: String,
+    /// UTF-16 `[start, end)` offsets of every match on this line. ripgrep
+    /// reports them, so the frontend paints exactly what the search
+    /// engine matched. `git grep` reports only the first column, so this
+    /// stays empty and the frontend re-matches the preview itself.
+    ranges: Vec<[u32; 2]>,
+}
+
+/// Byte offset → UTF-16 offset, the unit JS string indexes use. ripgrep
+/// counts bytes; handing those to the frontend would smear the highlight
+/// right by one per non-ASCII char earlier on the line. Clamps to the
+/// enclosing char for a non-boundary offset.
+fn byte_to_utf16(s: &str, byte: usize) -> u32 {
+    let mut n = 0usize;
+    for (i, ch) in s.char_indices() {
+        if i >= byte { return n as u32; }
+        n += ch.len_utf16();
+    }
+    n as u32
+}
+
+/// `git grep -n --column` line: `path:LINE:COL:preview`.
+fn parse_git_grep_line(line: &str) -> Option<RawHit> {
+    let mut it = line.splitn(4, ':');
+    let path = it.next()?.to_string();
+    let line_no: u32 = it.next()?.parse().ok()?;
+    let col: u32 = it.next()?.parse().ok()?;
+    let preview = it.next().unwrap_or("").to_string();
+    if path.is_empty() || line_no == 0 { return None; }
+    Some(RawHit { path, line: line_no, col, preview, ranges: Vec::new() })
+}
+
+/// One `--json` event from ripgrep. Only `type: "match"` carries a hit;
+/// begin/end/summary events are skipped.
+///
+/// Non-UTF-8 paths and lines arrive as `{"bytes": "<base64>"}` instead of
+/// `{"text": …}` — those are dropped rather than guessing an encoding
+/// (`git grep` would have emitted mojibake for the same file).
+fn parse_rg_json_line(line: &str) -> Option<RawHit> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "match" { return None; }
+    let d = v.get("data")?;
+    let path = d.get("path")?.get("text")?.as_str()?.to_string();
+    let line_no = d.get("line_number")?.as_u64()? as u32;
+    let text = d.get("lines")?.get("text")?.as_str()?;
+    let preview = text.trim_end_matches('\n').trim_end_matches('\r').to_string();
+    if path.is_empty() || line_no == 0 { return None; }
+
+    let mut ranges: Vec<[u32; 2]> = Vec::new();
+    for s in d.get("submatches").and_then(|s| s.as_array()).into_iter().flatten() {
+        let (Some(a), Some(b)) = (
+            s.get("start").and_then(|x| x.as_u64()),
+            s.get("end").and_then(|x| x.as_u64()),
+        ) else { continue };
+        ranges.push([byte_to_utf16(&preview, a as usize), byte_to_utf16(&preview, b as usize)]);
+    }
+    // git grep's column is 1-based; keep the contract identical so
+    // `revealAt` doesn't need to know which backend ran.
+    let col = ranges.first().map(|r| r[0] + 1).unwrap_or(1);
+    Some(RawHit { path, line: line_no, col, preview, ranges })
+}
+
 /// Per-task in-flight grep PID. Each new search SIGKILLs the
 /// previous one for the same task so typing doesn't fan out into
 /// dozens of zombie git-grep procs.
@@ -8852,9 +11340,12 @@ fn running_greps_swap(ws_id: &str, new_pid: Option<i32>) -> Option<i32> {
 /// the cap the child is SIGKILLed and `truncated: true` is reported.
 /// Re-entrant safety: any previous grep for the same task is killed
 /// before this one starts (typing fires a new search per keystroke).
-/// `regex` picks POSIX ERE (`-E`) over a literal match (`-F`). Not PCRE
+///
+/// Runs ripgrep when it's installed and `git grep` otherwise (see
+/// `find_backend`), which also decides the regex flavor `regex` selects:
+/// Rust regex under rg, POSIX ERE (`-E`) under git grep. Not git's PCRE
 /// (`-P`) — git is not always compiled with libpcre, Apple's is not.
-/// `case_sensitive` drops the default `-i`.
+/// `case_sensitive` drops the default case folding.
 #[derive(Deserialize)]
 pub struct GrepOpts {
     pub regex: bool,
@@ -8904,11 +11395,49 @@ fn task_grep_start(
     let app_o = app.clone();
     let ws_id_o = id.clone();
     let search_id_o = search_id.clone();
-    // git grep flags: -n line numbers, --column column, -I skip binary,
-    // -F literal / -E POSIX ERE, -i / --no-ignore-case, --untracked
-    // --exclude-standard include new files but respect .gitignore.
-    let match_mode = if opts.regex { "-E" } else { "-F" };
-    let case_flag = if opts.case_sensitive { "--no-ignore-case" } else { "-i" };
+    // One child per repo, spawned in its own process group so the whole
+    // tree dies with a single kill on the negated pid.
+    let spawn_in = move |backend: FindBackend, rcwd: &std::path::Path| {
+        let mut cmd = match backend {
+            // rg flags: --json (implies line numbers + match offsets),
+            // --hidden to match `git grep --untracked`'s view of
+            // non-ignored dotfiles, and !.git/ because --hidden would
+            // otherwise expose the object store. --no-config so a user's
+            // RIPGREP_CONFIG_PATH (say a stray --smart-case or -uu)
+            // can't quietly change what termic finds. Binary files and
+            // .gitignore are handled by rg's defaults.
+            FindBackend::Ripgrep(bin) => {
+                let mut c = std::process::Command::new(bin);
+                c.args(["--json", "--no-config", "--hidden", "--glob", "!.git/"]);
+                if !opts.regex { c.arg("-F"); }
+                c.arg(if opts.case_sensitive { "-s" } else { "-i" });
+                c.args(["-e", &query]);
+                c
+            }
+            // git grep flags: -n line numbers, --column column, -I skip
+            // binary, -F literal / -E POSIX ERE, -i / --no-ignore-case,
+            // --untracked --exclude-standard include new files but
+            // respect .gitignore.
+            FindBackend::GitGrep => {
+                let mut c = std::process::Command::new("git");
+                c.args([
+                    "grep",
+                    "-n", "--column", "-I",
+                    if opts.regex { "-E" } else { "-F" },
+                    if opts.case_sensitive { "--no-ignore-case" } else { "-i" },
+                    "--untracked", "--exclude-standard",
+                    "--no-color",
+                    "-e", &query,
+                ]);
+                c
+            }
+        };
+        cmd.current_dir(rcwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+    };
 
     thread::spawn(move || {
         // process_group(0) to kill the tree. We run one child per repo,
@@ -8929,6 +11458,9 @@ fn task_grep_start(
         };
 
         let mut my_pid: Option<i32> = None;
+        // Resolved HERE, not in the command: this can wait on the
+        // login-shell probe, and task_grep_start is sync (main thread).
+        let mut backend = find_backend();
         'repos: for (rcwd, prefix) in &repos {
             // Before each repo, bail if the slot changed: a newer search
             // (different pid) supersedes us, or a cancel cleared it (None).
@@ -8940,40 +11472,38 @@ fn task_grep_start(
                     break 'repos;
                 }
             }
-            let spawn = std::process::Command::new("git")
-                .args([
-                    "grep",
-                    "-n", "--column", "-I", match_mode, case_flag,
-                    "--untracked", "--exclude-standard",
-                    "--no-color",
-                    "-e", &query,
-                ])
-                .current_dir(rcwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn();
-            let mut child = match spawn { Ok(c) => c, Err(_) => continue 'repos };
+            let mut child = match spawn_in(backend, rcwd) {
+                Ok(c) => c,
+                // rg resolved at probe time but is gone now (upgrade,
+                // uninstall). Degrade to git grep instead of reporting
+                // zero matches, which would read as "nothing here".
+                Err(_) if backend != FindBackend::GitGrep => {
+                    backend = FindBackend::GitGrep;
+                    match spawn_in(backend, rcwd) { Ok(c) => c, Err(_) => continue 'repos }
+                }
+                Err(_) => continue 'repos,
+            };
             let pid = child.id() as i32;
             my_pid = Some(pid);
             running_greps_swap(&ws_id_o, Some(pid));
 
             if let Some(stdout) = child.stdout.take() {
                 for line in BufReader::new(stdout).lines().map_while(|r| r.ok()) {
-                    // git grep -n --column output: "path:LINE:COL:preview"
-                    let mut it = line.splitn(4, ':');
-                    let path = it.next().unwrap_or("").to_string();
-                    let line_no: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let col: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let preview = it.next().unwrap_or("").to_string();
-                    if path.is_empty() || line_no == 0 { continue; }
+                    let hit = match backend {
+                        FindBackend::Ripgrep(_) => parse_rg_json_line(&line),
+                        FindBackend::GitGrep => parse_git_grep_line(&line),
+                    };
+                    // rg emits begin/end/summary events between matches;
+                    // both backends can emit a line we can't read.
+                    let Some(hit) = hit else { continue };
                     if batch.is_empty() { batch_started = std::time::Instant::now(); }
                     batch.push(serde_json::json!({
                         // Prefix member paths so clicks resolve from the wrapper.
-                        "path": format!("{prefix}{path}"),
-                        "line": line_no,
-                        "col": col,
-                        "preview": preview,
+                        "path": format!("{prefix}{}", hit.path),
+                        "line": hit.line,
+                        "col": hit.col,
+                        "preview": hit.preview,
+                        "ranges": hit.ranges,
                     }));
                     count += 1;
                     if batch.len() >= BATCH_MAX
@@ -9302,7 +11832,19 @@ async fn play_completion_sound(name: String) {
 
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
-    let (program, args) = open_command(std::env::consts::OS, &path);
+    spawn_os_open(&path)
+}
+
+/// Hand `target` (a URL or a filesystem path) to the OS default handler.
+///
+/// THE single implementation, shared by `open_path` and `open_url_default`.
+/// It is factored out rather than duplicated because the preview buttons moved
+/// from the former to the latter (GH #245) on the strength of the two being
+/// identical: with no browser configured they must stay that way, and two
+/// copies of three lines is exactly the kind of thing a later refactor edits
+/// one of. Now they cannot disagree.
+fn spawn_os_open(target: &str) -> Result<(), String> {
+    let (program, args) = open_command(std::env::consts::OS, target);
     Command::new(program).args(&args).status().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -9424,6 +11966,293 @@ fn open_command(os: &str, target: &str) -> (&'static str, Vec<String>) {
     }
 }
 
+// ─────────────────── preview browser (GH #245) ───────────────────
+//
+// The user names a COMMAND TEMPLATE, not an app: `open -a "Google Chrome"`,
+// `firefox -P work`, `flatpak run com.google.Chrome`. A template is what lets
+// them pick a Chrome/Edge profile, which naming an app cannot.
+//
+// The template is tokenised HERE and spawned as argv. It is never handed to a
+// shell, and that is not a stylistic preference: Debian's `sensible-browser`
+// passes $BROWSER to `eval`, and the same mistake here would let a preview URL
+// like `http://localhost:3000/?a=1&b=2` split on the unquoted `&` — the exact
+// bug `open_command` documents for `cmd /C start`. Verified by experiment on
+// macOS: `open -na App --args --profile-directory="Profile 1" <url>` delivers
+// two argv entries with the `&` and any `%20` intact.
+
+/// The `{url}` placeholder in a browser command template.
+const BROWSER_URL_PLACEHOLDER: &str = "{url}";
+
+/// Split a browser command template into argv, honouring quotes the way a
+/// user reasonably expects when copying a command out of a terminal.
+///
+/// Deliberately NOT a shell: no variable expansion, no globbing, no command
+/// substitution, no operators. Double and single quotes group a run and are
+/// removed; inside double quotes a backslash escapes `"` or `\`; outside
+/// quotes a backslash escapes the next character. An unterminated quote is an
+/// error rather than a silently truncated argument, because the difference
+/// shows up as a link that mysteriously fails to open.
+fn split_browser_command(input: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has_cur = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if has_cur {
+                    out.push(std::mem::take(&mut cur));
+                    has_cur = false;
+                }
+            }
+            '\'' => {
+                has_cur = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(ch) => cur.push(ch),
+                        None => return Err("unterminated single quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                has_cur = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            // Only these two are escapes inside double quotes;
+                            // anything else keeps the backslash, so a Windows-
+                            // ish path in a quoted arg survives intact.
+                            Some(ch @ ('"' | '\\')) => cur.push(ch),
+                            Some(ch) => { cur.push('\\'); cur.push(ch); }
+                            None => return Err("unterminated double quote".into()),
+                        },
+                        Some(ch) => cur.push(ch),
+                        None => return Err("unterminated double quote".into()),
+                    }
+                }
+            }
+            '\\' => {
+                has_cur = true;
+                match chars.next() {
+                    Some(ch) => cur.push(ch),
+                    None => return Err("trailing backslash".into()),
+                }
+            }
+            ch => { has_cur = true; cur.push(ch); }
+        }
+    }
+    if has_cur { out.push(cur); }
+    Ok(out)
+}
+
+/// Build the argv that opens `url` with `template`.
+///
+/// `{url}` is substituted wherever it appears; with no placeholder the URL is
+/// appended as the final argument, which is what every preset relies on
+/// (`open -a Safari` + url, `firefox -P work` + url). The placeholder exists
+/// for the rare command that needs the URL in the middle.
+///
+/// The URL always lands as its OWN argv entry (or inside one), never re-split.
+fn browser_argv(template: &str, url: &str) -> Result<Vec<String>, String> {
+    let toks = split_browser_command(template)?;
+    if toks.is_empty() {
+        return Err("the browser command is empty".into());
+    }
+    if toks.iter().any(|t| t.contains(BROWSER_URL_PLACEHOLDER)) {
+        return Ok(toks.into_iter()
+            .map(|t| t.replace(BROWSER_URL_PLACEHOLDER, url))
+            .collect());
+    }
+    let mut argv = toks;
+    argv.push(url.to_string());
+    Ok(argv)
+}
+
+/// Does `argv[0]` name something we can actually execute? Used by Settings to
+/// reject a typo at save time rather than at click time. An absolute/relative
+/// path is checked directly; a bare name is looked up on PATH.
+///
+/// This can only vouch for the LAUNCHER. `open -a "Gogle Chrome"` passes here
+/// (because `open` exists) and still fails at launch, which is exactly why
+/// `open_external_url` also falls back at runtime.
+fn browser_program_exists(program: &str) -> bool {
+    // `is_file()` alone is not enough: a non-executable file that happens to
+    // share the name (a README in a PATH dir, a stray data file) would pass
+    // validation at save time and only fail on click. The runtime fallback
+    // would catch it, but the point of this check is to fail in the settings
+    // field, where the user can see and fix it.
+    #[cfg(unix)]
+    let is_exec = |p: &std::path::Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    #[cfg(not(unix))]
+    let is_exec = |p: &std::path::Path| p.is_file();
+    if program.contains('/') {
+        return is_exec(std::path::Path::new(program));
+    }
+    let Some(paths) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&paths).any(|dir| is_exec(&dir.join(program)))
+}
+
+/// Validate a browser command template for the Settings UI. `Ok(())` for an
+/// empty template (that means "OS default", always valid).
+#[tauri::command]
+fn browser_command_check(command: String) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Ok(());
+    }
+    let argv = browser_argv(&command, "https://example.invalid/")?;
+    if !browser_program_exists(&argv[0]) {
+        return Err(format!("`{}` was not found on your PATH", argv[0]));
+    }
+    Ok(())
+}
+
+/// E2E-ONLY: record the argv a preview/link open WOULD have run, instead of
+/// launching a browser on the machine running the suite. One JSON line per
+/// open in the isolated profile dir, so a spec can assert which browser the
+/// precedence rules picked with plain `fs` and no extra release-build IPC.
+#[cfg(feature = "e2e")]
+fn e2e_record_browser(argv: &[String]) {
+    if let Ok(dir) = data_dir() {
+        let line = serde_json::to_string(argv).unwrap_or_default();
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("e2e-browser.log"))
+            .and_then(|mut f| writeln!(f, "{line}"));
+    }
+}
+
+/// How long to watch a freshly spawned browser command for an early failure.
+///
+/// A launcher that is going to fail does so immediately (`open -a "Nonexistent"`
+/// exits 1 in a few ms), while a browser that took the URL either exits 0 at
+/// once or stays alive for its whole session. So a short bounded watch cleanly
+/// separates the two without ever waiting on a real browser.
+///
+/// NOTE for the next reader: this is NOT the banned `thread::sleep` poll loop
+/// (docs/performance.md bear trap 9). That one is about steady-state polling on
+/// a hot path; this is one bounded wait per user click, on the blocking pool.
+const BROWSER_WATCH_MS: u64 = 500;
+const BROWSER_WATCH_STEP_MS: u64 = 20;
+
+/// Outcome of trying to launch a URL with a user-configured browser command.
+#[derive(Debug, PartialEq, Eq)]
+enum BrowserLaunch {
+    /// The configured command took the URL.
+    Launched,
+    /// The command failed; the caller should fall back to the OS default.
+    Failed(String),
+}
+
+/// Run `argv`, watching briefly for an immediate failure. Blocking: callers
+/// must be on the blocking pool.
+#[cfg_attr(feature = "e2e", allow(dead_code))]
+fn run_browser_argv(argv: &[String]) -> BrowserLaunch {
+    let mut child = match Command::new(&argv[0]).args(&argv[1..]).spawn() {
+        Ok(c) => c,
+        Err(e) => return BrowserLaunch::Failed(format!("could not run `{}`: {e}", argv[0])),
+    };
+    let mut waited = 0;
+    while waited < BROWSER_WATCH_MS {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Exited already. Zero means it handed the URL off and quit
+                // (every `open`-style launcher); non-zero is a real failure,
+                // and the one the user actually hits: a misspelled app name.
+                return if status.success() {
+                    BrowserLaunch::Launched
+                } else {
+                    BrowserLaunch::Failed(format!(
+                        "`{}` exited with {}", argv[0],
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "a signal".into()),
+                    ))
+                };
+            }
+            // Still running past the watch window: a real browser holding the
+            // foreground (`firefox <url>` on Linux does exactly this).
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(BROWSER_WATCH_STEP_MS));
+                waited += BROWSER_WATCH_STEP_MS;
+            }
+            Err(e) => return BrowserLaunch::Failed(format!("could not wait on `{}`: {e}", argv[0])),
+        }
+    }
+    BrowserLaunch::Launched
+}
+
+/// Open `url` in the user's configured browser, falling back to the OS default
+/// (GH #245).
+///
+/// `browser` is the template the FRONTEND already resolved (project override
+/// beats the app-wide setting - see `resolveBrowserCommand` in
+/// lib/previewBrowser.ts, which owns and tests that precedence); empty
+/// or absent means "OS default", which takes the byte-identical path this app
+/// used before the setting existed. Returns which one happened plus the reason
+/// on a fallback, so the frontend can say so instead of leaving a dead link.
+#[tauri::command]
+async fn open_external_url(url: String, browser: Option<String>) -> Result<BrowserOpen, String> {
+    let template = browser.unwrap_or_default();
+    if template.trim().is_empty() {
+        return open_url_default(&url).map(|_| BrowserOpen { used: "default".into(), reason: None });
+    }
+    let argv = match browser_argv(&template, &url) {
+        Ok(a) => a,
+        Err(e) => {
+            open_url_default(&url)?;
+            return Ok(BrowserOpen { used: "fallback".into(), reason: Some(e) });
+        }
+    };
+    #[cfg(feature = "e2e")]
+    {
+        e2e_record_browser(&argv);
+        return Ok(BrowserOpen { used: "browser".into(), reason: None });
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        match tauri::async_runtime::spawn_blocking(move || run_browser_argv(&argv)).await {
+            Ok(BrowserLaunch::Launched) => Ok(BrowserOpen { used: "browser".into(), reason: None }),
+            Ok(BrowserLaunch::Failed(why)) => {
+                open_url_default(&url)?;
+                Ok(BrowserOpen { used: "fallback".into(), reason: Some(why) })
+            }
+            Err(e) => {
+                open_url_default(&url)?;
+                Ok(BrowserOpen { used: "fallback".into(), reason: Some(e.to_string()) })
+            }
+        }
+    }
+}
+
+/// What `open_external_url` did. `used` is "default" (no browser configured),
+/// "browser" (the configured one took it) or "fallback" (it failed and the OS
+/// default took it); `reason` is set only for "fallback".
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserOpen {
+    pub used: String,
+    pub reason: Option<String>,
+}
+
+/// Hand `url` to the OS default handler: the pre-#245 path, unchanged.
+fn open_url_default(url: &str) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        e2e_record_browser(&["<default>".to_string(), url.to_string()]);
+        return Ok(());
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        // Same call `open_path` makes - see `spawn_os_open`.
+        spawn_os_open(url)
+    }
+}
+
 // ───────────────────────────── settings / discovery ─────────────────────────────
 //
 // App-wide preferences live in `settings.json` next to `projects.json`. Today
@@ -9432,11 +12261,21 @@ fn open_command(os: &str, target: &str) -> (&'static str, Vec<String>) {
 // wizard fires exactly once per install). Keep this struct additive — fields
 // are serde(default) so old files keep parsing as we grow it.
 
-/// Repo-root config dirs symlinked into each new worktree by default: the
-/// common per-project agent-config dirs (Claude Code, Gemini, Codex). Each is
-/// only linked when it actually exists in the repo, so listing one a given repo
-/// lacks is harmless. Just the pre-filled starting point - users edit the list.
+/// Repo-root config paths symlinked into each new worktree by default: the
+/// common per-project agent-config dirs (Claude Code, Gemini, Codex) plus
+/// `.mcp.json`, which is a FILE and plays the same role — project-scoped MCP
+/// servers that a plain worktree checkout omits (GH #251). Each is only linked
+/// when it actually exists in the repo, so listing one a given repo lacks is
+/// harmless. Just the pre-filled starting point - users edit the list.
 fn default_worktree_symlink_paths() -> Vec<String> {
+    vec![".claude".into(), ".gemini".into(), ".codex".into(), ".mcp.json".into()]
+}
+
+/// The default as it shipped before `.mcp.json` joined it. A stored list equal
+/// to this one was never edited by the user, so the upgrade in
+/// `load_settings_inner` may replace it; anything else is theirs and is left
+/// alone. Delete once no profile can still carry the old list.
+fn legacy_worktree_symlink_paths_v0_29() -> Vec<String> {
     vec![".claude".into(), ".gemini".into(), ".codex".into()]
 }
 
@@ -9516,6 +12355,13 @@ pub struct Settings {
     /// nearly every `false` on disk is the default rather than a decision.
     #[serde(default)]
     pub cli_default_migrated: bool,
+    /// "Enable MCP endpoint" (Settings): binds the loopback MCP listener
+    /// (mcp_server.rs). Default OFF, and unlike `cli_enabled` the listener
+    /// only exists while this is on (bind-on-enable; there is no auto-launch
+    /// dead end on this surface). Also re-read per request so a disable
+    /// applies even to connections racing the unbind.
+    #[serde(default)]
+    pub mcp_enabled: bool,
     /// What the window's close button does: "ask" (default) | "menubar" |
     /// "quit". "ask" shows the close prompt whose "Don't ask again" checkbox
     /// writes the chosen one back here. Stored rather than inferred so the
@@ -9533,8 +12379,10 @@ pub struct Settings {
     /// gets the dock icon as their way back instead of losing both.
     #[serde(default)]
     pub tray_enabled: Option<bool>,
-    /// Repo-root config dirs symlinked into each NEW worktree task (when the
-    /// checkout didn't already provide them). `.claude/` and friends hold a
+    /// Repo-root config paths symlinked into each NEW worktree task (when the
+    /// checkout didn't already provide them). Files as well as dirs:
+    /// `.mcp.json` is a file and carries project-scoped MCP servers (GH #251).
+    /// `.claude/` and friends hold a
     /// project's subagents / skills / commands, which are commonly gitignored
     /// (or built from symlinks to a shared dir) so `git worktree add` leaves
     /// them out - an agent spawned there would otherwise lose all project-local
@@ -9559,6 +12407,18 @@ pub struct Settings {
     /// the same built-in. Resolution lives in `project_tasks_root`.
     #[serde(default = "builtin_tasks_path")]
     pub default_tasks_path: String,
+    /// App-wide command that opens preview URLs and terminal links (GH #245).
+    /// Empty (the default) means the OS default browser, i.e. exactly the
+    /// behaviour that shipped before this setting existed.
+    ///
+    /// A COMMAND TEMPLATE, not an app name: `open -a "Google Chrome"`,
+    /// `firefox -P work`, `flatpak run com.google.Chrome`. That is what lets a
+    /// user pick a Chrome/Edge profile, which naming an app cannot. Tokenised
+    /// by `split_browser_command` and spawned as argv - NEVER through a shell,
+    /// or the URL's `&` would be re-parsed (see `open_command`). Projects
+    /// override it via `Project.preview_browser`.
+    #[serde(default)]
+    pub preview_browser: String,
 }
 
 /// Whether the pre-create base fetch (GH #79) is enabled. Default-on: only an
@@ -10076,6 +12936,15 @@ pub(crate) fn load_settings_inner() -> Settings {
     // entries usually breaks the agent, and (b) it's a single line
     // to re-remove in Settings → Agents. Custom agents are left alone.
     let mut migrated = false;
+    // Migration (GH #251): `.mcp.json` joined the shipped list. Only a list
+    // that still EXACTLY equals the previous default is replaced — that is a
+    // user who never edited it, so this is honoring the "pre-filled starting
+    // point" rather than overriding a choice. A user who removed an entry, or
+    // added their own, keeps theirs untouched; so does one who cleared it.
+    if s.worktree_symlink_paths == legacy_worktree_symlink_paths_v0_29() {
+        s.worktree_symlink_paths = default_worktree_symlink_paths();
+        migrated = true;
+    }
     for def in default_agents() {
         if let Some(a) = s.agents.iter_mut().find(|a| a.id == def.id && a.builtin) {
             let existing: std::collections::HashSet<&String> =
@@ -10156,11 +13025,7 @@ pub(crate) fn load_settings_inner() -> Settings {
     // a read-only filesystem or transient I/O error shouldn't fail the
     // load (in-memory state is still correct).
     if migrated {
-        if let Ok(f) = settings_file() {
-            if let Ok(serialized) = serde_json::to_string_pretty(&s) {
-                let _ = fs::write(f, serialized);
-            }
-        }
+        let _ = save_settings_inner(&s);
     }
     s
 }
@@ -10188,15 +13053,43 @@ fn settings_load() -> Settings { load_settings_inner() }
 #[tauri::command]
 fn agents_defaults() -> Vec<Agent> { default_agents() }
 
-/// Run a shell command in `cwd` via `sh -lc` and return trimmed stdout.
-/// Used by post_launch_capture to harvest the CLI's session ID after exit.
+/// Run a shell command in `cwd` and return trimmed stdout. Used by
+/// post_launch_capture to harvest a lazily-created CLI session ID
+/// (`opencode session list | …`) so the next spawn can resume it.
+///
+/// Runs under the user's login-shell environment (`shell_env::spawn_env()`),
+/// exactly like the PTY that produced the session. This used to be a bare
+/// `sh -lc`, which inherits the app's launchd env and only sources bash's
+/// profile chain, never ~/.zshrc / ~/.zprofile where an installer like
+/// opencode's puts its PATH export. From a GUI-launched .app the capture
+/// then ran `opencode` as "command not found", returned empty stdout, and
+/// the frontend's `if (id)` guard dropped it silently: the session ID was
+/// never stored, so every relaunch started a fresh conversation (GH #243).
+///
+/// async + spawn_blocking: spawns a shell plus the agent's own CLI, which
+/// can take a second or more — must stay off the IPC/WKWebView thread (see
+/// the long-running-IPC discipline in CLAUDE.md).
 #[tauri::command]
-fn run_capture_command(cmd: String, cwd: String) -> Result<String, String> {
-    let out = std::process::Command::new("sh")
-        .args(["-lc", &cmd])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| e.to_string())?;
+async fn run_capture_command(cmd: String, cwd: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_capture_command_blocking(&cmd, &cwd))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn run_capture_command_blocking(cmd: &str, cwd: &str) -> Result<String, String> {
+    let mut c = std::process::Command::new("sh");
+    // `-c`, not `-lc`: the login env is injected below, and re-sourcing the
+    // profile chain on top of it would only re-strip PATH on some setups.
+    c.args(["-c", cmd]).current_dir(cwd);
+    let (path, inject) = shell_env::spawn_env();
+    c.env("PATH", path);
+    for (k, v) in inject {
+        c.env(k, v);
+    }
+    // A capture command is a plain query; nothing should be reading stdin.
+    // Leaving it inherited lets a misconfigured one block forever.
+    c.stdin(std::process::Stdio::null());
+    let out = c.output().map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -10208,6 +13101,9 @@ fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
     // to show/hide the menu-bar item, matching close_action/cli_enabled's
     // "re-read per use" behavior.
     let _ = set_tray_visible(&app, tray_on);
+    // Same discipline for the MCP listener (bind-on-enable, both ways).
+    // Idempotent, so no need to diff against the previous settings.
+    mcp_server::apply_enabled(app, s.mcp_enabled);
     Ok(())
 }
 
@@ -10216,8 +13112,8 @@ fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
 /// Settings UI does, instead of growing a second encoder that could drift.
 pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
     let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
+    write_atomic(&f, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Hide (`dismissed = true`) or restore (`false`) a discovered repo from the
@@ -10254,9 +13150,7 @@ fn agents_save(agents: Vec<Agent>) -> Result<(), String> {
     // lookups). If duplicates, keep the first occurrence.
     let mut seen = std::collections::HashSet::new();
     s.agents = agents.into_iter().filter(|a| seen.insert(a.id.clone())).collect();
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    save_settings_inner(&s)
 }
 
 // ───────────────────────────── custom themes ─────────────────────────────
@@ -10585,16 +13479,18 @@ async fn list_font_families() -> Vec<String> {
 /// the built-ins. `CliInfo.name` is the agent `id` so the frontend can
 /// match each result back to the registry.
 ///
-/// Detection falls back to hard-coded common install locations when
-/// `command -v` returns empty — covers two real cases:
-///   1. The CLI is a shell function (`claude () { ... }`) so `command -v`
-///      returns a function body, not a binary path.
-///   2. termic launched from a stripped-PATH context (Finder / .app)
-///      where /opt/homebrew/bin is missing.
+/// Walks `shell_env::resolved_path()` (the same probed-login-shell PATH,
+/// falling back to the static install-location union, that every other
+/// spawn site in the app uses) rather than shelling out its own
+/// `command -v` — that used to inherit termic's bare launchd env and
+/// only ever source bash's profile chain, so a CLI whose PATH export
+/// lives in `~/.zshrc`/`~/.zprofile` (Homebrew/nvm/volta's usual home)
+/// was invisible from a GUI-launched `.app` no matter how many times it
+/// relaunched, even though a real terminal found it instantly.
 ///
-/// async + spawn_blocking: spawns a `command -v` plus a version probe
-/// per agent, and runs at startup — must stay off the IPC/WKWebView
-/// thread (see the long-running-IPC discipline in CLAUDE.md).
+/// async + spawn_blocking: walks PATH plus a version probe per agent,
+/// and runs at startup — must stay off the IPC/WKWebView thread (see
+/// the long-running-IPC discipline in CLAUDE.md).
 #[tauri::command]
 async fn detect_clis() -> Vec<CliInfo> {
     tauri::async_runtime::spawn_blocking(detect_clis_blocking)
@@ -10604,12 +13500,12 @@ async fn detect_clis() -> Vec<CliInfo> {
 
 fn detect_clis_blocking() -> Vec<CliInfo> {
     let agents = load_settings_inner().agents;
-    // Probe agents concurrently — each agent costs a login-shell spawn
-    // (`sh -lc`, which sources the user's profile and can take hundreds
-    // of ms) plus a `--version` probe. Serially across 5+ agents that
-    // ran 2-5s at startup, long enough that the first popover opened
-    // before detection resolved and fell back to showing every agent.
-    // One thread per agent collapses the wall-clock to a single probe.
+    // Probe agents concurrently — `shell_env::resolved_path()` can block
+    // on the first login-shell probe landing (hundreds of ms), plus a
+    // `--version` probe per agent. Serially across 5+ agents that ran
+    // 2-5s at startup, long enough that the first popover opened before
+    // detection resolved and fell back to showing every agent. One
+    // thread per agent collapses the wall-clock to a single probe.
     let handles: Vec<_> = agents.iter().map(|agent| {
         let id = agent.id.clone();
         let bin = agent.command.trim().to_string();
@@ -10628,32 +13524,22 @@ fn detect_clis_blocking() -> Vec<CliInfo> {
                     path = bin.to_string();
                 }
             } else {
-                // PATH lookup via login shell — the common case.
-                if let Ok(o) = Command::new("/usr/bin/env")
-                    .args(["sh", "-lc", &format!("command -v {} 2>/dev/null", bin)])
-                    .output()
-                {
-                    if o.status.success() {
-                        let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        // Reject shell-function body lookalikes.
-                        if !p.is_empty() && (p.starts_with('/') || p.starts_with('~')) {
-                            found = true;
-                            path = p;
-                        }
-                    }
-                }
-                // Fallback: probe common install locations directly. Same
-                // list the PATH fallback unions in, and for the same
-                // reason (the login shell that would have found these is
-                // exactly what just failed) — kept in one place so a dir
-                // added there is never missing from the install badge.
-                if !found {
-                    for c in shell_env::fallback_dirs().iter().map(|d| format!("{d}/{bin}")) {
-                        if Path::new(&c).exists() {
-                            found = true;
-                            path = c;
-                            break;
-                        }
+                // PATH lookup — walk the same resolved PATH every other
+                // spawn site in the app uses (shell_env::resolved_path()):
+                // the probed login shell's PATH when available, else the
+                // static fallback union. A hand-rolled `sh -lc "command -v"`
+                // here used to inherit the app's bare launchd env and only
+                // ever source bash's profile chain (never ~/.zshrc /
+                // ~/.zprofile, where Homebrew/nvm/volta typically export
+                // PATH), so a GUI-launched .app could relaunch forever and
+                // still miss a CLI that `command -v` finds instantly from a
+                // real terminal.
+                for dir in shell_env::resolved_path().split(':').filter(|d| !d.is_empty()) {
+                    let c = format!("{dir}/{bin}");
+                    if Path::new(&c).exists() {
+                        found = true;
+                        path = c;
+                        break;
                     }
                 }
             }
@@ -11227,6 +14113,62 @@ pub(crate) fn leave_windowless(app: &AppHandle) {
     }
 }
 
+// ─── termic:// deep links (GH #192) ──────────────────────────────────────
+// External systems open Termic on a pre-filled New Task dialog with
+// `termic://new?project=…&name=…&prompt=…`. Rust deliberately does NOT
+// parse or validate the URL: the only checks worth making (is this a
+// REGISTERED project?) need the webview's store, so the raw URL crosses
+// once and `src/lib/deepLink.ts` owns the whole contract.
+//
+// The queue exists for cold start. macOS delivers the open-url Apple Event
+// while the webview is still booting, long before any JS listener is
+// attached, so an emit-only design drops exactly the link that launched the
+// app. Instead every arrival lands in this queue and the webview is merely
+// NUDGED; the webview always reads through `deep_link_take_pending`, which
+// drains atomically. That single-reader shape is also why a link arriving
+// while the app is live cannot be handled twice: the nudge carries no
+// payload, so there is nothing to double-handle.
+static PENDING_DEEP_LINKS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// Queue a `termic://` URL and nudge the webview. Safe to call before the
+/// window exists (the emit is dropped, the queue survives).
+pub(crate) fn queue_deep_link(app: &AppHandle, url: &str) {
+    use tauri::Manager;
+    dlog(&format!("[deeplink] queued {url}"));
+    PENDING_DEEP_LINKS.lock().push(url.to_string());
+    // Come to front. A link that opens a dialog (or selects a task) behind a
+    // hidden window is indistinguishable from one that did nothing, and
+    // windowless mode makes that the DEFAULT outcome for a menu-bar-only
+    // instance. macOS activates the app for a link it routes, but that does
+    // not un-hide a window `leave_windowless` put away.
+    //
+    // Gated on the window already existing: during cold-start `setup` this
+    // runs before the window is built, and leave_windowless would flip
+    // SHOWN_ONCE / the activation policy early, ahead of the normal startup
+    // ordering. The webview's own boot drain covers that case.
+    if app.get_webview_window("main").is_some() {
+        leave_windowless(app);
+    }
+    let _ = app.emit("termic://deep-link", ());
+}
+
+/// Drain the queue. The webview calls this on boot AND on every
+/// `termic://deep-link` nudge, so a link that arrived before the listener
+/// existed is picked up by the boot read instead of being lost.
+#[tauri::command]
+fn deep_link_take_pending() -> Vec<String> {
+    std::mem::take(&mut *PENDING_DEEP_LINKS.lock())
+}
+
+/// The `termic://` URL this process was launched with, if any. Only
+/// meaningful on Windows/Linux, where a link spawns a fresh process with
+/// the URL in argv; macOS routes it to the running app as an Apple Event
+/// and leaves argv alone. Read BEFORE the window exists so the
+/// single-instance preflight can hand it over to the surviving instance.
+fn deep_link_from_argv() -> Option<String> {
+    std::env::args().skip(1).find(|a| a.starts_with("termic://"))
+}
+
 // ─── startup timing ──────────────────────────────────────────────────────
 // Stamped as early as `run()` can manage. The webview reads it back at first
 // paint (`src/lib/perfMarks.ts`) so the nightly perf job can report
@@ -11343,6 +14285,13 @@ pub fn run() {
         // because the process plugin also exposes exit/restart APIs we
         // may want for other purposes later (debug 'restart app' etc).
         .plugin(tauri_plugin_process::init())
+        // `termic://` URL scheme (GH #192). Schemes are declared in
+        // tauri.conf.json → plugins.deep-link.desktop, which is what the
+        // bundler turns into CFBundleURLTypes; the handler is registered
+        // in `setup` below. Exposes no IPC command we call from JS (the
+        // webview reads `deep_link_take_pending` instead), so it needs no
+        // capability entry.
+        .plugin(tauri_plugin_deep_link::init())
         // Native PDF preview channel. WKWebView renders a PDF served as a real
         // `application/pdf` resource but shows blank for a `data:` URL, so the
         // file-tree preview pane points an `<embed>` at
@@ -11365,7 +14314,13 @@ pub fn run() {
             // vs beta, a direct binary run) never opens a duplicate that
             // races the shared projects.json/tasks/. Debug is newest-wins.
             // See cli_server::another_instance_running.
-            if cli_server::another_instance_running() {
+            //
+            // A `termic://` link that spawned THIS process (Windows/Linux;
+            // macOS routes links to the running app instead) rides along
+            // with the raise, so the link opens in the instance that
+            // survives rather than dying with the one we exit. GH #192.
+            let argv_link = deep_link_from_argv();
+            if cli_server::another_instance_running(argv_link.as_deref()) {
                 // Say WHY on stderr before going. Exiting silently before the
                 // window exists is indistinguishable from a crash-on-launch,
                 // and the raise above is invisible when the owner is a stale
@@ -11383,6 +14338,34 @@ pub fn run() {
                         .unwrap_or_else(|_| "<unresolved data dir>".into()),
                 );
                 std::process::exit(0);
+            }
+            // `termic://` deep links (GH #192). Registered here, before the
+            // window is built, so a link that LAUNCHED the app is already
+            // queued by the time the webview asks for it. Two sources, both
+            // needed: `get_current` returns the launch URL the plugin
+            // captured before `setup` ran (the cold-start case), while
+            // `on_open_url` covers every link that arrives afterwards
+            // (macOS re-activating an app that is already up). The queue
+            // dedupes nothing on purpose - the two sources are disjoint.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for u in urls {
+                        queue_deep_link(app.handle(), u.as_str());
+                    }
+                }
+                // Windows/Linux launch argv, for the case where we ARE the
+                // surviving instance (the handoff above only fires when
+                // somebody else owns the data dir).
+                if let Some(url) = argv_link {
+                    queue_deep_link(app.handle(), &url);
+                }
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for u in event.urls() {
+                        queue_deep_link(&handle, u.as_str());
+                    }
+                });
             }
             // Resolve the user's login-shell PATH off the main thread
             // so the first PTY spawn doesn't wait on shell startup.
@@ -11520,7 +14503,7 @@ pub fn run() {
             // into minimize-to-tray is the kind of default people hate. Those
             // platforms keep Tauri's native close. `--headless` still
             // goes windowless everywhere, because there the user asked for no
-            // window. See docs/plans/windows.md.
+            // window. See docs/ideas/windows.md.
             #[cfg(target_os = "macos")]
             {
                 let handle = app.handle().clone();
@@ -11580,6 +14563,7 @@ pub fn run() {
             // verbs stay behind the "Enable CLI" setting + per-boot
             // token). See cli_server.rs + docs/plans/cli.md.
             cli_server::start(app.handle().clone());
+            mcp_server::start_if_enabled(app.handle().clone());
             if !headless {
                 let _ = win.set_focus();
             }
@@ -11603,29 +14587,35 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             perf_boot_elapsed_ms,
+            deep_link_take_pending,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,
             tasks_list, task_create, task_create_multi, task_open_repo, task_importable_worktrees, task_import_worktree, task_archive, task_set_cli, task_set_custom_command, task_set_resume_override, task_set_sandbox, task_set_yolo,
             sandbox_available, sandbox_deny_counts, sandbox_recent_denied_hosts, sandbox_recent_denied_paths, sandbox_access_counts, sandbox_recent_access_hosts, sandbox_recent_access_paths, sandbox_set_monitor_filters, task_sandbox_add_allowed_host, task_sandbox_add_allowed_path, task_sandbox_remove_allowed_path, agent_sandbox_add_allowed_path, agent_sandbox_add_allowed_host, task_recent_denials,
             repo_config_load, repo_config_load_at, repo_config_save, repo_config_scaffold, repo_config_add_allowed_host, repo_config_add_allowed_path,
 
             task_reorder,
-            task_restore, task_delete, task_run_script, task_run_script_stream, task_stop_script, task_record_spawn, task_set_has_history, task_set_agent_session_id,
-            task_set_tabs, task_set_tab_session_id, task_set_tab_previous_session_id,
+            task_restore, task_delete, task_run_script, task_run_script_stream, task_ensure_extra_ports, task_stop_script, task_record_spawn, task_set_has_history, task_set_agent_session_id,
+            task_set_tabs, task_set_tab_session_id,
             task_set_split_layout,
             task_set_right_tabs, task_set_right_tab_session_id,
-            task_grep_start, task_grep_cancel,
+            task_grep_start, task_grep_cancel, task_find_backend,
             task_spotlight_start, task_spotlight_stop, task_spotlight_resync, task_spotlight_status,
             task_diff, task_files, task_list_files_for_finder, task_match_ignored_files, task_send_diff_to_main, task_merge_to_main,
             task_changes, task_git_status, task_git_branches, project_git_branches, project_branch_context, task_git_checkout, task_git_update, task_git_update_info, task_stage, task_unstage, task_commit, task_discard,
-            task_file_diff, task_file_diff_sides, task_file_read, task_file_read_base64, task_file_fp, task_file_write, task_dir_list, task_path_stat,
+            task_git_log, task_git_refs, task_git_push, task_git_commit_files, task_git_compare, task_git_blame, task_git_commit_meta, task_git_commit_offset,
+            task_file_diff, task_file_diff_sides, task_file_read, file_read_external, task_file_read_base64, task_file_fp, task_file_write, task_dir_list, task_path_stat,
             task_path_rename, task_path_delete, task_reveal_path,
+            scratch_list, scratch_read, scratch_write, scratch_set_meta, scratch_delete,
+            scratch_promote, scratch_promote_target_exists,
             task_rename, project_rename,
             pty_spawn, pty_write, pty_resize, pty_kill,
-            notify, open_path, reveal_path, open_file_external, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
+            procmon_start, procmon_sample, procmon_stop, procmon_signal, procmon_open_window,
+            notify, open_path, reveal_path, open_file_external, open_external_url, browser_command_check, home_dir, project_tasks_path_default, tasks_path_conflicts, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
             settings_load, settings_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
             automation::automation_result,
             automation::automation_armed,
             pty_alive,
+            pty_attached,
             cli_server::cli_rpc_result,
             cli_server::cli_rpc_ready,
             cli_server::cli_rpc_progress,
@@ -11633,6 +14623,9 @@ pub fn run() {
             cli_server::cli_prompt_report,
             cli_server::cli_install_symlink,
             cli_server::cli_install_status,
+            mcp_server::mcp_status,
+            mcp_server::mcp_token,
+            mcp_server::mcp_install_client,
             window_close_choice, window_is_windowless, close_prompt_ack,
             tray_set_attention,
             list_monospace_fonts, list_font_families,
@@ -11950,6 +14943,244 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    // ── file_read_external (GH #240) ─────────────────────────────────────
+    // The ONLY uncontained read in the app. These pin the three bounds that
+    // make that acceptable: absolute-only, size-capped, UTF-8-only. A binary
+    // or oversized file must ERROR rather than return junk, because the
+    // frontend reads that error as "not text, offer the OS actions instead".
+
+    #[test]
+    fn external_read_returns_text_outside_any_task() {
+        let d = tempdir().unwrap();
+        let f = d.path().join("notes.txt");
+        fs::write(&f, "hello outside").unwrap();
+        assert_eq!(read_external_file(f.to_str().unwrap()).unwrap(), "hello outside");
+    }
+
+    #[test]
+    fn external_read_rejects_a_relative_path() {
+        // Would otherwise resolve against the APP's cwd, which is nobody's task.
+        let e = read_external_file("src/a.ts").unwrap_err();
+        assert!(e.contains("not an absolute path"), "{e}");
+    }
+
+    #[test]
+    fn external_read_rejects_a_directory() {
+        let d = tempdir().unwrap();
+        assert!(read_external_file(d.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn external_read_rejects_binary() {
+        let d = tempdir().unwrap();
+        let f = d.path().join("blob.bin");
+        fs::write(&f, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let e = read_external_file(f.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("UTF-8"), "{e}");
+    }
+
+    #[test]
+    fn external_read_caps_size() {
+        let d = tempdir().unwrap();
+        let f = d.path().join("huge.txt");
+        fs::write(&f, "x".repeat(2_000_001)).unwrap();
+        assert!(read_external_file(f.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn external_read_errors_on_a_missing_path() {
+        let d = tempdir().unwrap();
+        assert!(read_external_file(d.path().join("nope.txt").to_str().unwrap()).is_err());
+    }
+
+    // ── post-launch session capture (GH #243) ──
+    //
+    // The capture harvests a lazily-created agent session ID (opencode) so
+    // the next spawn resumes it instead of starting over. Every failure mode
+    // here is silent by construction (empty stdout looks like "no session
+    // yet"), so the environment it runs in has to be the PTY's, not the
+    // .app's launchd env.
+
+    #[test]
+    fn capture_runs_in_cwd_and_trims_stdout() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("marker"), "ses_abc123\n").unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        // Pipelines are the whole point of the shell here (the shipped
+        // opencode capture is `… | grep … | cut …`).
+        let out = run_capture_command_blocking("cat marker | cut -d' ' -f1", &cwd).unwrap();
+        assert_eq!(out, "ses_abc123");
+    }
+
+    #[test]
+    fn capture_sees_the_login_shell_path() {
+        // The regression: a CLI installed outside the launchd PATH (opencode
+        // lands in ~/.opencode/bin, Homebrew in /opt/homebrew/bin) has to be
+        // findable, or the capture returns "" and the ID is never stored.
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let seen = run_capture_command_blocking("printf %s \"$PATH\"", &cwd).unwrap();
+        assert_eq!(seen, shell_env::spawn_env().0);
+    }
+
+    #[test]
+    fn capture_reports_stdout_only() {
+        // A "command not found" (the GH #243 failure) writes to stderr and
+        // must not be mistaken for a session ID.
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let out = run_capture_command_blocking(
+            "echo noise >&2; definitely-not-a-real-binary-243", &cwd).unwrap();
+        assert_eq!(out, "");
+    }
+
+    // ── create-time resume-args override ──
+    //
+    // The New Task dialog sets the same field the task menu's "Resume
+    // override" edits, so the two paths have to agree on what a blank box
+    // means: no override, NOT an override that resumes with nothing.
+
+    #[test]
+    fn blank_resume_override_means_no_override() {
+        assert_eq!(normalized_resume_override(None), None);
+        assert_eq!(normalized_resume_override(Some(String::new())), None);
+        assert_eq!(normalized_resume_override(Some("   \n\t ".into())), None);
+    }
+
+    #[test]
+    fn resume_override_is_stored_trimmed_and_verbatim() {
+        // Verbatim to the token: placeholders expand at spawn, and quoting
+        // is the caller's business, so nothing here may rewrite the string.
+        assert_eq!(
+            normalized_resume_override(Some("  --resume {WORKSPACE_NAME}  ".into())),
+            Some("--resume {WORKSPACE_NAME}".to_string()),
+        );
+        assert_eq!(
+            normalized_resume_override(Some("resume --last".into())),
+            Some("resume --last".to_string()),
+        );
+    }
+
+    // ── find-in-files backends (GH #181) ──
+    //
+    // Both parsers feed the same GrepHit contract, so the frontend never
+    // learns which backend ran. These pin the shape of that contract.
+
+    #[test]
+    fn git_grep_line_parses_into_a_hit_without_ranges() {
+        let h = parse_git_grep_line("src/lib.rs:42:7:  let x = 1;").expect("a match line");
+        assert_eq!(h.path, "src/lib.rs");
+        assert_eq!((h.line, h.col), (42, 7));
+        assert_eq!(h.preview, "  let x = 1;");
+        assert!(h.ranges.is_empty(), "git grep can't report match ranges, the frontend re-matches");
+    }
+
+    #[test]
+    fn git_grep_line_keeps_colons_that_belong_to_the_code() {
+        // splitn(4) matters: `a::b` in the preview must not be eaten.
+        let h = parse_git_grep_line("s.rs:1:1:foo::bar(x:y)").expect("a match line");
+        assert_eq!(h.preview, "foo::bar(x:y)");
+    }
+
+    #[test]
+    fn git_grep_rejects_non_match_output() {
+        assert!(parse_git_grep_line("").is_none());
+        assert!(parse_git_grep_line("Binary file x matches").is_none());
+        assert!(parse_git_grep_line("src/lib.rs:0:1:zero line number").is_none());
+    }
+
+    #[test]
+    fn rg_match_event_carries_every_range_on_the_line() {
+        let ev = r#"{"type":"match","data":{"path":{"text":"src/a.ts"},"lines":{"text":"foo bar foo\n"},"line_number":9,"absolute_offset":0,"submatches":[{"match":{"text":"foo"},"start":0,"end":3},{"match":{"text":"foo"},"start":8,"end":11}]}}"#;
+        let h = parse_rg_json_line(ev).expect("a match event");
+        assert_eq!(h.path, "src/a.ts");
+        assert_eq!(h.line, 9);
+        assert_eq!(h.preview, "foo bar foo", "trailing newline must be stripped");
+        assert_eq!(h.ranges, vec![[0, 3], [8, 11]]);
+        assert_eq!(h.col, 1, "col is 1-based, same contract as git grep --column");
+    }
+
+    #[test]
+    fn rg_ranges_are_utf16_not_byte_offsets() {
+        // rg counts bytes. "héllo " is 7 bytes but 6 UTF-16 units, so a
+        // byte-offset range would paint one char to the right of the match.
+        let ev = r#"{"type":"match","data":{"path":{"text":"a.txt"},"lines":{"text":"héllo world\n"},"line_number":1,"submatches":[{"match":{"text":"world"},"start":7,"end":12}]}}"#;
+        let h = parse_rg_json_line(ev).expect("a match event");
+        assert_eq!(h.ranges, vec![[6, 11]]);
+        assert_eq!(&h.preview[..], "héllo world");
+        // Sanity: the UTF-16 range actually spans the matched word.
+        let utf16: Vec<u16> = h.preview.encode_utf16().collect();
+        let picked = String::from_utf16(&utf16[6..11]).unwrap();
+        assert_eq!(picked, "world");
+    }
+
+    #[test]
+    fn rg_skips_events_that_are_not_matches() {
+        assert!(parse_rg_json_line(r#"{"type":"begin","data":{"path":{"text":"a.ts"}}}"#).is_none());
+        assert!(parse_rg_json_line(r#"{"type":"end","data":{"path":{"text":"a.ts"}}}"#).is_none());
+        assert!(parse_rg_json_line("not json at all").is_none());
+    }
+
+    #[test]
+    fn rg_drops_matches_it_cannot_decode() {
+        // Non-UTF-8 path: rg sends {"bytes": base64} instead of {"text"}.
+        // Guessing an encoding would put a garbage row in the results.
+        let ev = r#"{"type":"match","data":{"path":{"bytes":"YS50eHQ="},"lines":{"text":"hit\n"},"line_number":1,"submatches":[{"match":{"text":"hit"},"start":0,"end":3}]}}"#;
+        assert!(parse_rg_json_line(ev).is_none());
+    }
+
+    #[test]
+    fn path_probe_only_accepts_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        let real = dir.path().join("real");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&real).unwrap();
+
+        // A non-executable file with the right name must not win.
+        fs::write(real.join("rg"), b"#!/bin/sh\n").unwrap();
+        let path = format!("{}:{}", empty.display(), real.display());
+        assert!(find_on_path("rg", &path).is_none(), "a chmod-less file is not a backend");
+
+        fs::set_permissions(real.join("rg"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_on_path("rg", &path), Some(real.join("rg")));
+        assert!(find_on_path("rg", "").is_none(), "an empty PATH must not panic");
+    }
+
+    // The backend is memoized for the whole session, and the login-shell
+    // PATH lands asynchronously. Caching a miss read off the static
+    // fallback (no /opt/homebrew/bin) would pin git grep until relaunch
+    // for someone who has rg installed, so only these three combinations
+    // may be kept.
+    #[test]
+    fn a_miss_on_the_fallback_path_is_never_memoized() {
+        assert!(!backend_verdict_is_final(false, false), "ask again once the real PATH lands");
+        assert!(backend_verdict_is_final(false, true), "a miss on the final PATH is the answer");
+    }
+
+    #[test]
+    fn finding_rg_is_final_whatever_path_it_came_from() {
+        // The binary exists at that path; a later PATH can't unfind it.
+        assert!(backend_verdict_is_final(true, false));
+        assert!(backend_verdict_is_final(true, true));
+    }
+
+    #[test]
+    fn path_probe_takes_the_first_hit_in_path_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        for d in [&first, &second] {
+            fs::write(d.join("rg"), b"x").unwrap();
+            fs::set_permissions(d.join("rg"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!("{}:{}", first.display(), second.display());
+        assert_eq!(find_on_path("rg", &path), Some(first.join("rg")));
+    }
+
     // CLI graduation (0.26.0): the serde default only reaches profiles with
     // the field absent, so existing installs need the one-time flip. The
     // contract worth pinning is that it is ONE time: without the marker check
@@ -11979,6 +15210,22 @@ mod tests {
         assert!(apply_cli_default_migration(&mut s));
         assert!(s.cli_enabled);
         assert!(s.cli_default_migrated);
+    }
+
+    // Pinned tabs (GH #183). Task JSON has no migration step: `#[serde(default)]`
+    // IS the compatibility story, so a task file written before pinning existed
+    // must still load, and a pinned one must survive a save/load round trip.
+    #[test]
+    fn a_task_file_without_pinned_loads_with_it_off() {
+        let t: PersistedTab = serde_json::from_str(r#"{"id":"t1","cli":"claude"}"#).unwrap();
+        assert!(!t.pinned);
+    }
+
+    #[test]
+    fn pinned_survives_a_round_trip() {
+        let t = PersistedTab { id: "t1".into(), cli: "claude".into(), pinned: true, ..Default::default() };
+        let back: PersistedTab = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert!(back.pinned);
     }
 
     fn role(kind: &str, task: &str) -> PtyRole {
@@ -12111,6 +15358,51 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_attach_returns_as_soon_as_the_webview_acks() {
+        // The normal path: the flusher parks, the ack lands a moment later,
+        // output flows. Nothing may wait out the grace here.
+        let buf: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let attached = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let b2 = buf.clone();
+        let a2 = attached.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let _g = b2.0.lock();
+            a2.store(true, Ordering::Release);
+            b2.1.notify_all();
+        });
+        let t0 = Instant::now();
+        wait_for_attach(&buf, &attached, &done, Duration::from_secs(30));
+        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn wait_for_attach_gives_up_after_the_grace() {
+        // A caller that never acks must not wedge its PTY forever: output is
+        // late, not lost.
+        let buf: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let attached = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        wait_for_attach(&buf, &attached, &done, Duration::from_millis(120));
+        assert!(t0.elapsed() >= Duration::from_millis(100), "returned early: {:?}", t0.elapsed());
+        assert!(t0.elapsed() < Duration::from_secs(5), "overshot: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn wait_for_attach_returns_when_the_process_dies_first() {
+        // The reader's final drain waits on this too, so a child that exits
+        // before the ack must not hold pty-exit for the whole grace.
+        let buf: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let attached = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(true));
+        let t0 = Instant::now();
+        wait_for_attach(&buf, &attached, &done, Duration::from_secs(30));
+        assert!(t0.elapsed() < Duration::from_secs(1), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
     fn pty_feed_tap_gets_backlog_then_live_data_exactly_once() {
         let feed = PtyFeed::new();
         feed.push(b"before");
@@ -12183,7 +15475,59 @@ mod tests {
     }
 
     #[test]
-    fn worktree_symlink_paths_absent_vs_cleared() {
+    fn default_worktree_symlink_paths_carries_mcp_json() {
+        // GH #251: `.mcp.json` holds project-scoped MCP servers and is
+        // commonly gitignored, exactly like `.claude/`, so a plain worktree
+        // checkout silently loses them.
+        let d = default_worktree_symlink_paths();
+        assert!(d.contains(&".mcp.json".to_string()), "{d:?}");
+        assert!(d.contains(&".claude".to_string()), "{d:?}");
+    }
+
+    #[test]
+    fn link_config_dir_links_a_file_not_just_a_dir() {
+        // The list is no longer dirs-only. A file entry must link like any
+        // other, or `.mcp.json` is in the default and does nothing.
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git/info")).unwrap();
+        fs::write(repo.path().join(".mcp.json"), b"{\"mcpServers\":{}}").unwrap();
+        fs::create_dir_all(repo.path().join(".claude")).unwrap();
+        let wt = tempdir().unwrap();
+
+        link_config_dir(repo.path(), wt.path(), ".mcp.json");
+        link_config_dir(repo.path(), wt.path(), ".claude");
+
+        let linked = wt.path().join(".mcp.json");
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&linked).unwrap(), "{\"mcpServers\":{}}");
+        assert!(wt.path().join(".claude").symlink_metadata().unwrap().file_type().is_symlink());
+        // A name the repo lacks is a no-op, not an error or a broken link.
+        link_config_dir(repo.path(), wt.path(), ".gemini");
+        assert!(wt.path().join(".gemini").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn mcp_json_upgrade_only_touches_an_unedited_list() {
+        // An untouched list is the "pre-filled starting point" and may gain
+        // the new entry; anything the user shaped is theirs.
+        let untouched: Settings =
+            serde_json::from_str(r#"{"worktree_symlink_paths":[".claude",".gemini",".codex"]}"#).unwrap();
+        assert_eq!(untouched.worktree_symlink_paths, legacy_worktree_symlink_paths_v0_29());
+
+        // Edited (an entry removed), cleared, and extended lists must all
+        // survive the upgrade untouched — the migration compares for EQUALITY
+        // with the old default precisely so it cannot overwrite a choice.
+        for stored in [
+            vec![".claude".to_string()],
+            vec![],
+            vec![".claude".into(), ".gemini".into(), ".codex".into(), ".envrc".into()],
+        ] {
+            assert_ne!(stored, legacy_worktree_symlink_paths_v0_29(), "{stored:?}");
+        }
+    }
+
+    #[test]
+        fn worktree_symlink_paths_absent_vs_cleared() {
         // Absent in an old settings.json -> pre-filled defaults, so upgraders
         // keep the original .claude-linking behavior instead of silently losing it.
         let absent: Settings = serde_json::from_str("{}").unwrap();
@@ -12276,7 +15620,214 @@ mod tests {
         fs::write(outside.path().join("secret.png"), b"x").unwrap();
         let ws = tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret.png"), ws.path().join("link.png")).unwrap();
-        assert!(safe_task_path(ws.path(), "link.png").is_err());
+        let err = safe_task_path(ws.path(), "link.png").unwrap_err();
+        // The message has to name where the link went, or the file tree row it
+        // ends up in is as unactionable as the one #250 reported.
+        assert!(err.contains("path escapes task: link.png -> "), "{err}");
+        assert!(err.contains("secret.png"), "{err}");
+    }
+
+    // ───────── linked config dirs in a worktree (GH #250) ─────────
+
+    /// A repo with a gitignored `.claude/`, plus a worktree carrying the
+    /// symlink `link_config_dir` creates into it. This is the exact shape a
+    /// real task has, and the shape the strict check refused to read.
+    fn repo_with_linked_config() -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".claude/agents")).unwrap();
+        fs::write(repo.path().join(".claude/settings.json"), b"{}").unwrap();
+        let wt = tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            fs::canonicalize(repo.path().join(".claude")).unwrap(),
+            wt.path().join(".claude"),
+        )
+        .unwrap();
+        (repo, wt)
+    }
+
+    #[test]
+    fn reads_through_the_config_symlink_termic_created() {
+        let (repo, wt) = repo_with_linked_config();
+        // The bug: we make this link because .claude is gitignored, then the
+        // strict check refuses to read back through it, so the folder lists
+        // and never opens.
+        assert!(safe_task_path(wt.path(), ".claude").is_err());
+
+        let dir = safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude").unwrap();
+        assert_eq!(dir, fs::canonicalize(repo.path().join(".claude")).unwrap());
+        // …and files under it, which is what the editor opens.
+        let file = safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude/settings.json").unwrap();
+        assert!(file.ends_with(".claude/settings.json"));
+        assert!(safe_task_read_path_in(Some(repo.path()), wt.path(), ".claude/agents").is_ok());
+    }
+
+    #[test]
+    fn still_refuses_a_link_that_leaves_the_project() {
+        // The case the containment check exists for: a repo shipping a link to
+        // something private. It resolves outside the PROJECT root, so widening
+        // the bound to the project must not admit it.
+        let (repo, wt) = repo_with_linked_config();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("ssh")).unwrap();
+        fs::write(outside.path().join("ssh/id_rsa"), b"secret").unwrap();
+        std::os::unix::fs::symlink(
+            fs::canonicalize(outside.path().join("ssh")).unwrap(),
+            wt.path().join(".secrets"),
+        )
+        .unwrap();
+
+        let err = safe_task_read_path_in(Some(repo.path()), wt.path(), ".secrets/id_rsa").unwrap_err();
+        assert!(err.contains("path escapes task"), "{err}");
+        // And with no project known, nothing is relaxed at all.
+        assert!(safe_task_read_path_in(None, wt.path(), ".claude").is_err());
+    }
+
+    #[test]
+    fn only_a_link_at_the_task_root_is_relaxed() {
+        // A symlink buried deep in the repo must not widen the check, even
+        // when its target is inside the project: only the top-level dirs
+        // link_config_dir creates qualify.
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("vendor")).unwrap();
+        fs::write(repo.path().join("vendor/lib.rs"), b"x").unwrap();
+        let wt = tempdir().unwrap();
+        fs::create_dir_all(wt.path().join("src/nested")).unwrap();
+        std::os::unix::fs::symlink(
+            fs::canonicalize(repo.path().join("vendor")).unwrap(),
+            wt.path().join("src/nested/vendor"),
+        )
+        .unwrap();
+
+        assert!(safe_task_read_path_in(Some(repo.path()), wt.path(), "src/nested/vendor/lib.rs").is_err());
+    }
+
+    #[test]
+    fn ordinary_paths_are_untouched() {
+        // The relaxation is a FALLBACK: everything that resolved before still
+        // resolves the same way, and the classic escapes stay rejected.
+        let (repo, wt) = repo_with_linked_config();
+        fs::create_dir_all(wt.path().join("docs")).unwrap();
+        fs::write(wt.path().join("docs/a.md"), b"x").unwrap();
+        assert_eq!(
+            safe_task_read_path_in(Some(repo.path()), wt.path(), "docs/a.md").unwrap(),
+            safe_task_path(wt.path(), "docs/a.md").unwrap(),
+        );
+        assert!(safe_task_read_path_in(Some(repo.path()), wt.path(), "../outside.txt").is_err());
+        assert!(safe_task_read_path_in(Some(repo.path()), wt.path(), "/etc/passwd").is_err());
+    }
+
+    // ─────────────────── scratchpads (GH #244) ───────────────────
+
+    #[test]
+    fn safe_task_path_for_create_allows_a_missing_target_and_missing_parents() {
+        let ws = tempdir().unwrap();
+        fs::create_dir_all(ws.path().join("docs")).unwrap();
+        // Existing folder, new file.
+        let p = safe_task_path_for_create(ws.path(), "docs/notes.md").unwrap();
+        assert_eq!(p, fs::canonicalize(ws.path()).unwrap().join("docs/notes.md"));
+        // Neither the folder nor the file exists yet: the picker lets you type
+        // a new one, and promote mkdir -p's it.
+        let p = safe_task_path_for_create(ws.path(), "a/b/c/notes.md").unwrap();
+        assert_eq!(p, fs::canonicalize(ws.path()).unwrap().join("a/b/c/notes.md"));
+    }
+
+    #[test]
+    fn safe_task_path_for_create_rejects_escapes_including_through_a_symlink() {
+        let outside = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        assert!(safe_task_path_for_create(ws.path(), "../escape.md").is_err());
+        assert!(safe_task_path_for_create(ws.path(), "/etc/passwd").is_err());
+        assert!(safe_task_path_for_create(ws.path(), "").is_err());
+        // The dangerous case a naive "does the string contain .. ?" check
+        // misses: an EXISTING in-worktree directory symlinked outside, with
+        // the new file hung underneath it. The target itself never exists, so
+        // `safe_task_path` cannot answer this at all.
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("out")).unwrap();
+        let err = safe_task_path_for_create(ws.path(), "out/notes.md").unwrap_err();
+        assert!(err.contains("path escapes task: out/notes.md -> "), "{err}");
+    }
+
+    // ARCHIVING A TASK MUST LEAVE ITS PADS ALONE. Archiving is recoverable
+    // (the task stays in History, the branch stays in git), and notes about
+    // the work are exactly what someone wants back when they restore it. The
+    // only place pads may be destroyed is `delete_task_file`, the hard delete
+    // behind History's "Empty archive" and project removal.
+    //
+    // A source guard rather than a behavioural test because the alternative
+    // is standing up a real worktree to drive `task_archive_sync`, and what
+    // actually needs pinning is the call site, not the deletion.
+    #[test]
+    fn only_the_hard_delete_purges_scratchpads() {
+        let src = include_str!("lib.rs");
+        let calls: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("scratch_purge_task(") && !l.starts_with("//"))
+            .collect();
+        // Drop this test's own mentions of the name; what is left is the
+        // definition plus every real call site.
+        let real: Vec<&&str> = calls.iter()
+            .filter(|l| !l.starts_with("assert") && !l.contains("l.contains("))
+            .collect();
+        assert_eq!(
+            real.len(), 2,
+            "scratch_purge_task gained a call site: {real:#?}\n\
+             Only delete_task_file may purge pads — archiving must not.",
+        );
+        assert!(real.iter().any(|l| l.starts_with("fn scratch_purge_task")), "{real:#?}");
+        assert!(real.iter().any(|l| l.starts_with("scratch_purge_task(id);")), "{real:#?}");
+        // And that one call really does sit inside delete_task_file.
+        let body = src
+            .split_once("fn delete_task_file(").expect("delete_task_file exists").1;
+        let body = &body[..body.find("\n}\n").expect("function ends")];
+        assert!(body.contains("scratch_purge_task(id);"), "delete_task_file no longer purges pads");
+    }
+
+    #[test]
+    fn scratch_id_ok_refuses_path_segments() {
+        assert!(scratch_id_ok("2f1c9b4e-0000-4aaa-bbbb-cccccccccccc"));
+        assert!(scratch_id_ok("pad_1"));
+        // Every one of these would become a path segment under data_dir().
+        for bad in ["", "..", "a/b", "a\\b", "a.txt", "../../etc/passwd", "a b"] {
+            assert!(!scratch_id_ok(bad), "{bad:?} must be refused");
+        }
+        assert!(!scratch_id_ok(&"a".repeat(129)));
+    }
+
+    // The index is the only record of a pad's title and syntax — there is no
+    // filename to re-derive them from — so a round-trip through it is the
+    // whole restore path.
+    #[test]
+    fn scratch_index_round_trips_and_orders() {
+        let recs = vec![
+            ScratchRecord { id: "b".into(), title: "second".into(), syntax: Some("json".into()),
+                            order: 1, created_at: "t0".into(), updated_at: "t1".into() },
+            ScratchRecord { id: "a".into(), title: "first".into(), syntax: None,
+                            order: 0, created_at: "t0".into(), updated_at: "t0".into() },
+        ];
+        let json = serde_json::to_string(&recs).unwrap();
+        let mut back: Vec<ScratchRecord> = serde_json::from_str(&json).unwrap();
+        back.sort_by_key(|r| r.order);
+        assert_eq!(back.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(back[1].syntax.as_deref(), Some("json"));
+        assert_eq!(back[0].syntax, None);
+        // Records written before a field existed must still load: a pad that
+        // fails to deserialize is a note the user loses.
+        let old: Vec<ScratchRecord> = serde_json::from_str(
+            r#"[{"id":"a","title":"t","created_at":"x","updated_at":"y"}]"#,
+        ).unwrap();
+        assert_eq!(old[0].order, 0);
+        assert_eq!(old[0].syntax, None);
+    }
+
+    #[test]
+    fn safe_task_path_names_the_missing_path() {
+        // "No such file or directory (os error 2)" alone tells a user nothing
+        // about WHICH path is missing (GH #250).
+        let ws = tempdir().unwrap();
+        let err = safe_task_path(ws.path(), "docs/gone").unwrap_err();
+        assert!(err.contains("docs/gone"), "{err}");
+        assert!(err.contains("os error 2"), "{err}");
     }
 
     #[test]
@@ -12557,6 +16108,143 @@ mod tests {
     fn open_command_unknown_os_falls_back_to_xdg_open() {
         let (prog, _) = open_command("freebsd", "https://x.com");
         assert_eq!(prog, "xdg-open");
+    }
+
+    // ── preview browser (GH #245) ──
+
+    #[test]
+    fn browser_argv_appends_the_url_when_there_is_no_placeholder() {
+        // Every shipped preset relies on this: `open -a Safari` + the URL.
+        assert_eq!(
+            browser_argv("open -a Safari", "http://localhost:3000/").unwrap(),
+            vec!["open", "-a", "Safari", "http://localhost:3000/"],
+        );
+    }
+
+    #[test]
+    fn browser_argv_keeps_a_query_string_in_one_argument() {
+        // THE regression guard. A shell would split this on the unquoted `&`
+        // and open a truncated page (the bug open_command documents for
+        // `cmd /C start`, and what Debian's eval-based $BROWSER would do).
+        // Confirmed against the real `open` on macOS with an argv probe.
+        let argv = browser_argv(
+            r#"open -na "Google Chrome" --args --profile-directory=Default"#,
+            "http://localhost:3000/?a=1&b=2&r=x%20y",
+        ).unwrap();
+        assert_eq!(argv, vec![
+            "open", "-na", "Google Chrome", "--args",
+            "--profile-directory=Default",
+            "http://localhost:3000/?a=1&b=2&r=x%20y",
+        ]);
+    }
+
+    #[test]
+    fn browser_argv_substitutes_the_placeholder_instead_of_appending() {
+        let argv = browser_argv("launcher {url} --after", "https://x.test/").unwrap();
+        assert_eq!(argv, vec!["launcher", "https://x.test/", "--after"]);
+        // Substituting means NOT also appending, or the URL opens twice.
+        assert_eq!(argv.iter().filter(|a| a.contains("x.test")).count(), 1);
+    }
+
+    #[test]
+    fn browser_argv_rejects_an_empty_template() {
+        // Callers treat empty as "OS default" before getting here; reaching
+        // this with nothing but whitespace is a bad template, not a default.
+        assert!(browser_argv("   ", "https://x.test/").is_err());
+    }
+
+    #[test]
+    fn split_browser_command_keeps_quoted_spaces_together() {
+        assert_eq!(
+            split_browser_command(r#"open -a "Brave Browser""#).unwrap(),
+            vec!["open", "-a", "Brave Browser"],
+        );
+        assert_eq!(
+            split_browser_command("open -a 'Brave Browser'").unwrap(),
+            vec!["open", "-a", "Brave Browser"],
+        );
+    }
+
+    #[test]
+    fn split_browser_command_handles_a_quoted_profile_flag() {
+        // The form users copy off a blog post: the value quoted, not the flag.
+        assert_eq!(
+            split_browser_command(r#"chrome --profile-directory="Profile 1""#).unwrap(),
+            vec!["chrome", "--profile-directory=Profile 1"],
+        );
+    }
+
+    #[test]
+    fn split_browser_command_rejects_an_unterminated_quote() {
+        // Silently dropping the tail would produce a command that looks fine
+        // in the settings box and fails only on click.
+        assert!(split_browser_command(r#"open -a "Google Chrome"#).is_err());
+        assert!(split_browser_command("open -a 'Chrome").is_err());
+        assert!(split_browser_command(r"open -a Chrome\").is_err());
+    }
+
+    #[test]
+    fn split_browser_command_does_not_expand_anything() {
+        // Not a shell: no globbing, no substitution, no operators. These are
+        // literal argv entries, which is what keeps a URL inert.
+        assert_eq!(
+            split_browser_command("browser $HOME/* `id` && rm").unwrap(),
+            vec!["browser", "$HOME/*", "`id`", "&&", "rm"],
+        );
+    }
+
+    #[test]
+    fn split_browser_command_escapes_inside_double_quotes() {
+        assert_eq!(
+            split_browser_command(r#"b "a\"b" c"#).unwrap(),
+            vec!["b", r#"a"b"#, "c"],
+        );
+        // A backslash that is not an escape keeps itself, so a path survives.
+        assert_eq!(split_browser_command(r#"b "a\nb""#).unwrap(), vec!["b", r"a\nb"]);
+    }
+
+    #[test]
+    fn split_browser_command_tolerates_padding() {
+        assert_eq!(split_browser_command("  open   -a  Safari  ").unwrap(), vec!["open", "-a", "Safari"]);
+        assert!(split_browser_command("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn browser_program_exists_finds_a_path_and_a_path_lookup() {
+        // An absolute path to something that is really there, and a bare name
+        // resolved through PATH. `sh` is on every platform we ship.
+        assert!(browser_program_exists("/bin/sh"));
+        assert!(browser_program_exists("sh"));
+        assert!(!browser_program_exists("termic-no-such-browser-xyz"));
+        assert!(!browser_program_exists("/nope/termic-no-such-browser-xyz"));
+    }
+
+    #[test]
+    fn browser_program_exists_requires_the_execute_bit() {
+        // A file on PATH with the right NAME but no +x is not a launcher.
+        // Accepting it would pass the settings field and fail on click, which
+        // is the failure mode this whole feature exists to avoid.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("termic-fake-browser");
+        fs::write(&f, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!browser_program_exists(f.to_str().unwrap()), "a non-executable file passed");
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(browser_program_exists(f.to_str().unwrap()), "an executable file was rejected");
+        // A directory is not a launcher either.
+        assert!(!browser_program_exists(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn browser_command_check_accepts_empty_and_rejects_a_typo() {
+        // Empty is "OS default", always valid.
+        assert!(browser_command_check(String::new()).is_ok());
+        assert!(browser_command_check("   ".into()).is_ok());
+        // A launcher that does not exist is caught at save time.
+        assert!(browser_command_check("termic-no-such-browser-xyz --flag".into()).is_err());
+        // An unterminated quote is a template error, reported as one.
+        assert!(browser_command_check(r#"open -a "Chrome"#.into()).is_err());
     }
 
     #[test]
@@ -12999,6 +16687,52 @@ mod tests {
         ).trim().to_string()
     }
 
+    // diff_base_ref: the diff has to resolve the stored base the same way task
+    // create does. A repo with no remote is still pinned to "origin/main"
+    // (detect_default_remote falls back to the name "origin" whether or not
+    // that remote exists), so passing the stored value through raw made every
+    // git call fail, and the failures were folded into "no changes".
+    #[test]
+    fn diff_base_ref_resolves_a_remote_tracking_base_in_a_local_only_repo() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo); // local-only: branch "main", no origin.
+
+        assert!(git(&["--no-pager", "diff", "origin/main"], repo).is_err(),
+                "the stored base must be unusable here, or this proves nothing");
+        assert_eq!(diff_base_ref(repo, "origin/main").as_deref(), Some("main"));
+    }
+
+    // No commits means no HEAD, so even resolve_base_ref's fallback lands on a
+    // ref that does not exist. There is nothing to diff against, which is not
+    // the same as a failure: the untracked scan still has files to report.
+    // Same for an orphan HEAD, where the base resolves and HEAD does not.
+    #[test]
+    fn diff_base_ref_is_none_in_a_repo_with_no_commits() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let out = std::process::Command::new("git")
+            .args(["init", "-b", "main"]).current_dir(repo).output().unwrap();
+        assert!(out.status.success());
+
+        assert_eq!(diff_base_ref(repo, "origin/main"), None);
+    }
+
+    #[test]
+    fn diff_base_ref_is_none_on_an_orphan_head() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        let out = std::process::Command::new("git")
+            .args(["checkout", "--orphan", "fresh"]).current_dir(repo).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // The base resolves here; HEAD is what does not, and `git log
+        // main..HEAD` would fail on it.
+        assert_eq!(resolve_base_ref(repo, "origin/main"), "main");
+        assert_eq!(diff_base_ref(repo, "origin/main"), None);
+    }
+
     // resolve_base_ref: a worktree branch must be cut from a ref that EXISTS.
     // The project default base is remote-tracking ("origin/main"), which a
     // local-only repo (no remote) doesn't have — the reason a race/New Task
@@ -13146,6 +16880,855 @@ mod tests {
         let wt = wt_dir.path().join("wt");
         git_worktree_add(&main, &wt, "task");
         (main_dir, wt_dir, main, wt)
+    }
+
+    // ── git history / graph (issue #199) ──
+
+    #[test]
+    fn parse_git_log_splits_records_and_refs() {
+        let rec = |sha: &str, parents: &str, refs: &str, subject: &str| {
+            format!("{sha}\u{1f}{}\u{1f}{parents}\u{1f}Ada\u{1f}ada@example.com\u{1f}1700000000\u{1f}{refs}\u{1f}{subject}\u{1e}", &sha[..7])
+        };
+        let out = format!(
+            "{}\n{}\n{}",
+            rec("aaaaaaaaaaaa", "bbbbbbbbbbbb cccccccccccc", "HEAD -> main, origin/main, tag: v1", "merge: land it"),
+            rec("bbbbbbbbbbbb", "dddddddddddd", "", "subject, with a comma"),
+            rec("dddddddddddd", "", "", "root"),
+        );
+        let unpushed = ["aaaaaaaaaaaa".to_string()].into_iter().collect();
+        let commits = parse_git_log(&out, &unpushed);
+
+        assert_eq!(commits.len(), 3);
+        // A merge keeps BOTH parents, in git's order — lane layout depends on
+        // first-parent coming first.
+        assert_eq!(commits[0].parents, vec!["bbbbbbbbbbbb", "cccccccccccc"]);
+        assert_eq!(commits[0].refs, vec!["HEAD -> main", "origin/main", "tag: v1"]);
+        assert!(commits[0].unpushed, "rev-list membership must mark the commit outgoing");
+        // A comma inside the SUBJECT must not be mistaken for a ref separator.
+        assert_eq!(commits[1].subject, "subject, with a comma");
+        assert!(commits[1].refs.is_empty());
+        assert!(!commits[1].unpushed);
+        // A root commit has no parents and that is not a parse failure.
+        assert!(commits[2].parents.is_empty());
+        assert_eq!(commits[2].timestamp, 1700000000);
+    }
+
+    #[test]
+    fn parse_git_log_keeps_a_multiline_body_as_one_field() {
+        // The body is the last field and holds newlines. That only parses
+        // because records are RS-terminated, not newline-terminated: a
+        // line-based split would tear every multi-paragraph commit apart.
+        let body = "Why it changed.\n\nCo-authored-by: Ada <ada@example.com>";
+        let out = format!(
+            "abc123456789\u{1f}abc1234\u{1f}\u{1f}Ada\u{1f}ada@example.com\u{1f}1700000000\u{1f}\u{1f}the subject\u{1f}{body}\n\n\u{1e}",
+        );
+        let commits = parse_git_log(&out, &Default::default());
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "the subject");
+        // Trailing blank lines are git's, not the author's.
+        assert_eq!(commits[0].body, body);
+    }
+
+    #[test]
+    fn parse_git_log_leaves_a_one_line_commit_with_an_empty_body() {
+        let out = "abc123456789\u{1f}abc1234\u{1f}\u{1f}Ada\u{1f}ada@example.com\u{1f}1700000000\u{1f}\u{1f}subject only\u{1f}\u{1e}";
+        let commits = parse_git_log(out, &Default::default());
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "subject only");
+        assert!(commits[0].body.is_empty());
+    }
+
+    #[test]
+    fn parse_git_log_tolerates_empty_and_short_records() {
+        assert!(parse_git_log("", &Default::default()).is_empty());
+        // Truncated record (fewer fields than the format promises) is skipped
+        // rather than panicking on an index.
+        assert!(parse_git_log("abc\u{1f}abc\u{1e}", &Default::default()).is_empty());
+    }
+
+    #[test]
+    fn commit_ish_rejects_anything_but_a_sha() {
+        assert!(is_commit_ish("0d86f3a"));
+        assert!(is_commit_ish("0d86f3a6ba24515f2492137483333ba979e3450d"));
+        assert!(!is_commit_ish(""));
+        assert!(!is_commit_ish("HEAD"));
+        assert!(!is_commit_ish("--upload-pack=touch /tmp/pwn"));
+        assert!(!is_commit_ish("main..HEAD"));
+        assert!(!is_commit_ish(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn safe_rev_accepts_refnames_but_not_option_injection() {
+        // The Compare picker hands us real refnames, so unlike is_commit_ish
+        // these must pass.
+        assert!(is_safe_rev("main"));
+        assert!(is_safe_rev("origin/main"));
+        assert!(is_safe_rev("feature/gh-208_compare.v2"));
+        assert!(is_safe_rev("0d86f3a6ba24515f2492137483333ba979e3450d"));
+        // A leading dash is the whole reason this exists.
+        assert!(!is_safe_rev("--upload-pack=touch /tmp/pwn"));
+        assert!(!is_safe_rev("-c"));
+        // Rev SYNTAX is not a refname: the caller peels with ^{commit} itself,
+        // and a range would silently change what is being compared.
+        assert!(!is_safe_rev("main..HEAD"));
+        assert!(!is_safe_rev("HEAD~3"));
+        assert!(!is_safe_rev("main^"));
+        assert!(!is_safe_rev("refs/heads/*"));
+        assert!(!is_safe_rev(""));
+        assert!(!is_safe_rev("has space"));
+        assert!(!is_safe_rev(&"a".repeat(256)));
+    }
+
+    #[test]
+    fn name_status_z_keeps_the_destination_of_a_rename() {
+        // Exactly what `git diff --name-status -M -z` writes: a plain record is
+        // two fields, a rename is three, and the stream ends with a NUL.
+        let rows = parse_name_status_z("M\0keep.txt\0R075\0old.txt\0new.txt\0A\0add.txt\0");
+        assert_eq!(
+            rows,
+            vec![
+                ("M".to_string(), "keep.txt".to_string()),
+                // The similarity score is dropped and the NEW path kept — it is
+                // the one `git show <sha>:path` can resolve.
+                ("R".to_string(), "new.txt".to_string()),
+                ("A".to_string(), "add.txt".to_string()),
+            ],
+        );
+        assert!(parse_name_status_z("").is_empty());
+        // A truncated record is dropped, not panicked on.
+        assert!(parse_name_status_z("R100\0only-one-path\0").is_empty());
+    }
+
+    #[test]
+    fn numstat_z_handles_renames_and_binary_files() {
+        // A rename leaves the third tab-field EMPTY and follows with two
+        // NUL-terminated paths; a binary file reports "-" for both counts.
+        let rows = parse_numstat_z("1\t0\tkeep.txt\04\t2\t\0old.txt\0new.txt\0-\t-\tshot.png\0");
+        assert_eq!(
+            rows,
+            vec![
+                ("keep.txt".to_string(), Some(1), Some(0)),
+                ("new.txt".to_string(), Some(4), Some(2)),
+                // Binary churn is unknown, NOT zero.
+                ("shot.png".to_string(), None, None),
+            ],
+        );
+        assert!(parse_numstat_z("").is_empty());
+    }
+
+    /// A repo on `main` with one committed file, plus a `topic` branch that
+    /// commits one file, edits another without committing, and drops an
+    /// untracked one. The three ways work can exist in a task, in one fixture.
+    fn compare_fixture(repo: &Path) -> String {
+        git_init_with_commit(repo);
+        git_set_identity(repo);
+        git_commit_file(repo, "shared.txt", "one\ntwo\n", "shared on main");
+        let main = git_branch(repo);
+        git_run(repo, &["checkout", "-q", "-b", "topic"]);
+        git_commit_file(repo, "committed.txt", "c\n", "committed on topic");
+        fs::write(repo.join("shared.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(repo.join("untracked.txt"), "u\n").unwrap();
+        main
+    }
+
+    #[test]
+    fn git_compare_merges_committed_staged_and_untracked_work() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let main = compare_fixture(&repo);
+
+        let cmp = git_compare(&repo, &main, true).unwrap();
+        assert_eq!(cmp.branch, "topic");
+        assert!(!cmp.no_merge_base);
+        let by: std::collections::HashMap<&str, &GitFile> =
+            cmp.files.iter().map(|f| (f.path.as_str(), f)).collect();
+
+        // The entire point of the view: a file whose only change is a COMMIT
+        // shows up next to one that is merely edited and one git has never seen.
+        assert_eq!(by["committed.txt"].status, "A");
+        assert_eq!(by["shared.txt"].status, "M");
+        assert_eq!(by["untracked.txt"].status, "?");
+        assert_eq!(by.len(), 3);
+
+        assert_eq!(by["shared.txt"].added, Some(1));
+        assert_eq!(by["shared.txt"].removed, Some(0));
+        // Untracked churn can't come from `git diff` (no tree holds the file),
+        // so it is counted directly.
+        assert_eq!(by["untracked.txt"].added, Some(1));
+        // The header total must equal the rows it sits above.
+        assert_eq!(cmp.added, cmp.files.iter().filter_map(|f| f.added).sum::<u32>());
+        // A worktree-side file carries a real fingerprint, which is what keeps
+        // "mark as viewed" working here (unlike a History diff).
+        assert!(!by["shared.txt"].fp.is_empty());
+    }
+
+    #[test]
+    fn git_compare_defaults_to_the_merge_base_so_base_side_work_is_not_inverted() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let main = compare_fixture(&repo);
+        // Someone lands a commit on the base AFTER this task branched.
+        git_run(&repo, &["checkout", "-q", &main]);
+        git_commit_file(&repo, "later-on-main.txt", "later\n", "landed on main");
+        git_run(&repo, &["checkout", "-q", "topic"]);
+
+        let merged = git_compare(&repo, &main, true).unwrap();
+        assert!(
+            !merged.files.iter().any(|f| f.path == "later-on-main.txt"),
+            "three-dot semantics must ignore work the base gained since the branch point",
+        );
+
+        // Two-dot is the escape hatch, and there the same file DOES appear —
+        // as a deletion, because the topic branch genuinely doesn't have it.
+        let direct = git_compare(&repo, &main, false).unwrap();
+        let later = direct.files.iter().find(|f| f.path == "later-on-main.txt")
+            .expect("tip-to-tree compare sees the base's newer commit");
+        assert_eq!(later.status, "D");
+        assert_ne!(merged.base_sha, direct.base_sha, "the two modes read different left sides");
+    }
+
+    #[test]
+    fn blame_parses_incremental_groups_and_dedupes_the_commit_table() {
+        // Two commits, three groups: commit A owns lines 1-2 and 5, commit B
+        // owns 3-4. A's second group repeats only the sha line, which is the
+        // whole reason --incremental is cheap and the reason the parser must
+        // not clear already-filled fields.
+        let a = "1111111111111111111111111111111111111111";
+        let b = "2222222222222222222222222222222222222222";
+        let out = format!(
+"{a} 1 1 2
+author Ada
+author-mail <ada@example.com>
+author-time 1700000000
+author-tz +0000
+summary first subject
+filename f.rs
+{b} 3 3 2
+author Grace
+author-mail <grace@example.com>
+author-time 1700000100
+author-tz +0000
+summary second subject
+filename f.rs
+{a} 5 5 1
+previous 3333333333333333333333333333333333333333 f.rs
+filename f.rs
+");
+        let (commits, lines) = parse_git_blame_incremental(&out);
+
+        assert_eq!(commits.len(), 2, "a commit owning two groups appears once");
+        assert_eq!(commits[0].author, "Ada");
+        assert_eq!(commits[0].author_email, "ada@example.com", "angle brackets are stripped");
+        assert_eq!(commits[0].author_time, 1700000000);
+        assert_eq!(commits[0].summary, "first subject");
+        assert!(!commits[0].uncommitted);
+        assert_eq!(commits[1].author, "Grace");
+
+        // Line index is 0-based over 1-based git line numbers, and the
+        // out-of-order trailing group lands on line 5, not appended.
+        assert_eq!(lines, vec![0, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn blame_marks_the_all_zero_sha_as_uncommitted_and_tolerates_gaps() {
+        let zero = "0000000000000000000000000000000000000000";
+        let out = format!(
+"{zero} 1 2 1
+author Not Committed Yet
+author-mail <not.committed.yet>
+author-time 1700000200
+author-tz +0000
+summary Version of f.rs from f.rs
+filename f.rs
+");
+        // Only line 2 is attributed, so line 1 stays sentinel rather than
+        // silently pointing at commit 0, and the index ends where git's
+        // numbers end.
+        let (commits, lines) = parse_git_blame_incremental(&out);
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].uncommitted, "the all-zero sha is a working-tree line");
+        assert_eq!(lines, vec![u32::MAX, 0]);
+    }
+
+    #[test]
+    fn blame_ignores_a_malformed_group_header_and_refuses_an_absurd_count() {
+        let a = "1111111111111111111111111111111111111111";
+        // First header is malformed (two numbers, not three) and must be
+        // skipped without poisoning the following real group.
+        let out = format!("{a} 1 1\n{a} 1 1 3\nauthor Ada\nsummary s\nfilename f.rs\n");
+        let (commits, lines) = parse_git_blame_incremental(&out);
+        assert_eq!(commits.len(), 1, "the malformed header contributed no commit");
+        assert_eq!(lines, vec![0, 0, 0]);
+
+        // An absurd line count is refused outright rather than allocating for
+        // it. Nothing legitimate gets near BLAME_MAX_LINES.
+        let huge = format!("{a} 1 1 {}\nauthor Ada\nsummary s\nfilename f.rs\n", BLAME_MAX_LINES + 1);
+        let (_c, l) = parse_git_blame_incremental(&huge);
+        assert!(l.is_empty(), "a hostile count must not size the index");
+    }
+
+    #[test]
+    fn blame_reads_a_real_repo_and_attributes_the_working_tree_edit() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        git_set_identity(repo);
+        git_commit_file(repo, "f.txt", "one\ntwo\n", "add f");
+        let task = Task { path: repo.to_string_lossy().into_owned(), ..Default::default() };
+
+        let blamed = task_git_blame_for_task(&task, "f.txt").unwrap();
+        assert!(!blamed.skipped);
+        assert_eq!(blamed.lines.len(), 2);
+        assert!(!blamed.head.is_empty(), "head is reported for cache keying");
+        let author = &blamed.commits[blamed.lines[0] as usize].author;
+        assert!(!author.is_empty(), "a committed line has an author");
+
+        // Blame runs against the WORKING TREE, so an unsaved-then-saved third
+        // line is attributed to nobody yet instead of shifting the other two.
+        fs::write(repo.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let dirty = task_git_blame_for_task(&task, "f.txt").unwrap();
+        assert_eq!(dirty.lines.len(), 3);
+        assert!(
+            dirty.commits[dirty.lines[2] as usize].uncommitted,
+            "the new line is not committed yet",
+        );
+        assert!(
+            !dirty.commits[dirty.lines[0] as usize].uncommitted,
+            "the untouched first line keeps its commit",
+        );
+    }
+
+    #[test]
+    fn commit_offset_locates_a_commit_without_walking_pages() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        git_set_identity(repo);
+        let first = git_head(repo);
+        for n in 1..=5 {
+            git_commit_file(repo, &format!("f{n}.txt"), "x\n", &format!("c{n}"));
+        }
+        let head = git_head(repo);
+        let task = Task { path: repo.to_string_lossy().into_owned(), ..Default::default() };
+
+        // HEAD is at offset 0; the initial commit is 5 commits back. That IS
+        // the page `skip` needed to land on it, which is the whole point.
+        assert_eq!(task_git_commit_offset_for_task(&task, "", &head).unwrap(), 0);
+        assert_eq!(task_git_commit_offset_for_task(&task, "", &first).unwrap(), 5);
+
+        // Non-hex never reaches git as an argument.
+        assert!(task_git_commit_offset_for_task(&task, "", "--exec=touch /tmp/pwn").is_err());
+        assert!(task_git_commit_offset_for_task(&task, "", "HEAD~2").is_err());
+        // Well-formed but absent is an error, not 0 (which would silently scroll
+        // the panel to the top and look like a successful reveal).
+        assert!(task_git_commit_offset_for_task(&task, "", &"b".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn commit_meta_reads_one_commit_in_full_and_rejects_a_bad_sha() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        git_set_identity(repo);
+        fs::write(repo.join("f.txt"), "one\n").unwrap();
+        git_run(repo, &["add", "f.txt"]);
+        git_run(repo, &[
+            "commit", "-q", "-m",
+            "feat: the subject\n\nProse that explains it.\n\nCo-authored-by: Ada <ada@example.com>",
+        ]);
+        let head = git_head(repo);
+        let task = Task { path: repo.to_string_lossy().into_owned(), ..Default::default() };
+
+        let c = task_git_commit_meta_for_task(&task, "f.txt", &head).unwrap();
+        assert_eq!(c.sha, head);
+        assert_eq!(c.subject, "feat: the subject");
+        // The whole message below the subject, trailers included: the popup
+        // renders the prose and pulls co-authors out on the frontend.
+        assert!(c.body.contains("Prose that explains it."));
+        assert!(c.body.contains("Co-authored-by: Ada <ada@example.com>"));
+        assert!(!c.author.is_empty() && !c.email.is_empty());
+        assert!(c.timestamp > 0);
+
+        // Anything that is not hex never reaches git as an argument.
+        assert!(task_git_commit_meta_for_task(&task, "f.txt", "--exec=touch /tmp/pwn").is_err());
+        assert!(task_git_commit_meta_for_task(&task, "f.txt", "HEAD~1").is_err());
+        // Well-formed but absent is an error, not an empty commit.
+        assert!(task_git_commit_meta_for_task(&task, "f.txt", &"a".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn blame_is_silent_for_an_untracked_file_and_outside_a_repo() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        git_init_with_commit(repo);
+        fs::write(repo.join("untracked.txt"), "hi\n").unwrap();
+        let task = Task { path: repo.to_string_lossy().into_owned(), ..Default::default() };
+
+        // Untracked: empty, NOT an error. The editor shows nothing rather than
+        // a git failure on every file it opens.
+        let untracked = task_git_blame_for_task(&task, "untracked.txt").unwrap();
+        assert!(untracked.commits.is_empty() && untracked.lines.is_empty());
+        assert!(!untracked.skipped, "empty is not the same signal as skipped");
+
+        let plain = tempdir().unwrap();
+        fs::write(plain.path().join("f.txt"), "hi\n").unwrap();
+        let non_git = Task { path: plain.path().to_string_lossy().into_owned(), ..Default::default() };
+        let out = task_git_blame_for_task(&non_git, "f.txt").unwrap();
+        assert!(out.commits.is_empty() && out.head.is_empty());
+    }
+
+    #[test]
+    fn git_compare_rejects_a_ref_that_is_not_in_the_repo() {
+        let dir = tempdir().unwrap();
+        git_init_with_commit(dir.path());
+        assert!(git_compare(dir.path(), "no-such-branch", true).is_err());
+        // And never lets a dash reach git as an option.
+        assert!(git_compare(dir.path(), "--exec=touch /tmp/pwn", true).is_err());
+    }
+
+    #[test]
+    fn compare_diff_sides_read_the_base_against_the_working_tree() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let main = compare_fixture(&repo);
+        let cmp = git_compare(&repo, &main, true).unwrap();
+        let scope = format!("base:{}", cmp.base_sha);
+        let task = task_at(&repo);
+
+        // Committed on the branch: absent from the base, present on the right.
+        let added = task_file_diff_sides_for_task(&task, "committed.txt", Some(&scope)).unwrap();
+        assert!(!added.original_exists && added.modified_exists);
+        assert_eq!(added.modified, "c\n");
+
+        // Edited but never committed: the base still has the ORIGINAL, which is
+        // what an unstaged- or staged-scoped diff could not have shown.
+        let edited = task_file_diff_sides_for_task(&task, "shared.txt", Some(&scope)).unwrap();
+        assert_eq!(edited.original, "one\ntwo\n");
+        assert_eq!(edited.modified, "one\ntwo\nthree\n");
+        // The right side is the live file, so the review affordances stay on.
+        assert!(!edited.fp.is_empty());
+
+        // A garbage sha in the scope must not silently fall through to the
+        // default HEAD-vs-worktree sides.
+        let bogus = task_file_diff_sides_for_task(&task, "shared.txt", Some("base:not-hex")).unwrap();
+        assert_eq!(bogus.original, "one\ntwo\n", "an unparseable scope falls back to HEAD");
+    }
+
+    #[test]
+    fn git_log_page_reads_real_history_with_a_merge() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        git_commit_file(&repo, "a.txt", "a\n", "on main");
+        let main = git_branch(&repo);
+        git_run(&repo, &["checkout", "-q", "-b", "topic"]);
+        git_commit_file(&repo, "t.txt", "t\n", "on topic");
+        git_run(&repo, &["checkout", "-q", &main]);
+        git_run(&repo, &["merge", "--no-ff", "-m", "merge topic", "topic"]);
+
+        let page = git_log_page(&repo, 0, 50, false, false, "", &[]);
+        assert_eq!(page.branch, main);
+        assert!(page.upstream.is_empty(), "a local-only repo has no upstream");
+        let subjects: Vec<&str> = page.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert!(subjects.contains(&"merge topic"));
+        assert!(subjects.contains(&"on topic"), "--topo-order must include the merged-in branch");
+        let merge = page.commits.iter().find(|c| c.subject == "merge topic").unwrap();
+        assert_eq!(merge.parents.len(), 2, "merge must expose both parents to the lane layout");
+        assert!(merge.refs.iter().any(|r| r.contains("HEAD")), "the tip carries the HEAD decoration");
+        // Without an upstream nothing is claimed to be outgoing.
+        assert!(page.commits.iter().all(|c| !c.unpushed));
+    }
+
+
+    #[test]
+    fn grep_searches_the_whole_history_not_the_first_page() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        git_commit_file(&repo, "needle.txt", "x\n", "Fix the LOGIN bug");
+        for i in 0..12 {
+            git_commit_file(&repo, &format!("f{i}.txt"), "y\n", &format!("filler {i}"));
+        }
+        // A page this small would not reach the match by paging.
+        let page = git_log_page(&repo, 0, 3, false, false, "login", &[]);
+        let subjects: Vec<String> = page.commits.iter().map(|c| c.subject.clone()).collect();
+        assert_eq!(subjects, vec!["Fix the LOGIN bug".to_string()], "case-insensitive, from anywhere in the history");
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn grep_is_a_literal_string_not_a_regex() {
+        // The filter box is a filter box: a bracket in it is a character
+        // someone typed, and a half-typed regex must not become an error.
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        git_commit_file(&repo, "a.txt", "a\n", "fix(git): a [bracketed] subject");
+        git_commit_file(&repo, "b.txt", "b\n", "unrelated");
+
+        let hit = git_log_page(&repo, 0, 50, false, false, "[bracketed]", &[]);
+        assert_eq!(hit.commits.len(), 1);
+        // An unbalanced bracket is a query with no matches, never a crash.
+        let none = git_log_page(&repo, 0, 50, false, false, "[unclosed", &[]);
+        assert!(none.commits.is_empty());
+    }
+
+    #[test]
+    fn grep_matches_the_body_too_and_stacks_with_a_scope() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        std::fs::write(repo.join("c.txt"), "c\n").unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(&repo, &["commit", "-q", "-m", "terse subject", "-m", "the reason lives in the BODY"]);
+
+        assert_eq!(git_log_page(&repo, 0, 50, false, false, "body", &[]).commits.len(), 1);
+        // Search narrows a scope, it does not replace it: an empty ref list is
+        // still HEAD, and --all is still every ref.
+        assert_eq!(git_log_page(&repo, 0, 50, true, false, "body", &[]).commits.len(), 1);
+        assert!(git_log_page(&repo, 0, 50, false, false, "nothing matches this", &[]).commits.is_empty());
+    }
+
+    #[test]
+    fn first_parent_collapses_a_merged_branch_into_its_merge() {
+        // The complaint this answers: picking "main" still drew a lane per
+        // merged branch, because every commit on those branches IS an ancestor
+        // of main. First-parent walks only the mainline, so the merge is one
+        // row and the side commit is not walked at all.
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        let main = git_branch(&repo);
+        git_run(&repo, &["checkout", "-q", "-b", "topic"]);
+        git_commit_file(&repo, "t.txt", "t\n", "only on topic");
+        git_run(&repo, &["checkout", "-q", &main]);
+        git_run(&repo, &["merge", "--no-ff", "-m", "merge topic", "topic"]);
+
+        let full = git_log_page(&repo, 0, 50, false, false, "", &[]);
+        let subjects = |p: &GitLogPage| p.commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>();
+        assert!(subjects(&full).contains(&"only on topic".to_string()));
+
+        let fp = git_log_page(&repo, 0, 50, false, true, "", &[]);
+        assert!(subjects(&fp).contains(&"merge topic".to_string()), "the merge itself must stay");
+        assert!(
+            !subjects(&fp).contains(&"only on topic".to_string()),
+            "the merged side branch must collapse into its merge",
+        );
+        assert!(fp.commits.len() < full.commits.len());
+    }
+
+    #[test]
+    fn first_parent_is_ignored_under_all_refs() {
+        // --all exists to show every tip; pruning the topology under it would
+        // draw tips with no path to them.
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        let main = git_branch(&repo);
+        git_run(&repo, &["checkout", "-q", "-b", "topic"]);
+        git_commit_file(&repo, "t.txt", "t\n", "only on topic");
+        git_run(&repo, &["checkout", "-q", &main]);
+
+        let all = git_log_page(&repo, 0, 50, true, true, "", &[]);
+        assert!(all.commits.iter().any(|c| c.subject == "only on topic"));
+    }
+
+    #[test]
+    fn git_log_page_paginates_and_reports_more() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        for i in 0..5 {
+            git_commit_file(&repo, &format!("f{i}.txt"), "x\n", &format!("commit {i}"));
+        }
+        let first = git_log_page(&repo, 0, 2, false, false, "", &[]);
+        assert_eq!(first.commits.len(), 2, "a page must not leak the lookahead row");
+        assert!(first.has_more);
+        let second = git_log_page(&repo, 2, 2, false, false, "", &[]);
+        assert_eq!(second.commits.len(), 2);
+        assert_ne!(first.commits[0].sha, second.commits[0].sha, "skip must advance the page");
+        // The tail page knows it is the tail.
+        let tail = git_log_page(&repo, 0, 500, false, false, "", &[]);
+        assert!(!tail.has_more);
+    }
+
+    /// A repo with an unmerged side branch, which is the only shape where the
+    /// three scopes (HEAD / picked refs / --all) give three different answers.
+    fn repo_with_side_branch(repo: &Path) -> (String, String) {
+        git_init_with_commit(repo);
+        git_set_identity(repo);
+        git_commit_file(repo, "a.txt", "a\n", "on main");
+        let main = git_branch(repo);
+        git_run(repo, &["checkout", "-q", "-b", "side"]);
+        git_commit_file(repo, "s.txt", "s\n", "only on side");
+        git_run(repo, &["checkout", "-q", &main]);
+        (main, "side".to_string())
+    }
+
+    #[test]
+    fn ahead_count_is_zero_without_an_upstream_and_counts_unpushed_after_one() {
+        let origin_dir = tempdir().unwrap();
+        let origin = origin_dir.path().to_path_buf();
+        git_run(&origin, &["init", "-q", "--bare", "-b", "main"]);
+
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        let branch = git_branch(&repo);
+
+        // No upstream: "everything is unpushed" is not a number worth badging.
+        assert_eq!(ahead_count(&repo), 0);
+
+        git_run(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git_run(&repo, &["push", "-q", "-u", "origin", &branch]);
+        assert_eq!(ahead_count(&repo), 0, "in sync with the upstream");
+
+        git_commit_file(&repo, "a.txt", "a\n", "one");
+        git_commit_file(&repo, "b.txt", "b\n", "two");
+        assert_eq!(ahead_count(&repo), 2, "two commits the remote does not have");
+
+        // The badge clears once they are sent, via the same helper the button
+        // calls, so the button and the count cannot disagree.
+        git_push(&repo).unwrap();
+        assert_eq!(ahead_count(&repo), 0);
+    }
+
+    #[test]
+    fn git_push_sets_the_upstream_when_the_branch_has_none() {
+        let origin_dir = tempdir().unwrap();
+        let origin = origin_dir.path().to_path_buf();
+        git_run(&origin, &["init", "-q", "--bare", "-b", "main"]);
+
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        git_run(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+
+        // The fresh-worktree case: a plain `git push` fails here, and the
+        // fallback has to create the upstream rather than surface the error.
+        git_push(&repo).unwrap();
+        assert!(
+            git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], &repo).is_ok(),
+            "push must leave the branch tracking its remote",
+        );
+        assert_eq!(ahead_count(&repo), 0);
+    }
+
+    #[test]
+    fn git_refs_lists_branches_and_tags_without_remote_head() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let (main, side) = repo_with_side_branch(&repo);
+        git_run(&repo, &["tag", "v1"]);
+
+        let refs = git_refs(&repo);
+        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&main.as_str()));
+        assert!(names.contains(&side.as_str()));
+        assert!(names.contains(&"v1"));
+        // Kinds drive the picker's grouping, so they have to be right.
+        assert_eq!(refs.iter().find(|r| r.name == side).unwrap().kind, "branch");
+        assert_eq!(refs.iter().find(|r| r.name == "v1").unwrap().kind, "tag");
+        // Every entry carries a sha to show beside the name.
+        assert!(refs.iter().all(|r| !r.sha.is_empty()));
+        // `origin/HEAD` is an alias for another row; offering it would let the
+        // same history be picked twice under two names.
+        assert!(!names.iter().any(|n| n.ends_with("/HEAD")));
+    }
+
+    #[test]
+    fn allowed_refs_is_an_allowlist_that_dedupes_and_keeps_order() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let (main, side) = repo_with_side_branch(&repo);
+
+        let asked = vec![side.clone(), main.clone(), side.clone()];
+        assert_eq!(allowed_refs(&repo, &asked), vec![side.clone(), main.clone()]);
+
+        // The whole point: nothing that is not a real ref survives, so a
+        // caller-supplied string can never reach argv as a flag or a path.
+        let hostile = vec![
+            "--all".to_string(),
+            "--upload-pack=touch /tmp/pwned".to_string(),
+            "-n1".to_string(),
+            "no-such-branch".to_string(),
+            "../etc/passwd".to_string(),
+        ];
+        assert!(allowed_refs(&repo, &hostile).is_empty());
+    }
+
+    #[test]
+    fn git_log_page_scopes_to_head_picked_refs_or_all() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let (main, side) = repo_with_side_branch(&repo);
+        let subjects = |p: &GitLogPage| -> Vec<String> {
+            p.commits.iter().map(|c| c.subject.clone()).collect()
+        };
+
+        // Default: HEAD only. The unmerged side commit is not this branch's.
+        let head = git_log_page(&repo, 0, 50, false, false, "", &[]);
+        assert!(subjects(&head).contains(&"on main".to_string()));
+        assert!(!subjects(&head).contains(&"only on side".to_string()));
+
+        // --all wins over everything and brings the sibling in.
+        let all = git_log_page(&repo, 0, 50, true, false, "", &[]);
+        assert!(subjects(&all).contains(&"only on side".to_string()));
+
+        // Picked: just the side branch, which does NOT contain main's tip.
+        let picked = git_log_page(&repo, 0, 50, false, false, "", &[side.clone()]);
+        assert!(subjects(&picked).contains(&"only on side".to_string()));
+
+        // Picked both = the union, which is what --all shows in this repo.
+        let both = git_log_page(&repo, 0, 50, false, false, "", &[main.clone(), side.clone()]);
+        assert_eq!(both.commits.len(), all.commits.len());
+
+        // all_branches beats a refs list rather than intersecting with it.
+        let all_wins = git_log_page(&repo, 0, 50, true, false, "", &[side.clone()]);
+        assert_eq!(all_wins.commits.len(), all.commits.len());
+    }
+
+    #[test]
+    fn git_log_page_returns_nothing_when_every_picked_ref_is_gone() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let (main, _side) = repo_with_side_branch(&repo);
+        // A branch deleted while the picker still lists it. Falling back to
+        // HEAD would answer a different question under the old scope's label.
+        let page = git_log_page(&repo, 0, 50, false, false, "", &["deleted-branch".to_string()]);
+        assert!(page.commits.is_empty());
+        assert!(!page.has_more);
+        // The header still knows where it is, so the panel keeps its chrome.
+        assert_eq!(page.branch, main);
+    }
+
+    #[test]
+    fn git_log_page_is_empty_on_an_unborn_branch() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_run(&repo, &["init", "-q", "-b", "main"]);
+        // No commits yet: `git log` FAILS here. That must read as an empty
+        // history, not an error dialog.
+        let page = git_log_page(&repo, 0, 50, false, false, "", &[]);
+        assert!(page.commits.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn commit_files_lists_adds_edits_deletes_merges_and_the_root() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_run(&repo, &["init", "-q", "-b", "main"]);
+        git_set_identity(&repo);
+        // The FIRST commit has no parent — diff-tree needs --root to say
+        // anything at all about it.
+        git_commit_file(&repo, "root.txt", "r\n", "root commit");
+        let root = git_commit_files(&repo, &git_head(&repo)).unwrap();
+        assert_eq!(root.len(), 1, "root commit must list its files");
+        assert_eq!(root[0].path, "root.txt");
+
+        git_commit_file(&repo, "keep.txt", "one\n", "add keep");
+        let add = git_head(&repo);
+        let files = git_commit_files(&repo, &add).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "keep.txt");
+        assert_eq!(files[0].status, "A");
+
+        fs::remove_file(repo.join("keep.txt")).unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(&repo, &["commit", "-m", "drop keep"]);
+        let del = git_commit_files(&repo, &git_head(&repo)).unwrap();
+        assert_eq!(del[0].status, "D");
+
+        // A merge reports its delta against the first parent instead of the
+        // empty output plain `diff-tree` gives for merges.
+        let main = git_branch(&repo);
+        git_run(&repo, &["checkout", "-q", "-b", "side"]);
+        git_commit_file(&repo, "side.txt", "s\n", "side work");
+        git_run(&repo, &["checkout", "-q", &main]);
+        git_run(&repo, &["merge", "--no-ff", "-m", "merge side", "side"]);
+        let merged = git_commit_files(&repo, &git_head(&repo)).unwrap();
+        assert!(merged.iter().any(|f| f.path == "side.txt"), "merge must list what it brought in");
+    }
+
+    #[test]
+    fn commit_files_lists_a_merged_path_once_not_once_per_parent() {
+        // `diff-tree -m` prints one diff PER PARENT, so a file touched on both
+        // sides of a merge comes back twice — duplicate rows in the panel and a
+        // colliding React key. The previous merge test only checked presence,
+        // which a doubled list satisfies; this one pins the count.
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_run(&repo, &["init", "-q", "-b", "main"]);
+        git_set_identity(&repo);
+        git_commit_file(&repo, "shared.txt", "base\n", "root");
+
+        git_run(&repo, &["checkout", "-q", "-b", "side"]);
+        git_commit_file(&repo, "shared.txt", "side\n", "side edit");
+        git_commit_file(&repo, "only-side.txt", "s\n", "side only");
+        git_run(&repo, &["checkout", "-q", "main"]);
+        git_commit_file(&repo, "shared.txt", "main\n", "main edit");
+        // Conflicting merge, resolved by hand: the only shape where BOTH
+        // parents report the same path.
+        let _ = std::process::Command::new("git")
+            .args(["merge", "side", "-m", "merge"]).current_dir(&repo).output().unwrap();
+        fs::write(repo.join("shared.txt"), "resolved\n").unwrap();
+        git_run(&repo, &["add", "-A"]);
+        git_run(&repo, &["commit", "-q", "-m", "merge resolved"]);
+
+        let files = git_commit_files(&repo, &git_head(&repo)).unwrap();
+        let shared: Vec<_> = files.iter().filter(|f| f.path == "shared.txt").collect();
+        assert_eq!(shared.len(), 1, "a path touched on both sides must be listed once, got {files:?}");
+        // The dedupe must not cost the files the merge brought in cleanly —
+        // which is what switching to `--cc` would have done.
+        assert!(files.iter().any(|f| f.path == "only-side.txt"), "cleanly merged files must survive");
+        let mut paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let before = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), before, "no path may repeat");
+    }
+
+    #[test]
+    fn commit_files_refuses_a_non_sha_revision() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        assert!(git_commit_files(&repo, "HEAD").is_err());
+        assert!(git_commit_files(&repo, "--output=/tmp/pwn").is_err());
+    }
+
+    #[test]
+    fn diff_sides_of_a_commit_read_both_revisions_not_the_worktree() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        git_init_with_commit(&repo);
+        git_set_identity(&repo);
+        git_commit_file(&repo, "f.txt", "v1\n", "first");
+        git_commit_file(&repo, "f.txt", "v2\n", "second");
+        let second = git_head(&repo);
+        // Dirty the working tree: a commit diff must ignore it entirely.
+        fs::write(repo.join("f.txt"), "scratch\n").unwrap();
+
+        let w = Task { path: repo.to_string_lossy().into(), ..Task::default() };
+        let sides = task_file_diff_sides_for_task(&w, "f.txt", Some(&format!("commit:{second}"))).unwrap();
+        assert_eq!(sides.original, "v1\n", "left side must be the parent revision");
+        assert_eq!(sides.modified, "v2\n", "right side must be the commit, not the worktree");
+
+        // The very first commit of a file has no parent side: that is an add.
+        let first = git_rev(&repo, &format!("{second}^"));
+        let added = task_file_diff_sides_for_task(&w, "f.txt", Some(&format!("commit:{first}"))).unwrap();
+        assert!(!added.original_exists);
+        assert!(added.modified_exists);
+        assert_eq!(added.modified, "v1\n");
     }
 
     #[test]
@@ -13974,5 +18557,449 @@ mod tests {
                        "created":"2026-01-01T00:00:00Z","archived":false}"#;
         let t: Task = serde_json::from_str(json).expect("legacy task file still parses");
         assert_eq!(t.order, None);
+    }
+
+    // ── Extra named ports (GH #196) ─────────────────────────────────
+
+    #[test]
+    fn valid_names() {
+        assert!(valid_port_name("API_PORT"));
+        assert!(valid_port_name("_db"));
+        assert!(valid_port_name("frontendPort2"));
+    }
+
+    #[test]
+    fn invalid_names() {
+        assert!(!valid_port_name(""));          // empty
+        assert!(!valid_port_name("2PORT"));     // leading digit
+        assert!(!valid_port_name("MY-PORT"));   // dash
+        assert!(!valid_port_name("A B"));       // space
+    }
+
+    #[test]
+    fn reserved_names_rejected() {
+        for n in ["TERMIC_PORT", "PATH", "HOME", "CONDUCTOR_PORT", "TERM",
+                  "PORT", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+                  "TERMIC_CLI_HELP"] {
+            assert!(!valid_port_name(n), "{n} must be reserved");
+        }
+    }
+
+    #[test]
+    fn reserved_names_match_ts_mirror() {
+        // src/lib/namedPorts.ts carries a hand-maintained copy of
+        // RESERVED_PORT_NAMES for the Settings editor's inline warnings.
+        // Pin the two sets equal so "keep in sync" is a gate, not a
+        // comment. Parses the string literals out of the TS `new Set([...])`.
+        let ts_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/namedPorts.ts");
+        let ts = std::fs::read_to_string(&ts_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", ts_path.display()));
+        let start = ts.find("RESERVED_PORT_NAMES").expect("TS list missing");
+        let open = ts[start..].find('[').expect("TS list has no [") + start;
+        let close = ts[open..].find(']').expect("TS list has no ]") + open;
+        let ts_names: HashSet<&str> = ts[open..close]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let rust_names: HashSet<&str> = RESERVED_PORT_NAMES.iter().copied().collect();
+        assert!(!ts_names.is_empty(), "parsed zero names from namedPorts.ts");
+        assert_eq!(
+            ts_names, rust_names,
+            "RESERVED_PORT_NAMES differs between lib.rs and src/lib/namedPorts.ts"
+        );
+    }
+
+    #[test]
+    fn sibling_port_namespace_rejected() {
+        // TERMIC_PORT_<DIR> belongs to multi-repo sibling discovery; an
+        // extra in that namespace would collide with opposite precedence
+        // per spawn site.
+        assert!(!valid_port_name("TERMIC_PORT_API"));
+        assert!(!valid_port_name("TERMIC_PORT_2"));
+        // Other TERMIC_-prefixed names stay legal.
+        assert!(valid_port_name("TERMIC_EXTRA"));
+    }
+
+    #[test]
+    fn effective_list_unions_and_dedupes() {
+        // yaml first, personal appended, dupes and invalid dropped.
+        let dir = tempdir().unwrap();
+        let cfg = crate::repo_config::RepoConfig {
+            extra_named_ports: vec!["API_PORT".into(), "DB_PORT".into()],
+            ..Default::default()
+        };
+        crate::repo_config::save(dir.path(), &cfg).unwrap();
+        let proj = Project {
+            root_path: dir.path().to_string_lossy().into_owned(),
+            extra_named_ports: vec![
+                "DB_PORT".into(),      // dupe of yaml, dropped
+                "CACHE_PORT".into(),   // kept
+                "2BAD".into(),         // invalid, dropped
+                "PATH".into(),         // reserved, dropped
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_extra_named_ports(&proj),
+            vec!["API_PORT", "DB_PORT", "CACHE_PORT"],
+        );
+    }
+
+    fn stub_task(port: u16, members: usize, extras: usize, archived: bool) -> Task {
+        Task {
+            port,
+            archived,
+            composition: (0..members).map(|_| TaskMember::default()).collect(),
+            extra_named_ports: (0..extras)
+                .map(|j| NamedPort { name: format!("P{j}"), port: 0 })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_port_empty_state() {
+        assert_eq!(next_base_port(&[], 6).unwrap(), 18100);
+    }
+
+    #[test]
+    fn blocks_stack_consecutively() {
+        // Plain task block = 1 + 0 + 0 + 5 = 6 → next base is 18106.
+        let existing = vec![stub_task(18100, 0, 0, false)];
+        assert_eq!(next_base_port(&existing, 6).unwrap(), 18106);
+    }
+
+    #[test]
+    fn members_and_extras_widen_the_block() {
+        // 1 + 2 members + 3 extras + 5 buffer = 11 → next base 18111.
+        let existing = vec![stub_task(18100, 2, 3, false)];
+        assert_eq!(next_base_port(&existing, 6).unwrap(), 18111);
+    }
+
+    #[test]
+    fn archived_blocks_are_reused() {
+        let existing = vec![stub_task(18100, 0, 0, true)];
+        assert_eq!(next_base_port(&existing, 6).unwrap(), 18100);
+    }
+
+    #[test]
+    fn first_fit_takes_a_gap_that_fits() {
+        // Live at 18100 (len 6) and 18112 (len 6); the 18106..18112 gap
+        // fits needed=6 → reused.
+        let existing = vec![stub_task(18100, 0, 0, false), stub_task(18112, 0, 0, false)];
+        assert_eq!(next_base_port(&existing, 6).unwrap(), 18106);
+        // needed=8 does NOT fit the gap → lands after the last block.
+        assert_eq!(next_base_port(&existing, 8).unwrap(), 18118);
+    }
+
+    #[test]
+    fn restore_rehomes_a_stolen_block() {
+        // A archived at 18100, B created while A was archived reused the
+        // slot; restoring A must move A's whole block past B's.
+        let mut archived = stub_task(18100, 0, 2, true);
+        archived.id = "a".into();
+        archived.extra_named_ports = vec![
+            NamedPort { name: "API_PORT".into(), port: 18101 },
+            NamedPort { name: "DB_PORT".into(),  port: 18102 },
+        ];
+        let mut thief = stub_task(18100, 0, 0, false);
+        thief.id = "b".into();
+        let list = vec![archived.clone(), thief];
+        let mut restoring = archived;
+        assert!(rehome_ports_if_stolen(&mut restoring, &list));
+        // Thief block = 1 + 0 + 0 + 5 = 6 → new base 18106, extras follow.
+        assert_eq!(restoring.port, 18106);
+        assert_eq!(restoring.extra_named_ports, vec![
+            NamedPort { name: "API_PORT".into(), port: 18107 },
+            NamedPort { name: "DB_PORT".into(),  port: 18108 },
+        ]);
+    }
+
+    #[test]
+    fn restore_keeps_an_unstolen_block() {
+        let mut archived = stub_task(18100, 0, 0, true);
+        archived.id = "a".into();
+        let mut other = stub_task(18106, 0, 0, false);
+        other.id = "b".into();
+        let list = vec![archived.clone(), other];
+        let mut restoring = archived;
+        assert!(!rehome_ports_if_stolen(&mut restoring, &list));
+        assert_eq!(restoring.port, 18100);
+    }
+
+    #[test]
+    fn top_up_freezes_new_names_into_buffer_slots() {
+        // Task created with 1 extra (block stamped 1+0+1+5=7); config
+        // later grows by two names — they land in the buffer, existing
+        // pair untouched, block length unchanged.
+        let dir = tempdir().unwrap();
+        let cfg = crate::repo_config::RepoConfig {
+            extra_named_ports: vec!["API_PORT".into(), "DB_PORT".into(), "CACHE_PORT".into()],
+            ..Default::default()
+        };
+        crate::repo_config::save(dir.path(), &cfg).unwrap();
+        let proj = Project {
+            root_path: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut task = stub_task(18100, 0, 0, false);
+        task.extra_named_ports = vec![NamedPort { name: "API_PORT".into(), port: 18101 }];
+        task.port_block_len = 7;
+        assert!(top_up_extra_ports(&mut task, &proj, &[]));
+        assert_eq!(task.extra_named_ports, vec![
+            NamedPort { name: "API_PORT".into(),   port: 18101 },
+            NamedPort { name: "DB_PORT".into(),    port: 18102 },
+            NamedPort { name: "CACHE_PORT".into(), port: 18103 },
+        ]);
+        assert_eq!(task_block_len(&task), 7, "top-up must not grow the block");
+    }
+
+    #[test]
+    fn top_up_overflows_past_the_buffer_into_stray_ports() {
+        // Block 1+0+0+5=6: five buffer slots. Config declares six names:
+        // five fill the buffer, the sixth first-fits the next free
+        // single port PAST the block.
+        let dir = tempdir().unwrap();
+        let names: Vec<String> = (0..6).map(|i| format!("P{i}_PORT")).collect();
+        let cfg = crate::repo_config::RepoConfig {
+            extra_named_ports: names.clone(),
+            ..Default::default()
+        };
+        crate::repo_config::save(dir.path(), &cfg).unwrap();
+        let proj = Project {
+            root_path: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut task = stub_task(18100, 0, 0, false);
+        task.id = "a".into();
+        task.port_block_len = 6;
+        assert!(top_up_extra_ports(&mut task, &proj, &[]));
+        assert_eq!(task.extra_named_ports.len(), 6);
+        assert_eq!(task.extra_named_ports[4],
+                   NamedPort { name: "P4_PORT".into(), port: 18105 });
+        // Stray lands right after the task's own block.
+        assert_eq!(task.extra_named_ports[5],
+                   NamedPort { name: "P5_PORT".into(), port: 18106 });
+    }
+
+    #[test]
+    fn top_up_strays_avoid_other_tasks_blocks() {
+        // Same overflow, but a neighbor occupies [18106, 18112): the
+        // stray must jump past it.
+        let dir = tempdir().unwrap();
+        let names: Vec<String> = (0..6).map(|i| format!("P{i}_PORT")).collect();
+        let cfg = crate::repo_config::RepoConfig {
+            extra_named_ports: names,
+            ..Default::default()
+        };
+        crate::repo_config::save(dir.path(), &cfg).unwrap();
+        let proj = Project {
+            root_path: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut task = stub_task(18100, 0, 0, false);
+        task.id = "a".into();
+        task.port_block_len = 6;
+        let mut neighbor = stub_task(18106, 0, 0, false);
+        neighbor.id = "b".into();
+        assert!(top_up_extra_ports(&mut task, &proj, &[neighbor]));
+        assert_eq!(task.extra_named_ports[5].port, 18112);
+    }
+
+    #[test]
+    fn allocation_treats_strays_as_occupied() {
+        // A live task with a stray at 18106 (outside its 6-port block):
+        // the next block must clear both the block and the stray.
+        let mut a = stub_task(18100, 0, 0, false);
+        a.id = "a".into();
+        a.port_block_len = 6;
+        a.extra_named_ports = vec![NamedPort { name: "STRAY_PORT".into(), port: 18106 }];
+        assert_eq!(next_base_port(&[a], 6).unwrap(), 18107);
+    }
+
+    #[test]
+    fn restore_rehomes_when_a_stray_was_stolen() {
+        // The archived task's STRAY (not its block) got claimed by a
+        // task created meanwhile: restore must still re-home, and the
+        // fresh allocation re-compacts the stray into the new block.
+        let mut archived = stub_task(18100, 0, 0, true);
+        archived.id = "a".into();
+        archived.port_block_len = 6;
+        archived.extra_named_ports = vec![
+            NamedPort { name: "STRAY_PORT".into(), port: 18106 },
+        ];
+        let mut thief = stub_task(18106, 0, 0, false);
+        thief.id = "b".into();
+        let list = vec![archived.clone(), thief];
+        let mut restoring = archived;
+        assert!(rehome_ports_if_stolen(&mut restoring, &list));
+        // Thief occupies [18106, 18112); new block (1+0+1+5=7) lands after.
+        assert_eq!(restoring.port, 18112);
+        assert_eq!(restoring.extra_named_ports,
+                   vec![NamedPort { name: "STRAY_PORT".into(), port: 18113 }]);
+        assert_eq!(restoring.port_block_len, 7);
+    }
+
+    #[test]
+    fn top_up_stamps_legacy_records_and_leaves_removed_names_alone() {
+        // Pre-field record (port_block_len 0) with a frozen pair whose
+        // name is gone from the config: the pair survives, the block
+        // stamps to the computed shape BEFORE new pairs are added, and
+        // the new name lands in the buffer.
+        let dir = tempdir().unwrap();
+        let cfg = crate::repo_config::RepoConfig {
+            extra_named_ports: vec!["NEW_PORT".into()],
+            ..Default::default()
+        };
+        crate::repo_config::save(dir.path(), &cfg).unwrap();
+        let proj = Project {
+            root_path: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut task = stub_task(18100, 0, 0, false);
+        task.extra_named_ports = vec![NamedPort { name: "OLD_PORT".into(), port: 18101 }];
+        assert!(top_up_extra_ports(&mut task, &proj, &[]));
+        assert_eq!(task.port_block_len, 7, "stamped from the pre-top-up shape");
+        assert_eq!(task.extra_named_ports, vec![
+            NamedPort { name: "OLD_PORT".into(), port: 18101 },
+            NamedPort { name: "NEW_PORT".into(), port: 18102 },
+        ]);
+        // Idempotent: a second spawn adds nothing.
+        assert!(!top_up_extra_ports(&mut task, &proj, &[]));
+    }
+
+    #[test]
+    fn allocate_assigns_consecutive_extras_after_members() {
+        let (base, extras, _) = allocate_task_ports(
+            &[], 2, &["API_PORT".to_string(), "DB_PORT".to_string()],
+        ).unwrap();
+        assert_eq!(base, 18100);
+        // base=TERMIC_PORT, members at base+1+i, extras after members.
+        assert_eq!(extras, vec![
+            NamedPort { name: "API_PORT".into(), port: 18103 },
+            NamedPort { name: "DB_PORT".into(),  port: 18104 },
+        ]);
+    }
+
+    // ── write_atomic (the settings.json / projects.json / task writer) ──
+
+    #[test]
+    fn write_atomic_replaces_the_whole_file_with_no_stale_tail() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"{\"a\":1,\"padding\":\"xxxxxxxxxxxxxxxxxxxx\"}").unwrap();
+        // A shorter payload over a longer one: proof it's a replace, not an
+        // in-place overwrite that could leave the old bytes past the new end.
+        write_atomic(&f, b"{\"a\":2}").unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "{\"a\":2}");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_files_behind() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"one").unwrap();
+        write_atomic(&f, b"two").unwrap();
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"], "staging files must be renamed away, not accumulate");
+    }
+
+    #[test]
+    fn write_atomic_never_exposes_a_partial_file_to_a_concurrent_reader() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        let small = "s".repeat(64);
+        let big = "b".repeat(256 * 1024);
+        write_atomic(&f, small.as_bytes()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (f, stop) = (f.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut seen_partial = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let got = fs::read_to_string(&f).expect("path is never absent mid-write");
+                    if !got.chars().all(|c| c == 's') && !got.chars().all(|c| c == 'b') {
+                        seen_partial = Some(got.len());
+                        break;
+                    }
+                    if got.len() != 64 && got.len() != 256 * 1024 {
+                        seen_partial = Some(got.len());
+                        break;
+                    }
+                }
+                seen_partial
+            })
+        };
+        for i in 0..40 {
+            let body = if i % 2 == 0 { &big } else { &small };
+            write_atomic(&f, body.as_bytes()).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), None, "reader saw a torn file");
+    }
+
+    #[test]
+    fn write_atomic_preserves_the_destination_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        fs::write(&f, b"old").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&f, b"new").unwrap();
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic swap must not relax a tightened file");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_atomic_writes_through_a_symlinked_destination() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("dotfiles-settings.json");
+        let link = dir.path().join("settings.json");
+        fs::write(&target, b"old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link itself must survive");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new", "target must receive the write");
+    }
+
+    // Dangling link (dotfiles target not created yet): canonicalize fails, so
+    // the manual read_link fallback must still write the target, not clobber
+    // the link with a regular file.
+    #[test]
+    fn write_atomic_creates_the_target_of_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("dotfiles-settings.json");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link itself must survive");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new", "target must be created");
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_old_file_and_cleans_up_when_the_write_fails() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"good").unwrap();
+        // A directory at the destination makes the rename fail after the temp
+        // file is already written.
+        let blocked = dir.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(write_atomic(&blocked, b"nope").is_err());
+        assert_eq!(fs::read_to_string(&f).unwrap(), "good", "unrelated file untouched");
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "failed write left staging files: {strays:?}");
     }
 }

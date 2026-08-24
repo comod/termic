@@ -10,6 +10,16 @@ export interface ConfirmCheckbox {
   branchName?: string;
 }
 
+/** Shape askConfirm resolves to once the request carries a `checkbox` or
+ *  `dontAskAgain` (a plain boolean otherwise). `checked` is the checkbox
+ *  state at dismissal, so it is meaningful ONLY when `confirmed` is true:
+ *  ticking a box and then hitting Escape still reports it as ticked. */
+export interface ConfirmResult {
+  confirmed: boolean;
+  checked: boolean;
+  dontAskAgain: boolean;
+}
+
 export interface ConfirmRequest {
   title: string;
   message: string;
@@ -20,6 +30,11 @@ export interface ConfirmRequest {
    *  delete / "ripping the cage" style actions. */
   destructive?: boolean;
   checkbox?: ConfirmCheckbox;
+  /** Renders a second, separate "Show this every time" checkbox under
+   *  `checkbox`. The dialog only reports it back (as `dontAskAgain`); it is
+   *  the CALLER's job to persist the opt-out, and to do so only when
+   *  `confirmed` is also true. */
+  dontAskAgain?: boolean;
   /** Identifies a prompt whose asker can go away before it is answered (a
    *  terminal pane's "restart to apply YOLO?", say — the tab can be closed or
    *  the task archived while it stands). The asker passes a key here and calls
@@ -28,6 +43,12 @@ export interface ConfirmRequest {
    *  is on screen at a time, so an un-withdrawn prompt is not a small mess. */
   key?: string;
 }
+
+/** The three ways out of the scratchpad close prompt (GH #244). "save" opens
+ *  the promote picker and the close only happens if that picker goes through;
+ *  "discard" deletes the pad for good; "cancel" (including Esc / click-away)
+ *  leaves both the tab and the pad exactly as they were. */
+export type ScratchCloseChoice = "save" | "discard" | "cancel";
 
 /** How the user chose to share a file dropped onto a sandboxed terminal. */
 export type TerminalDropChoice =
@@ -43,15 +64,43 @@ export interface TerminalDropRequest {
   taskId: string;
 }
 
+/** Pre-fill for the New Task dialog. Every field is optional; the dialog
+ *  falls back to its usual project/last-used defaults for anything absent,
+ *  so a seed can carry as little as one field. */
+export interface NewTaskSeed {
+  /** Pre-fills "Branch from". */
+  baseBranch?: string;
+  /** Pre-fills the name field (a full name, not only a prefix, despite
+   *  the historical key). */
+  namePrefix?: string;
+  /** Open straight into "import an existing worktree" mode. */
+  importMode?: boolean;
+  /** Pre-fills the first-message textarea (GH #192, deep links). Sent to
+   *  the agent after create; never auto-submitted from the link itself. */
+  prompt?: string;
+  /** Agent CLI id to pre-select. Ignored when it names an agent this
+   *  install does not offer. */
+  agent?: string;
+  /** Task type to pre-select, overriding the user's remembered choice. */
+  mode?: "worktree" | "repo_root";
+  /** Bumped by `openNewTask` on every call. The dialog's reset effect keys
+   *  on it, so a SECOND open for the same project re-seeds the form instead
+   *  of no-op'ing — which is what a second deep link is (GH #192): the
+   *  window raises, and without this it raises onto the first link's name
+   *  and prompt. Assigned by the store; callers never set it. */
+  nonce?: number;
+}
+
 interface UIState {
   // dialog visibility
   newProjectOpen: boolean;
   newTaskProjectId: string | null;  // null = closed
   /** Optional seed for the New worktree dialog — when set, the dialog
-   *  pre-fills the branch-from field with this value. Used by the
-   *  "Duplicate task" flow to branch a new worktree off an
-   *  existing one's tip. Cleared when the dialog closes. */
-  newTaskSeed: { baseBranch?: string; namePrefix?: string; importMode?: boolean } | null;
+   *  pre-fills fields with these values. Used by the "Duplicate task" flow
+   *  (branch off an existing task's tip) and by `termic://` deep links
+   *  (GH #192), which can additionally seed the prompt, agent and task
+   *  type. Cleared when the dialog closes. */
+  newTaskSeed: NewTaskSeed | null;
   /** "Run a command" dialog — project id to open it for, null = closed.
    *  Creates a task whose default tab runs a user-supplied launch command
    *  instead of an agent. `customCommandMode` picks worktree vs main
@@ -72,12 +121,6 @@ interface UIState {
    *  closed. Lives in UI store so opening doesn't churn the task
    *  tree. */
   resumeOverrideTaskId: string | null;
-  /** Progress overlay for a QUICK worktree create (sidebar inline row).
-   *  Reuses the New Task dialog's ProgressBody: "creating" shows the
-   *  worktree add / file-copy spinner, "error" surfaces the failure with a
-   *  Close button. null = hidden. Main-checkout creates are instant and
-   *  never set this. */
-  taskCreateProgress: { phase: "creating" | "error"; err: string | null } | null;
   /** Read-only "Keyboard shortcuts" cheat-sheet modal (opened from the
    *  sidebar footer). Distinct from Settings → Shortcuts (which edits them). */
   /** True while Termic is in windowless mode (window closed to the menu bar,
@@ -132,6 +175,10 @@ interface UIState {
   commandPaletteOpen: boolean;
   /** ⌥⌘P prompt palette — searchable list of library prompts (title only). */
   promptPaletteOpen: boolean;
+  /** "Set syntax" picker — which editor tab it will re-highlight; null =
+   *  closed. Keyed by tab (not just task) because the pick applies to one
+   *  buffer, and the palette can outlive a tab switch underneath it. */
+  syntaxPaletteFor: { taskId: string; tabId: string } | null;
   /** The prompt-destination picker: "Run "<title>"" modal shared by the
    *  Prompts dropdown and the prompt palette's fallback. `body` is a
    *  one-shot editable copy of the
@@ -160,6 +207,17 @@ interface UIState {
   /** Active sandboxed-terminal drop prompt, if any. The resolve callback
    *  fires with the user's choice when the modal closes. */
   terminalDrop: { req: TerminalDropRequest; resolve: (c: TerminalDropChoice) => void } | null;
+  /** Active "close this scratchpad?" prompt (GH #244). null = nothing
+   *  pending. Deliberately NOT built on `confirm`: this has THREE outcomes
+   *  and ConfirmDialog folds dismissal into cancel, exactly the reason
+   *  CloseDialog is its own component too. Here dismissal IS the harmless
+   *  outcome (Esc keeps the pad and the tab), so the mapping works out. */
+  scratchClose: { title: string; resolve: (c: ScratchCloseChoice) => void } | null;
+  /** The "Save to project" picker for a scratchpad: which pad is being
+   *  promoted, and into which task. Resolves true once the pad is a real
+   *  file, so the close flow can tell "saved, now close the tab" from
+   *  "backed out, keep it". null = closed. */
+  scratchSave: { taskId: string; tabId: string; resolve: (saved: boolean) => void } | null;
   /** Tasks whose PTYs are about to be SIGKILL'd because the user
    *  explicitly hit "Save & restart" on a config dialog (Sandbox or
    *  Resume override). The next pty-exit for any PTY belonging to one of
@@ -178,7 +236,7 @@ interface UIState {
   // actions
   openNewProject: () => void;
   closeNewProject: () => void;
-  openNewTask: (projectId: string, seed?: { baseBranch?: string; namePrefix?: string; importMode?: boolean }) => void;
+  openNewTask: (projectId: string, seed?: NewTaskSeed) => void;
   closeNewTask: () => void;
   openCustomCommand: (projectId: string, mode?: "worktree" | "repo_root") => void;
   closeCustomCommand: () => void;
@@ -188,7 +246,6 @@ interface UIState {
   closeRunCommands: () => void;
   openResumeOverride: (taskId: string) => void;
   closeResumeOverride: () => void;
-  setTaskCreateProgress: (p: { phase: "creating" | "error"; err: string | null } | null) => void;
   openShortcutsHelp: () => void;
   closeShortcutsHelp: () => void;
   openWelcome: () => void;
@@ -203,6 +260,23 @@ interface UIState {
   openRaceCompare: (raceId: string) => void;
   closeRaceCompare: () => void;
   openSandbox: (taskId: string) => void;
+  /** "Show this commit in History": the blame popup's second button. Read by
+   *  RightPanel (open the Git tab), GitPanel (switch to the History view) and
+   *  HistoryPanel (select, expand and scroll to the sha). One request rather
+   *  than three, because the three live in different components and the editor
+   *  has no handle on any of them.
+   *
+   *  `at` is what makes it a REQUEST and not a state: asking for the same sha
+   *  twice must reveal it twice, and a plain `{taskId, sha}` compares equal the
+   *  second time and does nothing. Deliberately not named `open*`: it is not a
+   *  dialog, and CommandPalette.coverage.test.ts polices that prefix. */
+  commitReveal: { taskId: string; sha: string; at: number } | null;
+  revealCommitInHistory: (taskId: string, sha: string) => void;
+  /** Consume the request. MUST be called once it has been honoured: a reveal
+   *  that stays in the store is a standing order, and RightPanel re-runs its
+   *  effect on every task switch, so an un-consumed one pins the panel to the
+   *  Git tab for the rest of the session. Found the hard way, see ui.md. */
+  clearCommitReveal: () => void;
   closeSandbox: () => void;
   openFileFinder: (taskId: string) => void;
   closeFileFinder: () => void;
@@ -212,6 +286,8 @@ interface UIState {
   closeCommandPalette: () => void;
   openPromptPalette: () => void;
   closePromptPalette: () => void;
+  openSyntaxPalette: (taskId: string, tabId: string) => void;
+  closeSyntaxPalette: () => void;
   /** Open the destination picker for `prompt`, seeding the editable body. */
   openPromptFire: (prompt: Prompt) => void;
   closePromptFire: () => void;
@@ -226,11 +302,16 @@ interface UIState {
    *  to true (user confirmed) or false (cancelled / dismissed). Drop-in
    *  replacement for `window.confirm()` with our own chrome + theming. */
   askConfirm: {
-    (req: ConfirmRequest & { checkbox: ConfirmCheckbox }): Promise<{ confirmed: boolean; checked: boolean }>;
+    (req: ConfirmRequest & { checkbox: ConfirmCheckbox }): Promise<ConfirmResult>;
+    // `true`, not `boolean`: a request that passes `dontAskAgain: false` gets
+    // no second checkbox, so confirmAnswer hands back a bare boolean. Typing
+    // that call as ConfirmResult would compile and then read `.confirmed` off
+    // a boolean at runtime, silently turning a confirm into a cancel.
+    (req: ConfirmRequest & { dontAskAgain: true }): Promise<ConfirmResult>;
     (req: ConfirmRequest & { checkbox: undefined }): Promise<boolean>;
-    (req: ConfirmRequest): Promise<boolean | { confirmed: boolean; checked: boolean }>;
+    (req: ConfirmRequest): Promise<boolean | ConfirmResult>;
   };
-  resolveConfirm: (ok: boolean, checked?: boolean) => void;
+  resolveConfirm: (ok: boolean, checked?: boolean, dontAskAgain?: boolean) => void;
   /** Take back a keyed confirm the asker no longer wants answered (its pane
    *  unmounted, its task was archived, or it is about to ask again). Resolves
    *  the pending promise as "cancelled" and closes the modal. Safe to call
@@ -241,6 +322,14 @@ interface UIState {
    *  sharing strategy (or {kind:"cancel"} on dismiss). */
   askTerminalDrop: (req: TerminalDropRequest) => Promise<TerminalDropChoice>;
   resolveTerminalDrop: (choice: TerminalDropChoice) => void;
+  /** Open the scratchpad close prompt. Resolves with the user's choice
+   *  ("cancel" on dismiss). */
+  askScratchClose: (title: string) => Promise<ScratchCloseChoice>;
+  resolveScratchClose: (choice: ScratchCloseChoice) => void;
+  /** Open the promote picker. Resolves true when the pad became a file,
+   *  false on cancel/dismiss. */
+  askScratchSave: (taskId: string, tabId: string) => Promise<boolean>;
+  resolveScratchSave: (saved: boolean) => void;
   /** Mark a task for auto-restart on the next PTY exit. Called by
    *  dialogs that change spawn-time config and then kill the live agent so
    *  it relaunches with the new settings (the Sandbox dialog before
@@ -272,6 +361,17 @@ export interface Toast {
  *  deferral. Consumed by that deferred open, so entries never accumulate. */
 const withdrawnConfirms = new Set<string>();
 
+/** Shape the answer to match what the request asked for: a bare boolean for a
+ *  plain confirm, the full object once either checkbox is in play. Every exit
+ *  from a confirm (answered, dismissed, withdrawn) goes through here, so a
+ *  caller awaiting the object form can never be handed a boolean instead. */
+function confirmAnswer(
+  req: ConfirmRequest, confirmed: boolean, checked: boolean, dontAskAgain: boolean,
+): boolean | ConfirmResult {
+  if (!req.checkbox && !req.dontAskAgain) return confirmed;
+  return { confirmed, checked, dontAskAgain };
+}
+
 export const useUI = create<UIState>(set => ({
   newProjectOpen: false,
   newTaskProjectId: null,
@@ -281,7 +381,6 @@ export const useUI = create<UIState>(set => ({
   editCommandTaskId: null,
   runCommandsDialog: null,
   resumeOverrideTaskId: null,
-  taskCreateProgress: null,
   windowless: false,
   closePromptOpen: false,
   closePromptNonce: 0,
@@ -298,18 +397,27 @@ export const useUI = create<UIState>(set => ({
   projectPickerOpen: false,
   commandPaletteOpen: false,
   promptPaletteOpen: false,
+  syntaxPaletteFor: null,
   promptFire: null,
   renameRequest: null,
   busyMessage: null,
   fileTreeNonce: 0,
   confirm: null,
   terminalDrop: null,
+  scratchClose: null,
+  scratchSave: null,
   pendingPtyRestarts: new Set<string>(),
   toasts: [],
 
   openNewProject:    () => set({ newProjectOpen: true }),
   closeNewProject:   () => set({ newProjectOpen: false }),
-  openNewTask:  (projectId, seed) => set({ newTaskProjectId: projectId, newTaskSeed: seed ?? null }),
+  // Every open carries a fresh nonce, including a seedless one: "open the New
+  // Task dialog" means a fresh form even when it is already up for the same
+  // project, and only the store can guarantee the value actually changes.
+  openNewTask:  (projectId, seed) => set(s => ({
+    newTaskProjectId: projectId,
+    newTaskSeed: { ...(seed ?? {}), nonce: (s.newTaskSeed?.nonce ?? 0) + 1 },
+  })),
   closeNewTask: () => set({ newTaskProjectId: null, newTaskSeed: null }),
   openCustomCommand:  (projectId, mode = "repo_root") => set({ customCommandProjectId: projectId, customCommandMode: mode }),
   closeCustomCommand: () => set({ customCommandProjectId: null }),
@@ -319,7 +427,6 @@ export const useUI = create<UIState>(set => ({
   closeRunCommands:   () => set({ runCommandsDialog: null }),
   openResumeOverride: (taskId) => set({ resumeOverrideTaskId: taskId }),
   closeResumeOverride:() => set({ resumeOverrideTaskId: null }),
-  setTaskCreateProgress: (p) => set({ taskCreateProgress: p }),
   setWindowless: (v) => set({ windowless: v }),
   setClosePromptOpen: (v) => set({ closePromptOpen: v }),
   requestClosePrompt: () =>
@@ -338,6 +445,13 @@ export const useUI = create<UIState>(set => ({
   openRaceCompare:   (raceId) => set({ raceCompareId: raceId }),
   closeRaceCompare:  () => set({ raceCompareId: null }),
   openSandbox:       (taskId) => set({ sandboxForTaskId: taskId }),
+  commitReveal: null,
+  revealCommitInHistory: (taskId, sha) =>
+    // Un-hiding the right panel is RightPanel's job, not this store's: app.ts
+    // already imports this module, and reaching back the other way would make
+    // the two stores a cycle.
+    set({ commitReveal: { taskId, sha, at: Date.now() } }),
+  clearCommitReveal: () => set({ commitReveal: null }),
   closeSandbox:      () => set({ sandboxForTaskId: null }),
   openFileFinder:    (taskId) => set({ fileFinderTaskId: taskId }),
   closeFileFinder:   () => set({ fileFinderTaskId: null }),
@@ -349,6 +463,8 @@ export const useUI = create<UIState>(set => ({
   closeCommandPalette:() => set({ commandPaletteOpen: false }),
   openPromptPalette: () => set({ promptPaletteOpen: true }),
   closePromptPalette:() => set({ promptPaletteOpen: false }),
+  openSyntaxPalette: (taskId: string, tabId: string) => set({ syntaxPaletteFor: { taskId, tabId } }),
+  closeSyntaxPalette:() => set({ syntaxPaletteFor: null }),
   openPromptFire:    (prompt) => set({ promptFire: { prompt, body: prompt.body } }),
   closePromptFire:   () => set({ promptFire: null }),
   setPromptFireBody: (body) => set(s => (s.promptFire ? { promptFire: { ...s.promptFire, body } } : s)),
@@ -369,26 +485,20 @@ export const useUI = create<UIState>(set => ({
     new Promise<any>(resolve => setTimeout(() => {
       // Withdrawn during the deferral gap → never show it.
       if (req.key && withdrawnConfirms.delete(req.key)) {
-        resolve(req.checkbox ? { confirmed: false, checked: false } : false);
+        resolve(confirmAnswer(req, false, false, false));
         return;
       }
       set({ confirm: { req, resolve } });
     }, 0)),
-  resolveConfirm: (ok, checked) => {
+  resolveConfirm: (ok, checked, dontAskAgain) => {
     const c = useUI.getState().confirm;
-    if (c) {
-      if (c.req.checkbox) {
-        c.resolve({ confirmed: ok, checked: !!checked });
-      } else {
-        c.resolve(ok);
-      }
-    }
+    if (c) c.resolve(confirmAnswer(c.req, ok, !!checked, !!dontAskAgain));
     set({ confirm: null });
   },
   withdrawConfirm: (key) => {
     const c = useUI.getState().confirm;
     if (c?.req.key === key) {
-      c.resolve(c.req.checkbox ? { confirmed: false, checked: false } : false);
+      c.resolve(confirmAnswer(c.req, false, false, false));
       set({ confirm: null });
       return;
     }
@@ -402,6 +512,29 @@ export const useUI = create<UIState>(set => ({
     const d = useUI.getState().terminalDrop;
     d?.resolve(choice);
     set({ terminalDrop: null });
+  },
+  askScratchClose: (title) =>
+    // Same macrotask deferral askConfirm uses: this prompt is reached from a
+    // tab context-menu item, and a dialog mounted while Radix still holds its
+    // `pointer-events: none` lock on <body> restores that lock on close and
+    // leaves the whole window unclickable (GH #43).
+    new Promise<ScratchCloseChoice>(resolve =>
+      setTimeout(() => set({ scratchClose: { title, resolve } }), 0)),
+  resolveScratchClose: (choice) => {
+    const c = useUI.getState().scratchClose;
+    c?.resolve(choice);
+    set({ scratchClose: null });
+  },
+  askScratchSave: (taskId, tabId) =>
+    new Promise<boolean>(resolve =>
+      // Deferred like askConfirm / askScratchClose: this can open straight
+      // off the close prompt's "Save…" button, i.e. while another dialog is
+      // still unmounting (GH #43's pointer-events lock).
+      setTimeout(() => set({ scratchSave: { taskId, tabId, resolve } }), 0)),
+  resolveScratchSave: (saved) => {
+    const d = useUI.getState().scratchSave;
+    d?.resolve(saved);
+    set({ scratchSave: null });
   },
   markPendingPtyRestart: (taskId) => set(s => {
     const next = new Set(s.pendingPtyRestarts);

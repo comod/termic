@@ -65,6 +65,35 @@ gate, not a CSP tweak, per the note below.
 **Before widening the CSP again, remember it is app-wide.** `connect-src` or
 `script-src` would be materially worse than `img-src` is.
 
+## Known gap: one uncontained file read (`file_read_external`)
+
+Every other renderer → filesystem read is bounded by a task root
+(`safe_task_path` / `safe_task_read_path`, which reject absolute paths and
+`..` outright). `file_read_external` is the single exception, added for
+GH #240: a cmd+clicked absolute path in terminal output that resolves
+OUTSIDE the task has no task-relative form, so it cannot go through the
+contained read, and the tab it opens is read-only.
+
+What this adds is an arbitrary file **read** reachable from the webview. It
+is accepted, bounded three ways:
+
+- **Read only.** There is deliberately no absolute-path write counterpart.
+  `task_file_write` keeps its containment check, and the tab the read feeds
+  is `EditorState.readOnly` with its ⌘S path stubbed out. Nothing can be
+  mutated outside a task through this.
+- **Text only, capped.** The same 2 MB ceiling as the task read, plus a
+  UTF-8 requirement, so it is a text channel rather than a way to pull bytes
+  out of arbitrary binaries.
+- **Nowhere to send it.** The pinned CSP (`connect-src`, see
+  `src/lib/cspGuard.test.ts`) means an attacker who could invoke it has no
+  egress for the result.
+
+The residual risk is an XSS in our own UI turning into local file
+disclosure. That is strictly worse than before this command existed, and is
+the reason `connect-src` must not be widened (see the CSP rule in
+CLAUDE.md). The bounds above are pinned by `external_read_*` tests in
+`src-tauri/src/lib.rs`.
+
 ## Known gap: Monitor mode reaches the CLI control plane
 
 The CLI control socket (docs/plans/cli.md) is denied to `Enforce` /
@@ -77,8 +106,38 @@ is the accepted trade-off of Monitoring being a pure observer; the cage
 that actually enforces the boundary is `Enforce`/`EnforceFs`. (Same spirit
 as the webview gap above: a documented, accepted exposure, not a leak.)
 
+## Settled: a caged agent gets NO channel to another agent
+
+Recurring proposal, rejected 2026-08-24. The agent-to-agent protocol
+(docs/cli-agent-instructions.md) has one side prompt the other when its
+work is done, and an `Enforce` / `EnforceFs` agent cannot take part: it
+cannot reach the socket or read the token. The task menu's "Copy agent
+CLI briefing" prints a line saying so on caged tasks. That line is
+correct behaviour, not a TODO.
+
+Do not "fix" it by letting caged agents reach the control plane. The
+verbs are a straight escape (`new --sandbox off --yolo` spawns an uncaged
+agent; `apply` writes past the FS allow-list; `attach` types into an
+uncaged agent), so any proposal has to narrow them, and the narrow ones
+do not survive either:
+
+- **Report-back-only `send`.** Bounds the verb, not the payload. "Run
+  this for me" is text, and the recipient is uncaged.
+- **Reply-only addressing** (may only send to tasks that first sent to
+  it). Bounds the audience, not the payload, and picks the *worst*
+  audience: the one correspondent it is guaranteed to have is an agent
+  already collaborating with it, so the most likely to comply. This
+  makes the deputy more confused, not less.
+
+A cage with a text channel to something uncaged is not a cage. The
+supported way for a caged agent to report is the one the briefing
+prints: have it write a file inside its own worktree and read that from
+outside. If you need the prompt-back protocol, run the task in `Monitor`
+(which reaches the CLI by contract, see the gap above) or uncaged.
+
 ## Do NOT
 
 - Sandbox AuxTerminal, setup, run, or archive scripts.
 - Expose `task_set_sandbox` without SIGKILLing live PTYs by default. `kill_live=false` is an explicit escape hatch with a warning — don't make it the default.
 - Widen `tauri.conf.json`'s CSP without reading "Known gap" above. It applies to the whole webview, not to the component you are working on.
+- Give caged agents any path to another agent (control plane, scoped token, notify side channel). See "Settled" above for why the narrow versions fail too.

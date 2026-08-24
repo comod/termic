@@ -80,6 +80,17 @@ add it to branch protection once it's proven stable over ~20-30 runs.
 your real `termic_dev` data. Agent flows use `fakeagent` (`scripts/fake-agent.sh`)
 so no real tokens are spent.
 
+Worktree tasks land in `.e2e/tasks/` and **nowhere else**. They used to be
+created under `~/termic_dev/tasks/fixture-repo`, mixed in with the developer's
+own dev tasks, where nothing could safely clean them up: a run killed mid-spec
+left a worktree behind, and every later run then failed on `a worktree already
+lives at …` (or, once the directory was gone but the registration was not,
+`branch … is already checked out elsewhere`). `seed()` now wipes that directory
+and prunes the fixture repo's worktrees on every run.
+
+The task RECORDS are swept separately, by `wdio.conf.ts`'s `onPrepare` — that
+runs on every `test:e2e`, including runs that skip the seed script.
+
 The seeded `fixture-repo` carries an `origin` remote (a sibling bare repo,
 `.e2e/fixture-repo-origin.git`) so `origin/main` resolves like a real cloned
 checkout. This matters because the project default base is `origin/main`: any
@@ -159,9 +170,51 @@ describe("my feature", () => {
 });
 ```
 
+### The window is hidden, so nothing animates
+
+`document.hidden` is `true` for the whole run: the harness never brings the
+window to the front. WebKit freezes `requestAnimationFrame` in a window it
+believes is occluded, so **no rAF callback ever fires** in a spec. Anything the
+app defers to a frame is deferred forever.
+
+CodeMirror schedules its layout measurement that way. Until it runs, CM's
+height map holds its unmeasured default of 14px per line while the rendered
+lines are really 20, so each gutter number sits 6px above its code and the gap
+grows down the file. A gutter-alignment spec then reports exactly the drift it
+exists to catch, produced entirely by the harness. Waiting does not help: the
+frame is never coming.
+
+`flushEditorMeasure()` in `helpers.ts` runs the pending measure synchronously
+(via `coordsAtPos`, whose public read flushes it) and returns how many editors
+it touched, so a CodeMirror upgrade that moves the view handle fails loudly
+instead of silently going back to measuring nothing. **Call it before reading
+any geometry out of a CodeMirror editor.**
+
+The same applies to product code that leans on rAF: it is invisible in a spec.
+`cd359ba` moved the command palette's deferred effect from rAF to a macrotask
+for the user-facing half of this (a palette command fired minutes late, over
+whatever the user was doing by then, once the window came back).
+
 ## The one maturity caveat
 
 `@wdio/tauri-service` + `tauri-plugin-wdio` are young (1.x, late-2025 / 2026).
 They are maintained by the WebdriverIO org, but if a version regresses, pin the
 last-known-good `@wdio/*` and `tauri-plugin-wdio` together (they release in
 lockstep). The bridge/`e2e` skill remains as a fallback for manual checks.
+
+## Typechecking the specs
+
+`npm run typecheck:e2e` (`tsc -p e2e/tsconfig.json --noEmit`) covers `e2e/`,
+`perf/` and both wdio configs. None of it is in the app's `tsc -b` project, so
+`npm run build` says nothing about it, and by the time anyone looked there were
+71 errors: mostly spec-scope `let taskId: string | undefined` flowing into
+`browser.execute`, whose callback param then cannot index the store, plus two
+perf report units that were simply not in the union they claimed. It runs in CI
+beside the unit tests now.
+
+Two conventions that keep it clean. Spec-scope ids are declared with a definite
+assignment (`let taskId!: string`) because a before hook assigns them and the
+after hooks still guard at runtime. And anything read out of `window.__termic`
+is annotated at the boundary: the store is loosely typed, so an unannotated
+value passed into another `execute` arrives as WebdriverIO's `HTMLElement`
+union and every use of it is an implicit any.

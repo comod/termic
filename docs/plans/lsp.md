@@ -1,12 +1,17 @@
-# Language servers (design + findings)
+# Language servers (spec + findings)
 
-Status: proposed, not started. Opt-in, off by default.
+**Approved** (GH #174, the code-navigation half; the commenting half shipped in
+0.27.0). Opt-in, off by default, not started.
 
-Code navigation via LSP: go-to-definition, find usages, hover types, completion,
-rename. Written up so the decisions (and the traps) survive the investigation
-that produced them. Every number below was measured on a real repo, not quoted.
+Code navigation via LSP: go-to-definition, find usages, hover types,
+completion. Every number below was measured on a real repo, not quoted.
 
-Goal: enough navigation to replace PyCharm.
+**Goal: navigate the code the agent is changing, in the task you are already
+in.** Deliberately not "replace PyCharm" — that goal argues for owning rename,
+refactors and the endless tail of "but PyCharm also does X", and it makes
+phase 3 definitional rather than optional. What termic owes the user is the
+ability to follow a symbol through the diff an agent just produced without
+leaving the window.
 
 Non-goal: becoming an IDE. Off by default, one process per language per task
 at most, nothing bundled in the `.app`, nothing running until the user opts in.
@@ -59,24 +64,42 @@ first-party; Django 5.0.9; Python 3.13. Symbol under test: a model class used
 
 ### Cost model
 
-The important shape: **memory is driven by find-references, not by having a
-server open.**
+The August 2026 pass measured every server it could run. Two conclusions
+replace what this section used to say.
 
-| Phase | RSS (ty) |
-|---|---|
-| Boot + open a file | 49 MB |
-| After first find-references | 250 MB |
-| After a 20-keystroke burst | 250 MB (typing is free) |
-| After 20 s idle | 250 MB (**never released**) |
+**There is no single memory shape.** The doc previously generalised ty's
+behaviour — cheap until find-references, then permanently expensive. That is one
+of two patterns:
 
-Browsing with hover and ⌘-click costs ~50 MB per task. The 250 MB is the
-workspace index, built on demand the first time the user asks for usages, and
-never given back. Two full-featured tasks (repo root + one worktree) measured
-**508 MB combined**.
+| Server | After opening a file | After workspace find-references |
+|---|---|---|
+| ty | 15-49 MB | 250 MB, never released |
+| TypeScript 7 (termic, 307 files) | **276 MB** at project load | +1 MB, 9 ms — queries are free |
+| rust-analyzer (termic `src-tauri`) | **3,184 MB** | (already paid at index) — 3,077 MB 20 s later |
+| gopls (prometheus, 727 files) | 1,086 MB | **3,241 MB**, retained |
+| gopls (kubernetes, 17.9k files) | 1,460 MB | **6,813 MB** → 5,112 MB after 60 s |
+| clangd (abseil, 284k LOC) | — | **1,270 MB** peak |
+| jdtls | ≥1 GB floor (`-Xms1G` hard-coded) | vendor default caps heap at 2 GB |
+| Intelephense (Laravel, 3k files) | 394 MB | 479 MB |
+| sourcekit-lsp | ~32 MB — but **fans out >ncpu `swift-frontend` children** | |
 
-Since idle never reclaims, **killing the process is the only way to get the
-memory back**. That is what makes the lifecycle policy below load-bearing rather
-than decorative.
+So TypeScript pays at project load and answers queries for free; Go, Python and
+C++ pay on first find-references; Rust pays everything at index. All of them
+**keep it** — rust-analyzer's LRU eviction is literally commented out in source,
+and gopls and ty never shrink either. Killing the process remains the only way
+to reclaim.
+
+**The old "~800 MB worst case" was wrong by an order of magnitude.** A single
+Go task on a large repo can exceed it six times over, and four Rust tasks on
+termic's own `src-tauri` would reach 12 GB. Consequences for the lifecycle
+policy below: the cap must be a **memory budget, not a count of three**, the
+Activity window becomes the place this is visible and killable, and idle reap
+matters more than it looks.
+
+One thing that does NOT change: per-(task, language) is still required. Two
+worktrees of one repo share module paths, so a shared server would resolve an
+import into the wrong copy. That is a correctness bug, not a tuning knob, and
+the memory cost is the price of it.
 
 ### TypeScript 7 (verified end to end)
 
@@ -129,44 +152,112 @@ June 2026. `tower-lsp` is for *writing* servers; not applicable.
 No WebSocket, no localhost port, no daemon, **no CSP change** (all three are
 forbidden by CLAUDE.md, and none is needed).
 
-## Three hard requirements
+## The client contract
 
-Each of these silently breaks the feature. All three were found by measurement,
-not by reading docs.
+Thirteen servers were researched, one per language, each driven live where a
+runtime was available. The single biggest finding is that **there is no such
+thing as a generic LSP client here.** Servers disagree with each other on the
+basics, and every disagreement below was observed, not read off a spec. Get
+these wrong and the failure is silence or confident wrongness, never an error
+dialog.
 
-### 1. The Rust host must answer server→client requests
+### 1. Answer server→client requests, and answer them in the exact shape
 
-It cannot be a dumb pipe. It must intercept and answer `workspace/configuration`
-(reply `[null]`, one per requested item), `window/workDoneProgress/create` and
-`client/registerCapability`.
+Not a dumb pipe. The rule is **advertise capabilities deliberately, then answer
+everything you advertised** — most of these requests are only sent because the
+client claimed to support something.
 
-**`@codemirror/lsp-client` replies `-32601 MethodNotFound` to every
-server-initiated request.** ty defers *every* incoming request until its
-workspaces initialize; it recovers from a `null` config response but an *error*
-response wedges it permanently, with no timeout and no fallback (verified in
-`session.rs` in astral-sh/ruff). Observed failure: **every request times out and
-the server sits idle doing nothing.**
+| Server | What an error/omitted reply does |
+|---|---|
+| pyright / basedpyright | **Process exits.** An error reply to `client/registerCapability` or `workspace/diagnostic/refresh` becomes an unhandled promise rejection and aborts Node. |
+| ty | **Hangs forever.** Its `workspace/configuration` handler is the only thing that queues workspace init; every later request parks behind it. |
+| ty | **Panics** if the config array length ≠ the number of requested items. Reply `[]` to a 1-item request → assertion failure and exit. |
+| zls | Never resolves *any* config, including the path to `zig` — sits half-initialized. |
+| TypeScript 7 | Deadlocks: the next `textDocument/diagnostic` hangs until timeout. |
+| phpactor, Expert | `window/showMessageRequest` blocks find-references (10s soft, 60s hard) / blocks forever on an `:infinity` timeout. |
 
-The same client bug degraded pyrefly differently and more dangerously: it
-returned **9 references instead of 309**, instantly and confidently. Silently
-wrong is worse than broken.
+**The canonical reply to `workspace/configuration` is `[null]` — one `null` per
+requested item.** That satisfies every server tested, sidesteps ty's panic and
+its hang together, and means nothing has to be understood about the sections
+being asked for.
 
-Alternative fix: do not advertise `workspace.configuration` at all, and ty falls
-back to `initializationOptions`.
+`@codemirror/lsp-client` replies `-32601 MethodNotFound` to every
+server-initiated request, so this must be fixed in our host regardless. That
+same client bug is what made pyrefly return **9 references instead of 309**,
+instantly and confidently — the failure mode this whole document is organised
+around.
 
-### 2. Declare pull-diagnostics capability
+Cheapest posture: do NOT advertise `window.workDoneProgress` until we render
+progress (pylsp blocks ~1s per linter per pass waiting for a reply we never
+send), and do not advertise dynamic registration we do not implement.
 
-TypeScript 7 implements **`textDocument/diagnostic`** (pull) only. Push
-(`publishDiagnostics`) fires for config-file errors and nothing else; the PR to
-add per-file push is still unmerged. A client that declares only push capability
-gets **zero squiggles**.
+### 2. Implement pull AND push diagnostics, and pick per server
 
-### 3. Always set an explicit workspace root
+Five distinct patterns across thirteen servers. There is no majority to code to:
 
-Open a loose file with no root and ty indexes `$HOME` (upstream bug ty#2769).
+- **Pull only** — TypeScript 7, Kotlin, ruby-lsp, Roslyn. A push-only client
+  gets zero squiggles, silently. Roslyn additionally needs
+  `textDocument.diagnostic.dynamicRegistration: true` advertised or it sends
+  nothing at all.
+- **Push only** — zls, Expert, jdtls, gopls (pull exists but is off by default),
+  clangd, Intelephense, phpactor.
+- **Dynamic** — sourcekit-lsp advertises no `diagnosticProvider` at
+  `initialize`; it registers pull *after* the first `didOpen` and infers support
+  from whether the client accepts the registration. Reject it and you silently
+  drop to push.
+- **Hybrid, both at once** — rust-analyzer advertises pull for its own
+  diagnostics *and always pushes* `cargo check` results, ungated. **A pull-only
+  client silently loses every compiler error.**
+- **Conditional** — ty, zuban and ruff-server stop pushing the moment the client
+  claims pull support. Claim it and you must actually poll it.
+
+### 3. Send BOTH `rootUri` and `workspaceFolders`, and set the child's cwd
+
+Servers disagree outright, and one of them treats it as fatal:
+
+| Server | Reads |
+|---|---|
+| clangd | `rootUri` only — never looks at `workspaceFolders` |
+| ruby-lsp | `workspaceFolders[0]` only — never reads `rootUri` |
+| **phpactor** | **exits on startup** if `rootUri` is null |
+| ty, ruff-server, pyright | ignore `rootUri` |
+| jedi-ls | ignores `workspaceFolders` |
+| rust-analyzer, ty, ruff-server | fall back to the **process cwd** |
+
+So: always send both, and always spawn with `cwd` set to the task worktree.
+Getting the last one wrong is not cosmetic — ty will index the user's entire
+home directory (ty#2769), and rust-analyzer will index whatever directory
+termic happened to be launched from.
 
 Also handle `-32801 ContentModified` and retry: ty can drop an in-flight
 references response if a `didOpen` races it (ty#3061).
+
+### 4. Export the environment, and never sandbox a server
+
+sourcekit-lsp's own client-authoring guide is explicit: *"don't attempt to use
+SourceKit-LSP in a sandboxed context"* and *"provide the current system
+environment variables … don't wipe them all out"*. That matches the decision in
+[sandbox.md](../sandbox.md) — only the agent CLI PTY is in the threat model —
+but it is now an upstream requirement rather than our preference. Python
+additionally needs `VIRTUAL_ENV` exported: it is the only interpreter mechanism
+every candidate except pyright honours.
+
+### 5. Worktrees break servers that assume one project per machine
+
+Three servers key state by something that collides across our worktrees:
+
+- **jdtls** defaults its Eclipse workspace to
+  `~/Library/Caches/jdtls/jdtls-<sha1(basename(cwd))>` — hashed over the
+  **leaf directory name**, so two worktrees of the same repo silently share one
+  index. Pass `-data` explicitly, per task.
+- **Intelephense** defaults `storagePath` to `os.tmpdir()`; parallel tasks
+  contend on one cache. Set it per worktree.
+- **ruby-lsp** writes a *composed bundle* into `.ruby-lsp/` **in the project
+  root** and runs `bundle install` there, so every worktree pays that cost on
+  first start.
+
+And **gopls relies on the client for file-change notification**: a branch
+switch or an agent's rewrite that we do not report leaves it stale.
 
 ## Server registry: declarative manifests
 
@@ -229,30 +320,63 @@ per-asset `digest` field is the reliable source. Do not resolve `latest` at runt
 
 ## Lifecycle
 
-Servers are **per (task, language)**. They cannot be shared across tasks: each task
-is a git worktree, so the files are at different paths *with different content*.
-A shared server would send go-to-definition into the wrong worktree's copy. That is
-a correctness bug, not a tuning knob.
+**One LSP instance per checkout, per language** — where a checkout is the main
+repo or a worktree, and the two are treated identically. The key is the resolved
+workspace root; it is NOT the task.
 
-LSP's `workspaceFolders` (one server, many roots) saves only the process baseline,
-not the index, and couples task lifetimes and crashes. Not worth it.
+"Checkout" is the honest unit. Tasks are a layer above it, and "one task, one
+checkout" is false in both directions:
+
+- **Several tasks can share one checkout.** A main-checkout task
+  (`is_main_checkout`) runs in the project's `root_path` itself, and nothing
+  stops several existing at once. Same directory, same bytes, same branch — so N
+  of them need **one** server between them, not N. At rust-analyzer's ~3.1 GB or gopls's 3-6 GB, that
+  is the difference between a second main-checkout task being free and it costing
+  another few gigabytes for an identical index.
+- **One task can span several checkouts.** A multi-repo task holds several
+  members, each with its own root (`kind: "host" | "worktree" | "repo_root"`), so
+  it wants one server per member checkout per language.
+
+**Separate checkouts still get separate servers, and that part is not
+negotiable.** Two worktrees are different paths holding *different content*, and
+they share module paths — an import resolved in the wrong copy is a correctness
+bug, not a tuning knob. That is where the memory genuinely buys something.
+
+Refcount, therefore: spawn on the first task that has code navigation enabled and
+opens an editor tab of that language at that checkout; reap when the last such
+task closes. The *grant* is refcounted the same way and on the same tasks (see
+Opt-in), so when a checkout's last task goes, both the server and the permission
+to run one go with it. Two consequences for the UI: turning navigation off in one task must not
+kill a server another task is still using, and **"stop this server now" stops it
+for every task sharing that root** — say so on the button rather than surprising
+someone.
+
+LSP's `workspaceFolders` (one server, many *unrelated* roots) is a different idea
+and still not worth it: it saves only the process baseline, not the index, and it
+couples task lifetimes and crashes.
 
 Memory is therefore controlled by lifecycle:
 
-- **Lazy spawn.** Only when an editor tab of that language is open in that task.
+- **Lazy spawn.** Only when an editor tab of that language is open in a task
+  using that root.
   This fits termic unusually well: most of the time a task is open, the user is
   watching an agent in a terminal, not editing. The agent does not need the server.
   Six open tasks with no editor tabs cost zero.
 - **Idle reap.** When the last editor tab of that language closes, shut down after
   a few minutes' grace. Tab bounces do not pay the restart; walking away frees the
   memory.
-- **LRU cap.** Ceiling of ~3 live servers, evict least-recently-used. Reopening
-  costs a re-index (seconds).
+- **A memory budget, not a server count.** ~3 servers was sized against ty's
+  250 MB. Measured reality spans 32 MB (sourcekit-lsp) to 6.8 GB (gopls on
+  kubernetes), so the cap has to be RSS-aware: evict least-recently-used until
+  the total is under budget, and refuse to spawn a new server when already over
+  it. `rust-analyzer/memoryUsage` gives per-server RSS for free where supported.
 - **Register in `cleanup_children`** (`lib.rs:8373`, wired to `RunEvent::Exit`).
   Forget this and rust-analyzer survives app quit and eats a core.
 
-Steady state is 1-2 servers, because a human edits in one task at a time. Worst
-case under the cap is ~800 MB.
+Steady state is 1-2 servers, because a human edits in one task at a time. The
+worst case is no longer estimable as a single number — see the cost model above
+— which is exactly why the budget is dynamic and surfaced in the Activity
+window.
 
 ## Document model (prerequisite work)
 
@@ -260,15 +384,35 @@ There is **no document registry today**. Every editor tab creates a fresh
 `EditorView` from a fresh disk read. Nothing tracks "what is open", no version
 counter, nothing for `didOpen`/`didChange`/`didClose` to sync against.
 
-The trap: **`openPreviewTab` recycles a preview tab in place** (`store/app.ts:1889`),
+**This phase is not "nothing visible".** It is the phase that has to be correct
+or everything above it is quietly wrong, and wrong here does not raise errors,
+it returns confident bad answers.
+
+The trap: **`openPreviewTab` recycles a preview tab in place** (`store/app.ts`),
 mutating the tab's `path` **without ever firing a close**. A naive tab-diff leaks
 `didOpen`s and desyncs the server model, which produces wrong results rather than
-errors.
+errors. There is now precedent for exactly where the `didClose`/`didOpen` pair
+belongs: that same recycle path already resets `syntax` / `syntaxAuto` because a
+recycled slot is a DIFFERENT file (shipped in 9f8b487). Whatever it resets
+there, the registry must close there.
 
 Needed before any LSP code:
 
 - A `(taskId, path) -> { version, languageId }` registry, driven by
   `openPreviewTab` / `closeTab` / the mount effect.
+- **`languageId` comes from `lib/languages.ts`** — `effectiveLanguageId` is
+  already the one place a language is decided, and it folds in the user's manual
+  Set-syntax pick. Those ids are CodeMirror's registry NAMES ("Shell",
+  "Properties files", "C++"), NOT the LSP spec's vocabulary, so the registry
+  owns a small explicit name → LSP-`languageId` table (`Shell` →
+  `shellscript`, `Properties files` → `ini`). See
+  [docs/ui.md](../ui.md#which-language-and-where-that-is-decided). Note it is
+  the PANE that resolves a path, not `lib/languages.ts`, which never sees one.
+- **Decide what a URI-less buffer is.** Scratchpads (GH #244) are editor tabs
+  with no path at all, so they either model as an untitled document or are
+  excluded outright. Excluded is the right v1 answer — a language server has
+  nothing useful to say about a note — but it has to be a decision, because the
+  registry keys on path and a scratch tab would key on `undefined`.
 - Forward the `ExternalReload` path too (`EditorPane.tsx:299`): a disk-change
   reload is a full-document `didChange`.
 - Debounce `didChange`. It fires per keystroke.
@@ -289,6 +433,25 @@ the file tree, plus an explicit read-only bypass of the containment check.
 Phases 1-2 give nice navigation. **This phase is what makes it a PyCharm
 replacement.** It is not optional for the stated goal.
 
+## The hover surface is already partly claimed
+
+Inline blame (shipped, see [ui.md](../ui.md)) shows its commit card as a CodeMirror
+tooltip, so phase 1's hover no longer has the surface to itself. Blame does NOT use
+`hoverTooltip`: it drives `showTooltip` from its own state field, opened by the
+annotation's own `mouseenter` after a 1s delay and anchored at the line's end. So the
+two can coexist without both registering a hover source and racing, but they can
+still overlap on screen. The decision, so it is not discovered mid-implementation:
+
+**Code hover and annotation hover stay separate, and only one card is ever on
+screen.** Separation needs no arbitration — blame's annotation is a
+`Decoration.widget({ side: 1 })` past `line.to`, where there is no symbol, so an
+LSP `hoverTooltip` source returns null over it, and blame is not a hover source
+at all. What DOES need a rule is both wanting the screen at once: a hover on a
+symbol near the end of a line whose blame card is anchored at that line's end.
+There, **hover wins** — hover is a question the user asked, blame is ambient.
+Blame's card suppresses itself while an LSP tooltip is open on the same line;
+its existing `cancelClose` / `closeCardSoon` lifecycle is where that hooks in.
+
 ## Security
 
 - **Sanitize hover/completion HTML.** Servers return Markdown that gets rendered to
@@ -302,67 +465,245 @@ replacement.** It is not optional for the stated goal.
 - **Content-Length is bytes, not characters.** The classic hand-rolled-framer bug;
   it bites on the first non-ASCII docstring.
 
-## Recommended default set
+## Shipped manifests
 
-| Language | Server | Download | Runtime |
+One research pass per language, August 2026. Every row below has a named server,
+a licence, and a reason for its tier. Sizes and memory figures are measured
+unless marked otherwise.
+
+The expensive part of supporting a language is **not the manifest, it is the
+installer**: a manifest is a dozen lines of TOML, while an `[server.install]`
+block is a pinned version plus a per-platform SHA-256 to re-pin on every
+upstream release, and a claim that we tested that server.
+
+### Tier 1 — we pin a version + SHA-256 and download it
+
+| Language | Server | Licence | Download | Also needs |
+|---|---|---|---|---|
+| TypeScript / TSX / JS | **TypeScript 7** (`tsc --lsp --stdio`) | Apache-2.0 | 8.84 MB tarball, GitHub release, SHA-256 verified | nothing |
+| Python | **ty** (nav) + **ruff server** (lint) | MIT | ~12 MB arm64 binary | nothing |
+| Rust | **rust-analyzer** | MIT OR Apache-2.0 | 13.2 MB `.gz` → 35.7 MB binary, GitHub `digest` verified | the user's Rust toolchain (`cargo`, `rust-src`, `rust-analyzer-proc-macro-srv`) |
+| C# | **Roslyn language server** | **MIT** | 66 MB `.nupkg` from nuget.org, immutable URL, SHA-256 verified | .NET 10 runtime **and** SDK on PATH |
+
+Four traps that are conditions of shipping these, not footnotes:
+
+- **TypeScript 7 is not one file.** The binary needs ~3 MB of sibling
+  `lib.*.d.ts` (26 MB extracted). Ship only the executable and the CLI panics —
+  but **LSP mode silently returns zero diagnostics**. Ship `package/lib/` whole.
+- **rust-analyzer: never ship the rustup component.** It is dynamically linked
+  against `librustc_driver` and `libLLVM`, which are not in its tarball; it only
+  runs inside a toolchain tree. Use the standalone GitHub release, but probe
+  `rustup which rust-analyzer` first and prefer it — a pinned build hard-rejects
+  toolchains below its `MINIMUM_SUPPORTED_TOOLCHAIN_VERSION` (1.94 today, and it
+  moves, so a pin we ship now will start refusing older toolchains over time).
+- **C# is MIT via NuGet only.** The restrictive terms attach to the marketplace
+  **VSIX** and to **C# Dev Kit** (usable only with Microsoft products). Take the
+  NuGet package; never ship the VSIX; never touch Dev Kit. Its `--daemon-mode`
+  escapes the process tree via `setsid` and conflicts with `cleanup_children` —
+  opt-in at most.
+- **ty's find-references needs re-verifying against the pinned build.** The
+  earlier shootout in this doc measured ty 0.0.59 returning 251 of 309
+  references; the August 2026 pass measured current ty as complete and
+  workspace-wide. Both cannot be true of one version. Pin, re-run the Django
+  case, and only enable find-references if the pinned build is correct — ship
+  goto-def and hover regardless.
+
+### Tier 1½ — probe the toolchain, then resolve a matching server
+
+Neither a fixed pin nor PATH-only. Where the server is version-locked to a
+compiler, the correct move is to read the toolchain version first and fetch the
+server that matches it, SHA-verified from the official index.
+
+**Zig** is the case that forced this category. `zls` is otherwise an ideal tier-1
+candidate — 3.6 MB static binary, MIT, SHA-256s published at
+`builds.zigtools.org/index.json` — but a tagged `zls` **hard-refuses nightly
+Zig**, and much of the Zig community tracks master. A fixed pin would ship users
+a server that rejects their compiler. (Today there is additionally no working
+zls for Zig master at all, pending an upstream build-system rework.)
+
+### Tier 2 — PATH-only manifests, no installer
+
+Same format, no `[server.install]`. Present → we drive it. Absent → the language
+has no navigation and we offer nothing.
+
+| Language | Server | Licence | Why not tier 1 |
 |---|---|---|---|
-| TypeScript / TSX | TypeScript 7 native | 9.3 MB | none |
-| Python | ty (nav) + ruff (lint) | ~50 MB | none |
-| Rust | rust-analyzer | 13.9 MB | none |
-| Go | gopls | `go install` | Go (already present) |
+| Go | **gopls** | BSD-3 | **No official prebuilt binary exists** — every release has zero assets, `go install` is the only path — and it needs `go` on PATH at runtime anyway |
+| Swift | **sourcekit-lsp** | Apache-2.0 w/ Runtime Library Exception | Toolchain-bundled; all 7 GitHub releases carry zero assets. It must match the user's `sourcekitd`, so pinning would break correctness rather than guarantee it |
+| Java | **jdtls** | EPL-2.0 | A 48 MB OSGi/JVM app; the real dependency is a JDK 21+ we cannot ship (plus Python 3.9+ for its launcher) |
+| Kotlin | **JetBrains `kotlin-lsp`** | Apache-2.0 source, proprietary parts in the binary | 370 MB, **Alpha**, and its builds **hard-expire on a timer** — a pinned SHA would become a scheduled outage. Homebrew avoids that and the Gatekeeper quarantine |
+| C / C++ | **clangd** | Apache-2.0 w/ LLVM exception | 93.6 MB → 383 MB extracted, ~1.3 GB RSS, and without a compile DB it emits **fabricated errors inside libc++** |
+| Ruby | **ruby-lsp** | MIT | A gem with a C extension, zero release assets; must run under the project's own Ruby and Bundler |
+| PHP | **Intelephense**, else **phpactor** | proprietary EULA / MIT | Neither is a static binary, and neither runtime ships with macOS (**PHP was removed in Monterey**). See the licence note below |
+| Elixir | **Expert** | Apache-2.0 | Prebuilt binaries exist, but it locates and compiles against the *project's* `elixir`/`erl`, so downloading buys nothing a PATH lookup does not |
 
-~73 MB of optional on-demand downloads, every one a single static binary, covering
-the languages termic users actually write. Nothing ships in the `.app`.
+Notes that belong in the UI, not just here:
 
-**Skip:** JSON, Markdown, HTML/CSS (CodeMirror already wins in-process, no
-subprocess), bash, and clangd (93 MB universal binary that also needs
-`compile_commands.json`).
+- **Intelephense is proprietary, freemium, and phones home.** Its EULA
+  *explicitly permits* an LSP client driving it, and goto-def / find-references /
+  hover are free-tier (verified from a live `initialize`), so PATH-only use is
+  legitimate. But §5(c) forbids redistribution, so **auto-downloading it would
+  automate acceptance of a licence the user never sees** — the exact complaint
+  filed against Helix. It also bundles Azure Application Insights telemetry,
+  which contradicts termic's on-device claim unless we say so plainly. Prefer it
+  when present, fall back to **phpactor** (MIT) otherwise, and label both.
+- **Swift navigation needs a build server.** `.xcodeproj` / `.xcworkspace` are
+  **not supported at all** — zero occurrences in sourcekit-lsp's tree. Cross-file
+  goto-def in a bare directory returns `null`. Users need `Package.swift`, or a
+  bridge like `xcode-build-server` producing `buildServer.json`. Say so rather
+  than shipping a server that looks broken.
+- **Detecting Swift is not a PATH lookup.** `/usr/bin/sourcekit-lsp` is a 116 KB
+  xcselect **shim** that exists on a Mac with no developer tools and pops an
+  installer dialog when exec'd. Probe `xcode-select -p` (exit 0 **and** the
+  directory exists), then `xcrun --find sourcekit-lsp`. Command Line Tools alone
+  is sufficient — Xcode is not required.
+- **`/usr/bin/java` proves nothing** either; bare macOS ships a stub. Detect via
+  `/usr/libexec/java_home -v 21+`.
+
+### Skipped, with reasons
+
+- **JSON, Markdown, HTML/CSS** — CodeMirror already wins in-process. A
+  subprocess to report a misspelled JSON key is a bad trade.
+- **bash** — weak servers, thin payoff.
+- **Microsoft cpptools** — **licence forbids it.** Usable "only with" Microsoft
+  products, and redistribution as a stand-alone offering is prohibited. Not even
+  tier 2.
+- **C# Dev Kit** — proprietary, Microsoft-editors-only. Not needed: the Roslyn
+  server asserts `isUsingDevKit == false` on the path we use.
+- **Dead projects**, named so nobody re-proposes them: `fwcd/kotlin-language-server`
+  (deprecated by its own author in favour of JetBrains'), **OmniSharp** (no
+  release since Nov 2025, dropped by vscode-csharp), `lexical` and `next-ls`
+  (both archived; next-ls redirects to Expert), `felixfbecker/php-language-server`
+  (dead since 2018), `sourcegraph/go-langserver` (archived 2022).
+- **Watch, do not ship**: `kmp-lsp` (Rust, Kotlin, no type checking), `Dexter`
+  (Go, Elixir, no BEAM needed), `Mago` and `phpantom_lsp` (PHP, Rust). All under
+  a year old. Re-evaluate in six months.
 
 ### Python server choice, honestly
-
-- **ty** is the default: single MIT binary, lightest of the full-featured servers,
-  workspace-wide find-references correct **by default** (pyright and basedpyright
-  default to `diagnosticMode: openFilesOnly`; pyrefly has an undocumented 2000-file
-  index cap). But it is **0.0.x**, it missed a real reference in our measurement,
-  and it scores 71.6% on the typing-conformance suite with reports of ~80% false
-  positives on real code. **Use ty for navigation and ruff for diagnostics. Do not
-  surface ty's type errors.** Note also Astral is being acquired by OpenAI (ty stays
-  MIT).
-- **zuban** is the one to watch: **150 MB** (a third of the alternatives), all 309
-  refs, best completions, **99.3% conformance (highest of anything tested)**, by the
-  author of Jedi. It is AGPL-3.0-only, which is a **non-issue**: termic is
-  AGPL-3.0-or-later, and spawning a binary over a stdio pipe is mere aggregation
-  regardless. The blocker is maturity (rename has broken stdlib code in third-party
-  testing), not law.
-- **pyrefly** is not the default despite Meta backing and PyCharm shipping it: in
-  PyCharm it is **opt-in and type-only, and JetBrains kept their own engine for
-  find-usages, goto-def and rename.** It was also the heaviest thing measured.
-- **basedpyright** is the safe fallback (MIT, mature, correct) but drags a Node
-  runtime and 451 MB.
 
 ## Phasing
 
 | Phase | Work | Ships |
 |---|---|---|
 | 0 | Document registry; extract `gotoLocation()` | nothing visible; unblocks all |
-| 1 | Rust LSP host + Channel transport + one server, default-OFF pref | hover, diagnostics, goto-def |
+| 1 | Rust LSP host + Channel transport + TypeScript 7 AND Python, default-OFF pref | hover, diagnostics, goto-def |
 | 2 | Find-references panel, completion, signature help, rename | the PyCharm core |
 | 3 | Read-only external-file tabs | ⌘-click into site-packages |
-| 4 | Declarative manifests + Settings section | rust-analyzer, gopls, TS7 for free |
+| 4 | Declarative manifests + Settings section | tier 1 completed (rust-analyzer, Roslyn) AND the whole tier-2 PATH-only set (Go, Swift, Java, Kotlin, C/C++, Ruby, PHP, Elixir) + Zig via toolchain probe |
 | 5 | `[server.install]` download with pinned checksums | works without a toolchain |
 
-Value is concentrated in 0-2. Phase 3 is the difference between "nicer editor" and
-"PyCharm replacement".
+Value is concentrated in 0-2, which is the whole of the stated goal. Phase 3
+buys ⌘-click into dependency source; it is worth doing and it is not what the
+feature is for, so it does not gate calling this done.
 
-## Opt-in
+**Phase 1 ships TypeScript 7 and Python together.** TS7 is the strongest
+measured case and needs no runtime, it is dogfooded in this repo every day, and
+it does not depend on settling ty vs zuban. Python ships alongside it with
+goto-def and hover only (see the Python section: no find-references until a
+server earns it), so the open question below blocks a feature, not the phase.
 
-A per-**project** toggle (not per-task; re-enabling per task is a paper cut). With
-it off, nothing spawns, nothing is imported, and the editor is byte-for-byte what
-it is today. Default OFF, following the existing `loadRemoteImages` pattern
-(`prefs.ts`).
+## Opt-in: "Code navigation"
 
-Discovery should not depend on browsing Settings: prompt contextually in the editor
-the first time it would help.
+**Arming happens at one place: a task, for that task's checkout.** Given the
+measured cost (rust-analyzer ~3.1 GB per checkout, gopls up to 6.8 GB, none of it
+ever released), a blanket inherited "on" is a bill the user did not agree to,
+arriving from a process they did not start.
+
+The app-wide pref survives in one demoted role only: **whether the feature is
+offered at all** (default OFF, `prefs.ts`, alongside `loadRemoteImages`). With it
+off, nothing is imported, no affordance appears, and the editor is byte-for-byte
+what it is today. With it on, the *offer* exists — a task can now be armed. It
+never turns navigation on anywhere by itself.
+
+### Per-project auto-enable: three choices, because the cost shape differs
+
+A project may standing-instruct termic to arm new checkouts for it. Deliberately
+NOT a boolean, because "arm the main checkout" and "arm every worktree" are
+different orders of magnitude and a single "on" would hide that:
+
+| Setting | What it arms | What it costs |
+|---|---|---|
+| **Off** (default) | Nothing. Each task asks. | Nothing until you say so. |
+| **Main checkout only** | The project's main repo, automatically. Worktree tasks still ask. | **Bounded: one server per language, ever.** Every task on the main checkout shares it, so the tenth costs what the first did. |
+| **Main checkout and worktrees** | Every checkout in the project, automatically. | **Unbounded: one server per language PER WORKTREE.** Ten worktree tasks is ten servers and ten indexes; at rust-analyzer's ~3.1 GB that is ~31 GB. |
+
+The middle option exists because it is the one most people actually want and it
+is genuinely cheap: reading the code you are supervising, in the checkout that
+never goes away, at a fixed cost that does not grow with how many agents you run.
+
+The third option is for someone who reviews every worktree's diff in an editor rather
+than in the terminal — a real workflow, and the only one that justifies paying
+per task. The UI must state the multiplication in the option itself, not in a
+tooltip: it is the difference between one server and one per agent you spawn.
+
+Lives on the `Project` record in `projects.json` (machine-local), next to
+`default_sandbox` and `spotlight_enabled` — **not** in `.termic.yaml`. That file
+is committed and team-shared, which is right for sandbox policy and wrong here:
+whether to spend 30 GB of *this* machine's memory is not a decision a colleague
+should be able to push.
+
+Auto-enable is a standing instruction to grant, not a permanent grant: the
+lifecycle below is unchanged, and turning it back to Off stops future arming
+without hunting down existing servers (they lapse on their own, at the usual
+point).
+
+### The grant is per checkout, and it expires
+
+Arming is a grant on a **checkout** (see Lifecycle: the main repo is one
+checkout, each worktree is another), made from a task, and it is deliberately
+**not sticky**:
+
+- Enabling it in a task — by hand, or because the project's auto-enable said so —
+  arms that task's checkout. Sibling tasks on the same checkout come along for
+  free — they share the one server, so there is nothing
+  extra to pay or to ask for.
+- **The grant is refcounted against the tasks on that checkout. When the last one
+  is archived or closed, the grant is dropped and the server is reaped.** The
+  next task created on that checkout starts unarmed and someone has to ask again
+  — unless the project's auto-enable covers that checkout, in which case the
+  standing instruction re-grants it.
+
+That last rule is the point. Worktrees usually disappear with their task, so a
+stale grant there is self-limiting — but **the main checkout is permanent**. A
+grant made once for a five-minute code read would otherwise sit on it forever,
+and quietly resurrect a multi-gigabyte server months later, on a machine whose
+owner has long since forgotten they said yes. Tying the grant's lifetime to the
+work that motivated it means **an enablement can never outlive its reason**.
+
+The cost of this design is honest and small: someone who reads code in the main
+checkout every day re-enables it every day. That is a click against several
+gigabytes, and it is the right side of the trade.
+
+### The memory disclosure is part of the feature
+
+A user cannot consent to a cost nobody showed them, and this cost is large,
+per-checkout, and never reclaimed until the process dies. Three things have to be
+said at the moment of enabling — not buried in Settings:
+
+1. **A number, from the manifest, per language.** Not "may use significant
+   memory". Each manifest carries a measured typical and worst-case RSS, so the
+   toggle can read *"rust-analyzer typically holds 2-3 GB per checkout and does
+   not release it"* or *"gopls 1 GB, up to 7 GB on a large repo"*. The figures in
+   the cost model above are the seed values.
+2. **That the unit is the CHECKOUT — not the project, and not the task.** This is
+   the difference users will not guess and must be told outright, because every
+   IDE they have used runs one server per project. Termic runs **one per
+   checkout: the main repo counts as one, and every worktree is another.** So ten
+   worktree tasks with navigation on everywhere is ten servers and ten copies of
+   the index. Say the reassuring half in the same breath: tasks sharing a
+   checkout share one server, so a second task on the main checkout is free.
+3. **Where it went, how to get it back, and that it will lapse.** The Activity
+   window lists live servers with their RSS and a stop button; stopping one frees
+   its memory immediately and costs a re-index when next needed. And the grant
+   itself ends when the checkout's last task does — which is a feature, and
+   should read as one rather than as the setting mysteriously forgetting itself.
+
+Language servers are the first thing termic runs that can cost more than every
+agent in the window combined. That deserves a sentence at the point of decision,
+not a support thread afterwards.
+
+Discovery should not depend on browsing Settings: prompt contextually in the
+editor the first time it would help.
 
 ## Open questions
 

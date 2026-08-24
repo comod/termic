@@ -44,6 +44,41 @@ macOS overlay title bar, hidden title, 84px reserved left for traffic lights. Th
 
 Opt-out with both `data-tauri-drag-region="false"` and `WebkitAppRegion: "no-drag"`. mousedown handler skips `button, input, [data-no-drag]`. `startDragging()` silently fails without `core:window:allow-start-dragging` in capabilities. No `user-select: none` on drag region — put it on inner text spans.
 
+## Activity window (per-agent CPU / memory)
+
+A SECOND window (label `procmon`, its own Vite entry `activity.html`), opened from the pulse icon in the sidebar footer or the palette's "Activity monitor". Not a modal, and that is the whole design: the numbers only mean something while you drive the agent that moves them, which a modal over the app makes impossible. Rows are grouped project → task → tab, with Termic's own processes in their own group at the bottom.
+
+Every column header sorts (`activityGroups.ts`), default CPU descending, and a group sorts by the aggregate of whichever column is active. Two rules there are not obvious and both exist because the table was unreadable without them:
+
+- **The CPU sort key is a short average, while the displayed number stays instantaneous.** Ordering on the instant makes near-equal rows trade places every tick, which is precisely when several agents are busy and you need to read the table.
+- **The tie-break must be TOTAL** (name, then row key). Two idle claude tabs in one task tie on every column, and a comparator that returns 0 leaves them in snapshot order, i.e. Rust's `HashMap` iteration order — rows visibly reshuffling while nothing happens.
+
+There is no expand affordance. PID is its own (sortable) column, and the per-child process breakdown a tree can have lives in the row's tooltip: for a one-process row, which is most rows, expanding only repeated the Process and PID columns.
+
+Three things to know before touching it:
+
+- **It has no capabilities.** `capabilities/default.json` is scoped `"windows": ["main"]`, so this window gets no core-plugin permissions: no `data-tauri-drag-region` (it keeps a NATIVE title bar, which is what you grab), no `startDragging`, no window-close from JS. App-defined `#[tauri::command]`s are outside the ACL and work fine, which is all the monitor needs. Anything plugin-backed you add here needs a second capability entry first.
+- **Its own entry point, not a branch inside `main.tsx`.** `activity.html` → `src/activity.tsx` → `ActivityWindow.tsx`, which keeps xterm, the WebGL addon and CodeMirror out of the monitor's webview entirely (14 KB entry chunk + the shared React chunk, versus the app's 2.3 MB). A window whose job is reporting memory should not be the second-biggest consumer of it.
+- **Snapshots never touch a Zustand store.** They live in local state in `ActivityWindow`. A 1 Hz write into `app.ts` would copy its ~233 keys and re-run every mounted task's selectors, i.e. the monitor would become the regression (docs/performance.md bear trap 8).
+
+Theme comes from importing `@/store/prefs` (the module applies the persisted palette's CSS vars at load, and localStorage is shared across windows of the same origin). Zustand state does NOT cross webviews, so a theme change in the main window reaches this one when it next opens.
+
+**Row names come from the main window, on request** (`lib/activityTitleBridge.ts`). A tab's displayed title is `customTitle ? title : (liveTitle || title)`, and `liveTitle` (the agent's OSC title) lives only in the main window's JS memory, never on disk — so Activity emits `activity://request-titles` and the main window answers with a `tabId -> title` map. Three details are load-bearing:
+
+- **The request rides the sample tick, not `loadMeta`'s every-tenth.** The project/task lists are disk reads and genuinely slow-moving; a title is the one piece of metadata here that changes while you watch it, because an agent rewrites its tab title as it works. On the every-tenth cadence an occluded window lagged 50 s behind, which is also how the e2e case for it flaked.
+- **A reply identical to the last one is dropped before it reaches React** (`sameTitles`). Nearly every reply is unchanged, and passing a fresh object identity through once a second would re-run `groupRows` for nothing — the cross-window twin of [performance.md](performance.md) bear trap 8.
+- **A bridged title applies even to a tab absent from `persisted_tabs`.** The task list is re-read from disk on the slow cadence, so a just-opened task's tabs can still be missing from it while the main window is already showing their titles. Gating the overlay on the persisted array made such a row read "Agent · bash" until the next re-read.
+
+`emit`/`listen` are the core `event` plugin, so — unlike a plain `#[tauri::command]` — they ARE capability-gated per window (`capabilities/procmon.json`). A dropped permission fails silently, with titles quietly reverting to the "Tab N · claude" fallback, which is why both sides log a broken bridge through `log_line`.
+
+## Top-bar tooltips that name a shortcut
+
+`CommandPaletteButton.tsx` opens the right-hand cluster in `UnifiedBar.tsx`, before Run and the rest of the task-scoped actions (a divider separates it from them), and renders with or without a task (the palette's global commands do not need one). The palette button is a bare icon (`SquareChevronRight`, the ">" prompt) matching its neighbours: the shortcut lives in the tooltip only, built from the LIVE `command-palette` binding via `bindingGlyphs` rather than a hard-coded "⇧⌘P", so a rebind retitles it. An earlier version printed the glyphs on the button face as a bordered chip, which read as a foreign element in a row of bare icons.
+
+Prompts (⌥⌘P, the searchable palette over the same list) and the right-panel toggle (⌥⌘B) get the same treatment through the local `tipWithKey(text, id)` helper in `UnifiedBar.tsx`, which appends the live glyphs or nothing. Wrap the tooltip OUTSIDE a `DropdownTrigger asChild` (`<Tip><DropdownTrigger asChild><Button/></DropdownTrigger></Tip>`), and give that menu `onCloseAutoFocus={e => e.preventDefault()}` or the focus snapping back to the trigger re-fires the tooltip and leaves it stuck open.
+
+The palette button toggles on `pointerdown`, not `click`, and that is load-bearing: the palette is a non-modal Radix dialog whose dismissable layer closes it on document pointerdown, so a click handler reading `commandPaletteOpen` always sees `false` and reopens what the user just dismissed. `onClick` remains as the keyboard path (Enter / Space fire no pointer event) and no-ops when pointerdown already handled the press.
+
 ## Dropping a path into a terminal
 
 Two gestures, one landing point (`lib/terminalDrop.ts`): every terminal host registers itself with `registerTerminalDropTarget`, and a drop types the escaped path into that PTY through `ipc.ptyWrite` — indistinguishable from typing it.
@@ -52,6 +87,43 @@ Two gestures, one landing point (`lib/terminalDrop.ts`): every terminal host reg
 - **From the file tree** (GH #136) — a pointer drag (`startPathDrag`), same as the tab strip: **never HTML5 DnD**, which is unreliable in WKWebView and gets intercepted by Tauri's file-drop. Inserts the path relative to the task root (falls back to absolute for another task's terminal); no sandbox prompt, since the worktree is already granted.
 
 Both share the hit test and the `.termic-drop-target` highlight, so they agree on where a drop lands.
+
+## Confirms for recoverable actions
+
+`ConfirmDialog` (`askConfirm`) renders an optional second checkbox when the
+request passes `dontAskAgain: true`. It reads **"Show this every time" and
+starts ticked**: unticking is the deliberate act, and the box then matches the
+Settings toggle it writes rather than inverting it. The result still comes back
+as `dontAskAgain` (true = the user opted out), so callers persist on
+`confirmed && dontAskAgain` and never on dismissal alone: the dialog reports
+the checkbox state at dismissal, so a backed-out action would otherwise disable
+every future confirmation.
+
+Two flows use it, both writing a Settings › Tasks toggle:
+`confirmBeforeArchiveTask` (`src/lib/archiveTask.ts`) and
+`confirmBeforeCloseAgentTab` (`src/lib/closeTab.ts`). When the confirm is off,
+the action still reports itself with a toast that names the way back (History
+for an archive, the `+` menu's Resume submenu for a closed tab), because the
+dialog was the only other feedback that anything happened.
+
+Copy follows what is actually recoverable, and only a genuinely one-way action
+gets `destructive: true` (the red button). An archive keeps the task in History
+and the branch in git; a main agent tab auto-resumes; a secondary tab comes
+back from Resume. A **pane** tab is never snapshotted into `closedTabs`, so
+that one is one-way and says so. Red buttons everywhere teach people to ignore
+red buttons.
+
+A **scratchpad** (GH #244) gets its own three-outcome prompt instead
+(`ScratchCloseDialog`, Save… / Discard / Cancel, dismissal = Cancel), because
+it has never been written anywhere the user chose and there is no file to go
+back to. That prompt runs **once per pad, including inside a bulk close**
+("Close others", "Close to the right"): folding several pads into the one
+counting confirm would mean a single click deciding the fate of several notes.
+Cancel there spares that pad and lets the rest of the set close, the only
+reading that survives the fact that the tabs before it are already gone.
+`confirmBulkClose` therefore counts dirty FILES and live agents only, and a set
+of nothing but pads skips it entirely rather than stacking two dialogs on one
+decision.
 
 ## Close vs Quit (windowless mode)
 
@@ -76,11 +148,111 @@ This is a deliberate behavior CHANGE, not a bug fix. Previously closing the last
 
 The webview stays ALIVE while windowless — it owns PTY lifetime and every work-state signal, so tearing it down would kill the agents. It is not suspended (WebKit only clamps timers to 1 Hz). What windowless mode DOES have to do is collapse the task panes to zero geometry, or xterm keeps drawing for an invisible window: see docs/performance.md bear trap 2b and `src/lib/windowlessMode.ts`.
 
+## Right-panel tabs (All files / Git)
+
+**Git** is one tab with three sub-tabs, because they are three questions about
+one repo rather than three places:
+
+- **Commit** — what you can stage right now (Fork-style staging, the only one
+  of the three you ACT in: stage, discard, commit, push).
+- **Compare** — what this branch adds up to next to another ref (issue #208):
+  one list of every path that differs between a chosen ref and the working
+  tree, committed and uncommitted alike, because an agent that split a feature
+  over six commits leaves nothing in the staging view to read. Its own bar
+  (`<base> → <branch>`) WRAPS to a second row rather than truncating: two long
+  names is the normal case, and on one row flexbox splits the deficit in
+  proportion to length, which crushed the shorter ref to a single character.
+- **History** — the commit graph (issue #199), full height.
+
+Order of the chrome above them, outermost first: repo pills (multi-repo tasks),
+then the branch bar, then the sub-tabs. Which repo you are looking at is what
+the branch and all three sub-tabs are ABOUT, so it cannot sit inside them.
+
+One box serves all three, on the branch row. The chip is not "one short
+control" the way that row was first written: branch names are routinely long
+enough to fill it, and since the box is a flex-basis-0 item it absorbed none of
+the shrink and collapsed to its own padding. The box holds a 30% floor and the
+chip a matching cap, so a name truncates instead of taking the row. In Commit and Compare it filters the file list. In History it is a
+MESSAGE SEARCH run by git (`--grep`, literal and case-insensitive, subject and
+body) over the whole scope rather than over the rows on screen: "does this
+branch have a commit about X" is a question about the history, and answering it
+from the loaded page would make it a question about how far you had scrolled.
+Debounced at 250ms, so it is one `git log` per pause. It narrows whatever scope
+is active rather than replacing it, so a search under All searches every ref.
+
+The sub-tab row keeps only what belongs to the active view: the view-mode menu
+for Commit and Compare, the ref picker for History.
+
+History's picker has two independent axes. WHICH refs to walk (Auto = the
+checked-out branch, All = every ref, or any number of named ones) and HOW MUCH
+of the topology: **First parent only** collapses a merged side branch into the
+merge commit that brought it in. Without it, picking one branch still draws a
+lane per merged branch, because those commits genuinely are its ancestors,
+which reads as "why am I seeing other branches when I picked main".
+
+The graph used to be a collapsible section at the foot of the staging view,
+sharing the body by a draggable ratio. It is the one view here that wants
+vertical space and was getting whatever two file lists left over, so it became
+a sub-tab and the collapse flag, the ratio, the divider and their localStorage
+keys went with it.
+
 ## Right-panel footer (Setup / Run / Terminal)
 
-Three tabs. Setup + Run stream via `useScriptRuns`. Terminal is opt-in: click `+` → `useApp.enableFooterTerm(wsId)` → AuxTerminal mounts. RunToolbar: Open (expands `project.preview_url` with `$TERMIC_PORT`/`$CONDUCTOR_PORT`/`$PORT`/`$TERMIC_WORKSPACE_NAME`) + Run/Stop (SIGTERMs process group). Default: tab=Run, expanded.
+Three tabs. Setup + Run stream via `useScriptRuns`. Terminal is opt-in: click `+` → `useApp.enableFooterTerm(wsId)` → AuxTerminal mounts. RunToolbar: Open (expands `project.preview_url` with `$TERMIC_PORT`/`$CONDUCTOR_PORT`/`$PORT`/`$TERMIC_WORKSPACE_NAME` + any frozen extra named port, GH #196) + Run/Stop (SIGTERMs process group). Default: tab=Run, expanded.
 
 `task_archive` sweeps `RUNNING_SCRIPTS` and SIGTERMs each before teardown.
+
+## Editor path bar (breadcrumb + syntax)
+
+The bar under the tab strip, for `edit` and `diff` tabs with a path (`EditorBreadcrumb` in `components/task/TaskView.tsx`). Each path segment is a click target: a folder reveals/expands that folder in the tree, the filename reveals the file, and every segment right-clicks to a copy menu. On the right: copy path, open the containing folder in Finder, locate in the tree.
+
+Editor tabs also get a **language button** there, showing what the buffer is highlighted as and opening the "Set syntax" picker (`SyntaxPalette`, also reachable as the command palette's `set-syntax` row). Sublime and VS Code put this bottom-right; termic has no status bar, and inventing one to hold a single control would cost the terminal pane an edge, so it goes on the bar that already exists. Diff tabs deliberately do NOT get it: there is no editable buffer there, so a diff's syntax always follows its path.
+
+A **scratchpad** (GH #244) renders its own variant of this bar: no trail, no copy / Finder / locate buttons (it has no path to point at), a line saying it is not in the project yet, and the language button — which matters more here than anywhere else, since with no extension the content sniffer is the only thing that CAN name the buffer. Its manual pick is PERSISTED, in the scratch index, unlike an edit tab's session-only one (point 1 below): there is no filename to re-derive it from after a relaunch. `SyntaxPalette` writes it at the moment of the pick, not the pane from an effect: picking Markdown swaps panes and remounts the editor in the same commit, so a pane-side effect would only ever see the new value as its initial seed.
+
+Picking **Markdown** on a pad also earns it the source / preview / split shell a `.md` file gets (`MarkdownPane`, routed on `effectiveLanguageId(tab) === MARKDOWN` rather than on a path, since a pad has no extension). That works because the shell's preview is fed by the EDITOR BUFFER, not by disk, so an unsaved pad has something to render. Relative links and images resolve from the task root (a pad has no directory of its own), and there is no `file.md#heading` reveal to consume. Switching between the two panes remounts CodeMirror once; the pad's unmount flush writes the buffer on the way out, so nothing is lost.
+
+### Which language, and where that is decided
+
+The set of languages is **CodeMirror's published registry** (`@codemirror/language-data`, ~150 of them), so opening a `.php`, `.lua` or `.zig` file highlights with no edit here. **Adding a language is not a thing you do.** A language id IS the registry's `name` ("TypeScript", "Properties files", "TSX"), which is also its label.
+
+Precedence, in `lib/languages.ts`:
+
+1. **A manual pick** (`EditTab.syntax`) — session-only, exactly like Sublime's. It survives tab switches, not a relaunch, and is cleared when a preview tab slot recycles onto a different file (otherwise the next file to land in that slot inherits the override). A **scratchpad's** pick is the exception and persists (above).
+2. **The automatic answer** (`syntaxAuto`), written by the editor pane: the language the PATH resolves to, or, when the path matches nothing, a guess from the **content** (`lib/detectSyntax.ts` — only markers close to unambiguous: a shebang, an `<?xml`, text that actually `JSON.parse`s; a wrong guess is worse than no guess, so anything vaguer stays Plain Text).
+
+`effectiveLanguageId` therefore has only two levels, not three, and **does not look at the path**. It cannot: resolving a path needs the registry, and the registry may not be reachable from the main chunk (below). The pane owns resolution and writes its answer back to the tab, so the breadcrumb and the picker read one settled value instead of re-deriving it. A tab the pane has not answered for yet reads as Plain Text for a frame.
+
+### The bundle rule
+
+`lib/languageExts.ts` is the gateway to every grammar, and it is imported ONLY by the lazily loaded editor and diff panes. `lib/languages.ts` stays free of CodeMirror. **`lib/mainChunkGuard.test.ts` pins this** by walking the static import graph from `main.tsx`: a stray `import` of `@codemirror/language-data` from anything reachable at app start would move ~800K of grammars onto the launch path. `SyntaxPalette` is mounted from `App.tsx`, so it `import()`s the list when it opens rather than at module load.
+
+The rule covers the GRAMMAR packages too, not just the registry index, and that is the half that bites. A single `import { javascript } from "@codemirror/lang-javascript"` in the settings theme preview pinned that package into the main chunk, and the namespace object the registry's own `import()` then received came back with **no `javascript` export at all** (`e.javascript is not a function`): every `.ts` and `.js` file in the app silently fell through to the content sniffer and highlighted as whatever that guessed. Nothing reachable at app start may name a grammar package, however small the use looks; fetch it with `await import("@/lib/languageExts")` instead. A failed grammar load now also `console.warn`s rather than resolving quietly to "no grammar".
+
+Measured: the main chunk went 2361K → 2214K (the old catalog is gone, and so is the pinned JS grammar), `languageExts` is a 21K chunk fetched on the first editor or diff open, and `dist/` grows ~876K spread over ~119 extra chunks that are only fetched for a language actually opened.
+
+### Async loads, and the race
+
+A grammar is now a **chunk fetch**, so nothing about setting a language is synchronous. Both panes resolve it alongside the file read (`Promise.all`) rather than after it, so highlighting is there on first paint. Switching syntax still reconfigures the language **compartment** in place — no `EditorView` rebuild, so the cursor, undo history and scroll position survive.
+
+Four things race to set one editor's language: the initial load, a path change on a recycled preview tab, the sniffer answering as a pad fills, and a manual pick. Whichever STARTED last must win no matter which chunk arrives first, so every apply goes through `lib/langSwitch.ts` (`claim()` returns a predicate that is false once anything else has claimed). An `alive` flag is not enough — it only knows about unmount.
+
+### What termic still owns
+
+Three grammars, because the registry cannot serve them, and a short **overlay** of filename rules, because it does not match the way we need:
+
+- **Custom grammars**: `Makefile` (hand-written, `lib/makeMode.ts` — `legacy-modes` has ~150 CodeMirror 5 modes and Makefile is not among them; the rule that makes it a Makefile rather than a config file is that a leading TAB opens a recipe, where the line is shell instead of make, and a trailing backslash keeps that state across lines), `ProtoBuf` (`lib/protoMode.ts`; the registry's mode predates proto3, and ours takes the same NAME so it replaces rather than shadows it), and `Elixir` (absent upstream).
+- **Overlay rules** (`OVERLAY_RULES`), each reusing the registry entry's own loader: `Dockerfile.dev` (upstream's pattern is anchored `/^Dockerfile$/`), `justfile`, `.env.production`, `.zsh`/`.fish`, `.conf`, `.rake`, `.pyi`, `.mdx`, and the component templates with no grammar of their own (`.svelte`, `.astro`, `.ejs`, …) which get tag highlighting from HTML.
+
+Two upstream behaviours to know about. `LanguageDescription.matchFilename` compares the **raw** extension, so `README.MD` matches nothing — `matchLanguage` in `lib/languageExts.ts` does its own two-pass match with the extension lower-cased, and must not be swapped back. And the registry splits JSX/TSX out of JavaScript/TypeScript, so a `.tsx` file's button reads "TSX". `.gradle.kts` is Kotlin, not Groovy, which upstream already gets right.
+
+## Indentation, detected per file
+
+The editor hard-coded two spaces for every buffer, which is wrong for most of what an agent writes: Python is four, Go and Makefiles are tabs, and a Makefile's tabs are the format rather than a preference. `lib/detectIndent.ts` reads it off the file, VS Code's default behaviour (`editor.detectIndentation`) and the only one that needs no configuration to be right.
+
+It votes on the DIFFERENCE between consecutive indented lines rather than the smallest indent seen: a file full of 8-column aligned continuation lines still steps by 2, and the step is what survives that. Ties go to the smaller size (a 4-space file also steps by 8 wherever it nests twice), a single observation is not enough evidence to override the fallback, and only the first 64 KB is read, since this runs on the path that opens a file. It lives in its own compartment, so an external reload re-detects without rebuilding the view.
+
+Not done: `.editorconfig`, which is the explicit signal and should win over the guess when a project has one.
 
 ## Inline review comments (two surfaces)
 
@@ -99,6 +271,40 @@ Both routes go through `sendCommentsToAgent` (`lib/sendComments.ts`) — one del
 The editor's gutter column collapses to zero width while there is nothing to put in it (no selection, no comments for the file). A gutter costs its width on every line forever, and an editor is read far more than it is commented on — 20px of permanent horizontal room made files, markdown especially, start scrolling sideways sooner than they used to. The diff keeps a fixed column: it shows a button on every hover, so a width appearing and disappearing under the mouse would be worse than the space.
 
 While an editor is open, each queued comment keeps the actual selection it was made on as document offsets, mapped through every edit (`lib/commentAnchors.ts`) and written back to the store debounced. Type three lines above a queued comment and its stored range follows the code instead of pointing at whatever now occupies the old line number. The association pair is deliberate: `from` maps with +1 and `to` with -1, so the range does not swallow text typed at its edges. Note the anchor tracks the BUFFER; comment on unsaved edits and the agent, which reads disk, sees something different.
+
+## Inline git blame (cursor line only)
+
+`inlineBlameExtension(taskId, path, { onOpenCommit, onShowInHistory })` annotates the line the cursor is on with `subject, Author (age)` in dimmed text, 50px after the code. VS Code's `git.blame.editorDecoration`, and the format is VS Code's default template with `commitAge` supplying the age so the editor and the History panel describe the same commit the same way.
+
+**The annotation itself is inert.** It sits inside the line being edited, where a click target competes with placing the cursor, so it is hover-only. Resting on it for `CARD_DELAY_MS` (500ms) opens a hover card: long enough that crossing the annotation on the way somewhere else does not throw a card over the next line, short enough that resting on it feels answered.
+
+The card carries author, relative age AND absolute date (the first answers "is this recent", the second "which release"), the short sha, co-authors, the subject in full, and the message prose. Its header holds the two actions:
+
+- **Open diff** — this file as that commit changed it, in the `commit:<sha>` diff tab the History panel already uses.
+- **Show in History** — `revealCommitInHistory(taskId, sha)` on the UI store. RightPanel opens the Git tab (and un-hides the panel), GitPanel switches to the Graph, HistoryPanel selects, expands and scrolls to the sha. Three consumers of one request, because the editor has no handle on any of them.
+
+  Two things about that request are load-bearing:
+
+  - **It is CONSUMED.** `clearCommitReveal()` once honoured, plus an `at` timestamp each consumer records so it acts on a request once. Left standing it is a standing order: RightPanel's effect depends on the active task, so it re-fires on every task switch and re-pins the panel to the Git tab. That is not theoretical, it cost most of a debugging session and broke two unrelated e2e specs.
+  - **A commit that is not loaded is JUMPED to, not paged to.** `task_git_commit_offset` asks git how far back the sha is (`rev-list --count <sha>..HEAD`) and the panel fetches the single page around it, replacing the window rather than appending (the rows above belong to a different part of the history, and stitching them would draw a graph with a hole in it). Paging forward until the sha appears works on a young repo and is hopeless on a monorepo, where a two-year-old commit is tens of thousands of rows down. A sha that is not reachable from HEAD says so in a toast and drops the request.
+
+The card is a CodeMirror tooltip (`showTooltip`), so CodeMirror owns positioning, flipping and clipping. Two things had to be told about the geometry, and both were visible bugs first:
+
+- **`tooltips({ tooltipSpace })` in EditorPane**, constraining every tooltip to the editor pane's own rect. CodeMirror's default is the whole document viewport, so a card anchored at the end of a long line ran under the right panel and one near the top ran under the tab bar. Mounted in EditorPane rather than in this extension because the review-comment tooltip wants it too.
+- **A `min-width` on the card**, not just a max. The annotation sits at the end of a line, so there is often only a sliver of room to its right; with no minimum the card shrink-to-fit into that sliver, wrapped its header into a column and drew its buttons over the author line. Given a width it cannot fit, CodeMirror shifts it left instead, which is the wanted behaviour. It has to survive the pointer travelling into it or its buttons are decoration, hence `CARD_CLOSE_MS` (220ms) of grace on leaving the annotation, cancelled when the pointer arrives in the card. Any edit closes it: the card describes a line that is moving under it.
+
+The message body is NOT part of the blame payload. A file's blame can name 169 distinct commits and the reader looks at one, so `task_git_commit_meta` fetches the body when a card opens, cached per sha. The header renders immediately from the blame data and the prose fills in when git answers, rather than the card waiting on a fork before showing anything.
+
+There is deliberately **no blame column**. Annotating every line is a layout cost, not a cosmetic choice; the reasoning and the CodeMirror rule behind it are bear trap 10 in [performance.md](performance.md).
+
+The pref is `inlineBlame`, OFF by default (matching VS Code's own default and the opt-in shape `loadRemoteImages` set), in Settings → Appearance → Editor, and in the command palette as "Toggle inline git blame" with its current state as the row suffix. It is mounted through its own `Compartment`, so toggling reconfigures in place: cursor, undo history and scroll position all survive, and with it off the extension is never constructed, so nothing is fetched and no state field exists.
+
+Two honesty rules, because a confidently wrong author is worse than none:
+
+- **A line the user edited loses its attribution** and reads "Not committed yet". Mapping alone does not achieve that: `MapMode.TrackBefore` drops a line joined onto the one above, but the survivor keeps its own mark, so the merged line would be credited to whoever owned the first half. Every line an edit touched is filtered out of the snapshot as well.
+- **A dirty buffer is never re-blamed.** Blame reads the file on DISK, so its line numbers would not match the screen. The save and external-reload paths drop the cache entry and dispatch `refreshBlame`, which is when a re-fetch happens.
+
+A git tick is deliberately NOT a re-fetch. `gitRevision` bumps on every stage and unstage, not just on commits, so it dispatches `markBlameStale`: the annotation on screen stays put and the refetch rides the reader's next cursor move. Re-blaming per tick forks git once per open editor to redraw one line that usually did not change, and it measurably slowed the e2e suite when it was written that way.
 
 ## Settled detection / notifications
 

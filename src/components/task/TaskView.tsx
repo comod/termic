@@ -21,6 +21,7 @@ import type { Task, Tab, TerminalTab } from "@/lib/types";
 import { useApp, useTaskTabs, useActiveTabId } from "@/store/app";
 import { usePrefs, currentTerminalTheme } from "@/store/prefs";
 import { TabBar, TabPill } from "./TabBar";
+import { TabContextMenu } from "./TabContextMenu";
 import { TerminalPane, FooterBar } from "./TerminalPane";
 import { RunPane } from "./RunPane";
 import { SplitNodeView } from "./SplitView";
@@ -30,16 +31,21 @@ import { Plus, ChevronDown, ChevronUp, ChevronRight, LocateFixed, Copy, Check, F
 import { cn } from "@/lib/utils";
 import { getAllLeaves, computeLeafBounds, focusedTabId } from "@/lib/splitTree";
 import type { PaneLeaf, Rect } from "@/lib/splitTree";
-import { openPath } from "@/lib/ipc";
+import { openPath, revealPath } from "@/lib/ipc";
+import { copyToClipboard } from "@/lib/clipboard";
 import { fileIconUrl } from "@/lib/explorer/iconResolver";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent } from "@/components/ui/ContextMenu";
 import { CopyPathItems } from "./CopyPathItems";
+import { useUI } from "@/store/ui";
+import { MARKDOWN, effectiveLanguageId, languageLabel } from "@/lib/languages";
 import { dirnamePosix, MARKDOWN_EXT_RE } from "@/lib/markdownPaths";
-import { keepsDisplayWhenHidden, previewKindForPath } from "@/lib/previewPaths";
+import { isSvgPath, keepsDisplayWhenHidden, previewKindForPath } from "@/lib/previewPaths";
+import { restoreScratchTabs } from "@/lib/scratchTabs";
 const EditorPane = lazy(() => import("./EditorPane").then(m => ({ default: m.EditorPane })));
 const DiffPane   = lazy(() => import("./DiffPane").then(m => ({ default: m.DiffPane })));
 const MarkdownPane = lazy(() => import("./MarkdownPane").then(m => ({ default: m.MarkdownPane })));
+const SvgPane = lazy(() => import("./SvgPane").then(m => ({ default: m.SvgPane })));
 const PreviewPane  = lazy(() => import("./PreviewPane").then(m => ({ default: m.PreviewPane })));
 const DirListingPane = lazy(() => import("./DirListingPane").then(m => ({ default: m.DirListingPane })));
 // Lightweight extension check so we don't import the (lazy) MarkdownPane
@@ -60,7 +66,71 @@ function EditorBreadcrumb({ task }: { task: Task }) {
   const activeId = useActiveTabId(task.id);
   const tab = useApp(s => (s.tabs[task.id] ?? []).find(t => t.id === activeId));
   const revealInTree = useApp(s => s.revealInTree);
+  const openSyntaxPalette = useUI(s => s.openSyntaxPalette);
   const [copied, setCopied] = useState(false);
+  // A scratchpad has no path, so there is no trail to render and nothing to
+  // copy, locate or open in Finder. It DOES get the syntax button: with no
+  // extension to go on, the content sniffer's guess (and the user's override)
+  // is the only thing that says how the buffer is being highlighted.
+  if (tab?.type === "scratch") {
+    return (
+      <div className="flex h-7 shrink-0 items-center gap-1 border-b border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2 text-[12px]">
+        <span className="min-w-0 flex-1 truncate text-[var(--color-fg-faint)]">
+          Scratchpad, not saved to the project yet. ⌘S picks a place for it.
+        </span>
+        <button
+          data-testid="syntax-button"
+          onClick={() => openSyntaxPalette(task.id, tab.id)}
+          title="Set syntax"
+          className="shrink-0 rounded px-1.5 py-0.5 text-[11.5px] text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+        >
+          {languageLabel(effectiveLanguageId(tab))}
+        </button>
+      </div>
+    );
+  }
+  // An out-of-task file (GH #240). Its path is ABSOLUTE and points outside the
+  // task, so none of the trail below applies: the segments are not task
+  // -relative, there is nothing to locate in the file tree, and the file is
+  // read-only. It still gets the syntax button, and the full path is rendered
+  // rather than a basename because "which file is this, exactly" is the whole
+  // question for a path that came out of agent output.
+  if (tab?.type === "external") {
+    const extName = tab.path.split("/").pop() || tab.path;
+    return (
+      <div className="flex h-7 shrink-0 items-center gap-1 border-b border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2 text-[12px]">
+        <img src={fileIconUrl(extName)} alt="" className="mr-1 h-3.5 w-3.5 shrink-0 file-icon" />
+        <span className="min-w-0 flex-1 truncate text-[var(--color-fg-faint)]" title={tab.path}>
+          {tab.path}
+        </span>
+        <span className="shrink-0 rounded bg-[var(--color-bg-2)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-faint)]">
+          Read-only
+        </span>
+        <button
+          data-testid="syntax-button"
+          onClick={() => openSyntaxPalette(task.id, tab.id)}
+          title="Set syntax"
+          className="shrink-0 rounded px-1.5 py-0.5 text-[11.5px] text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+        >
+          {languageLabel(effectiveLanguageId(tab))}
+        </button>
+        <button
+          onClick={() => void copyToClipboard(tab.path, "path")}
+          title="Copy path"
+          className="shrink-0 rounded p-1 text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+        >
+          <Copy className="h-3.5 w-3.5" />
+        </button>
+        <button
+          onClick={() => revealPath(tab.path).catch(() => {})}
+          title="Reveal in Finder"
+          className="shrink-0 rounded p-1 text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+        >
+          <FolderOpen className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    );
+  }
   if (!tab || (tab.type !== "edit" && tab.type !== "diff") || !tab.path) return null;
   const path = tab.path;
   const parts = path.split("/").filter(Boolean);
@@ -109,6 +179,21 @@ function EditorBreadcrumb({ task }: { task: Task }) {
         })}
       </div>
       <div className="ml-1 flex shrink-0 items-center gap-0.5">
+        {/* Sublime puts the syntax picker bottom-right; termic has no status
+            bar, and inventing one to hold a single control would cost the
+            terminal an edge. It goes on the bar this file already has, next
+            to the other per-file actions. Editor tabs only: a diff has no
+            editable buffer, so its syntax always follows its path. */}
+        {tab.type === "edit" && (
+          <button
+            data-testid="syntax-button"
+            onClick={() => openSyntaxPalette(task.id, tab.id)}
+            title="Set syntax"
+            className="shrink-0 rounded px-1.5 py-0.5 text-[11.5px] text-[var(--color-fg-faint)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+          >
+            {languageLabel(effectiveLanguageId(tab))}
+          </button>
+        )}
         <button onClick={copyPath} title="Copy path" className={iconBtn}>
           {copied ? <Check className="h-3.5 w-3.5 text-[var(--color-accent)]" /> : <Copy className="h-3.5 w-3.5" />}
         </button>
@@ -137,6 +222,8 @@ export function TaskView({ task }: { task: Task }) {
   const addBottomTab = useApp(s => s.addBottomTab);
   const closeBottomTab = useApp(s => s.closeBottomTab);
   const setActiveBottom = useApp(s => s.setActiveBottomTab);
+  const pinBottomTab = useApp(s => s.pinBottomTab);
+  const unpinBottomTab = useApp(s => s.unpinBottomTab);
   const setBottomLiveTitle = useApp(s => s.setBottomTabLiveTitle);
 
   // Subscribe to themeMode (and the custom-theme edit counter) so the
@@ -161,6 +248,12 @@ export function TaskView({ task }: { task: Task }) {
   const setSplitRatio = useApp(s => s.setSplitRatio);
 
   useEffect(() => { ensureDefaultTab(task.id, task.cli); }, [task.id, task.cli, ensureDefaultTab]);
+
+  // Bring back this task's scratchpads (GH #244). Deliberately NOT part of
+  // `persisted_tabs`, which is agent-tabs-only by construction: pads restore
+  // from their own index, unfocused and behind whatever agent tab the line
+  // above just seeded. Idempotent, so a remount cannot double a tab.
+  useEffect(() => { void restoreScratchTabs(task.id); }, [task.id]);
 
   // Seed the first bottom tab the moment the split opens.
   useEffect(() => {
@@ -215,9 +308,11 @@ export function TaskView({ task }: { task: Task }) {
   // the breadcrumb h-7 (28px) when it's visible — same condition as
   // EditorBreadcrumb's own null-return. Pane headers are always h-9.
   const activeMainTab = tabs.find(t => t.id === activeId);
-  const bcVisible = !!activeMainTab
-    && (activeMainTab.type === "edit" || activeMainTab.type === "diff")
-    && !!activeMainTab.path;
+  const bcVisible = !!activeMainTab && (
+    activeMainTab.type === "scratch"
+    || activeMainTab.type === "external"
+    || ((activeMainTab.type === "edit" || activeMainTab.type === "diff") && !!activeMainTab.path)
+  );
   const mainTopPx = splitRoot ? 36 + (bcVisible ? 28 : 0) : 0;
 
   // One computeLeafBounds over the FULL tree positions everything: the main
@@ -252,6 +347,42 @@ export function TaskView({ task }: { task: Task }) {
       height: `calc(${r.h * 100}% - ${chromePx}px)`,
     };
   };
+
+  // Scratch shells live in a separate `bottomTabs` array, but render through
+  // the SAME TabPill as agent tabs (via a synthetic shell Tab) so every strip
+  // looks identical.
+  const renderBottomPill = (t: NonNullable<typeof bottomTabs>[number]) => (
+    <TabContextMenu
+      key={t.id}
+      tabs={bottomTabs || []}
+      tabId={t.id}
+      pinned={!!t.pinned}
+      onPin={() => pinBottomTab(task.id, t.id)}
+      onUnpin={() => unpinBottomTab(task.id, t.id)}
+      onClose={() => closeBottomTab(task.id, t.id)}
+      // Plain shells: nothing to confirm, nothing to resume.
+      onCloseMany={(ids) => ids.forEach(id => closeBottomTab(task.id, id))}
+    >
+      <TabPill
+        task={task}
+        tab={{ id: t.id, type: "terminal", cli: "shell", title: t.title, liveTitle: t.liveTitle, pinned: t.pinned } as TerminalTab}
+        active={t.id === activeBottom}
+        paneFocused
+        compact
+        onSelect={() => setActiveBottom(task.id, t.id)}
+        onClose={() => closeBottomTab(task.id, t.id)}
+        onUnpin={() => unpinBottomTab(task.id, t.id)}
+        renaming={null}
+        onStartRename={() => {}}
+        onChangeRename={() => {}}
+        onCommitRename={() => {}}
+        onCancelRename={() => {}}
+        dragging={false}
+        dragTx={0}
+        onStartDrag={() => {}}
+      />
+    </TabContextMenu>
+  );
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -386,11 +517,38 @@ export function TaskView({ task }: { task: Task }) {
                     : <TerminalPane task={task} tab={t as TerminalTab} active={tabActive} />)}
                   {t.type === "edit"     && (
                     <Suspense fallback={null}>
-                      {previewKindForPath(t.path)
-                        ? <PreviewPane task={task} tab={t} />
-                        : isMarkdownPath(t.path)
-                          ? <MarkdownPane task={task} tab={t} visible={visible} ownsFind={ownsFind} />
-                          : <EditorPane task={task} tab={t} active={tabActive} />}
+                      {isSvgPath(t.path)
+                        ? <SvgPane task={task} tab={t} />
+                        : previewKindForPath(t.path)
+                          ? <PreviewPane task={task} tab={t} />
+                          : isMarkdownPath(t.path)
+                            ? <MarkdownPane task={task} tab={t} visible={visible} ownsFind={ownsFind} />
+                            : <EditorPane task={task} tab={t} active={tabActive} />}
+                    </Suspense>
+                  )}
+                  {t.type === "scratch"  && (
+                    <Suspense fallback={null}>
+                      {/* A pad whose syntax resolves to markdown gets the same
+                          source / preview / split shell a `.md` file does. It
+                          is keyed off the SYNTAX rather than a path because a
+                          pad has no extension: picking Markdown is how you say
+                          "this is a document", and the toggle is most of what
+                          that buys you. Swapping panes remounts CodeMirror
+                          once, which the pad's unmount flush already covers. */}
+                      {effectiveLanguageId(t) === MARKDOWN
+                        ? <MarkdownPane task={task} tab={t} visible={visible} ownsFind={ownsFind} />
+                        : <EditorPane task={task} tab={t} active={tabActive} />}
+                    </Suspense>
+                  )}
+                  {t.type === "external" && (
+                    <Suspense fallback={null}>
+                      {/* Source view only, never the markdown / SVG / binary
+                          preview shells (GH #240). Every one of them resolves
+                          sibling assets and links against the TASK root, which
+                          an out-of-task file has no relationship to, so they
+                          would render broken images and links that go nowhere.
+                          Read-only source is the honest thing to show. */}
+                      <EditorPane task={task} tab={t} active={tabActive} />
                     </Suspense>
                   )}
                   {t.type === "diff"     && <Suspense fallback={null}><DiffPane task={task} tab={t} /></Suspense>}
@@ -452,30 +610,18 @@ export function TaskView({ task }: { task: Task }) {
                 {/* Tabs + New scroll horizontally (no scrollbar) so the queue
                     button on the left and the collapse toggle on the right stay
                     fixed and reachable no matter how many shells are open. */}
-                <div className="flex min-w-0 flex-1 items-stretch gap-0 overflow-x-auto no-scrollbar">
-                  {(bottomTabs || []).map(t => (
-                    // Scratch shells live in a separate `bottomTabs` array, but
-                    // render through the SAME TabPill as agent tabs (via a
-                    // synthetic shell Tab) so every strip looks identical.
-                    <TabPill
-                      key={t.id}
-                      task={task}
-                      tab={{ id: t.id, type: "terminal", cli: "shell", title: t.title, liveTitle: t.liveTitle } as TerminalTab}
-                      active={t.id === activeBottom}
-                      paneFocused
-                      compact
-                      onSelect={() => setActiveBottom(task.id, t.id)}
-                      onClose={() => closeBottomTab(task.id, t.id)}
-                      renaming={null}
-                      onStartRename={() => {}}
-                      onChangeRename={() => {}}
-                      onCommitRename={() => {}}
-                      onCancelRename={() => {}}
-                      dragging={false}
-                      dragTx={0}
-                      onStartDrag={() => {}}
-                    />
-                  ))}
+                {/* Pinned shells sit outside the scroller so they stay in
+                    reach, same as the main strip (issue #183). */}
+                {(bottomTabs || []).some(t => t.pinned) && (
+                  <>
+                    <div data-pinned-strip="" className="flex shrink-0 items-stretch gap-0 overflow-x-auto no-scrollbar max-w-[55%]">
+                      {(bottomTabs || []).filter(t => t.pinned).map(renderBottomPill)}
+                    </div>
+                    <div className="mx-1 h-5 w-px shrink-0 self-center bg-[var(--color-border-soft)]" />
+                  </>
+                )}
+                <div data-scroll-strip="" className="flex min-w-0 flex-1 items-stretch gap-0 overflow-x-auto no-scrollbar">
+                  {(bottomTabs || []).filter(t => !t.pinned).map(renderBottomPill)}
                   <button
                     title="New shell tab"
                     onClick={() => addBottomTab(task.id)}
@@ -518,6 +664,7 @@ export function TaskView({ task }: { task: Task }) {
                   >
                     <AuxTerminal
                       taskId={task.id}
+                      tabId={t.id}
                       taskPath={task.path}
                       active={t.id === activeBottom}
                       // Grab focus once the PTY is live, but only for shells

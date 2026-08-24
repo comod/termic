@@ -2,30 +2,37 @@
 // Two layout flavors: full (220px) vs compact (56px, icon-only with tooltips).
 
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type FocusEvent as ReactFocusEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useApp, useTaskTabs, useActiveTabId } from "@/store/app";
 import { usePrefs } from "@/store/prefs";
 import { Button } from "@/components/ui/Button";
 import { Tip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
-import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard } from "lucide-react";
-import { DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator, DropdownLabel } from "@/components/ui/Dropdown";
+import { LayoutGrid, History, FolderPlus, Settings, Plus, Archive, Layers, Moon, Cog, MoreVertical, GitBranch, GitBranchPlus, FolderGit2, ChevronRight, ChevronDown, Bell, Bug, Mail, Zap, X, Pencil, Copy, ChevronsDownUp, ChevronsUpDown, Check, AudioWaveform, Radio, SquareChevronRight, CircleStop, Trash2, Folder, FolderMinus, FolderOpen, Megaphone, Keyboard, Activity, Waypoints } from "lucide-react";
+import { DropdownRoot, DropdownTrigger, DropdownMenu, DropdownItem, DropdownSeparator, DropdownLabel, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
 import { ContextMenuRoot, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuLabel, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from "@/components/ui/ContextMenu";
 import { ProjectActionsMenuItems } from "./ProjectActionsMenuItems";
+import { NewTabMenuItems } from "@/components/task/NewTabMenuItems";
+import { newScratchTab } from "@/lib/scratchTabs";
 import { UpdateCard } from "./UpdateCard";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { useUI } from "@/store/ui";
+import { usePendingTasks } from "@/store/pendingTasks";
+import { useIsArchiving } from "@/store/archivingTasks";
 import { cn } from "@/lib/utils";
 import { formatTerminalTitle } from "@/lib/terminalTitle";
 import { requestCloseTab } from "@/lib/closeTab";
-import { taskRename, taskReorder, projectRename, openPath, projectReorder, taskSetYolo, projectRemove, projectUpdate, projectSetGroup } from "@/lib/ipc";
+import { taskRename, taskReorder, projectRename, openPath, projectReorder, taskSetYolo, projectRemove, projectUpdate, projectSetGroup, procmonOpenWindow } from "@/lib/ipc";
 import { copyToClipboard } from "@/lib/clipboard";
+import { copyAgentBriefing } from "@/lib/agentBriefing";
 import { groupOf, projectSections } from "@/lib/projectGroups";
 import { createQuickTask, derivedBranch, type NewTaskMode } from "@/lib/quickTask";
 import { withCreateLock } from "@/lib/createLock";
 import { confirmAndArchive } from "@/lib/archiveTask";
 import { startSpotlight, stopSpotlight } from "@/lib/spotlight";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
-import type { Task, TerminalTab } from "@/lib/types";
+import type { Tab, Task, TerminalTab } from "@/lib/types";
+import { agentDisplayName } from "@/lib/agents";
 import { effectiveSandboxMode, isSandboxEnforced } from "@/lib/types";
 import { SandboxIcon, SANDBOX_VISUALS } from "@/components/SandboxIcon";
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
@@ -102,6 +109,12 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   const setGroupColor = useApp(s => s.setGroupColor);
   const setAllTasksCollapsed = useApp(s => s.setAllTasksCollapsed);
   const setAllGroupsCollapsed = useApp(s => s.setAllGroupsCollapsed);
+  // Tasks mid-creation (GH #242): no real Task yet, so they can't come from
+  // `tasks` above — rendered as synthetic rows in the same list, filtered by
+  // project inside renderProject below (a plain object filter, not a hook
+  // call, since renderProject runs per-project inside a loop).
+  const pendingTasksById = usePendingTasks(s => s.pending);
+  const pendingTaskList = Object.values(pendingTasksById);
   // (agents subscription lives inside ProjectActionsMenuItems now —
   // Sidebar itself doesn't need the registry.)
 
@@ -899,6 +912,12 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
         )}>
           {!compact && <span>Projects</span>}
           <div className={cn("flex gap-0.5", compact && "flex-col")}>
+            {/* Expand/collapse-all + expand-mode + hide-inactive controls act
+                on the full project TREE (names, task rows), none of which
+                compact mode renders — the rail is icon-only. Nothing here
+                would do anything if opened, so skip it entirely rather than
+                show a trigger with nothing behind it. */}
+            {!compact && (
             <DropdownRoot>
               <Tip content="Project list options">
                 <DropdownTrigger asChild>
@@ -967,6 +986,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                 </DropdownItem>
               </DropdownMenu>
             </DropdownRoot>
+            )}
             <Tip content="Add project (repo)"><Button size="icon" variant="icon" onClick={openNewProject}>
               <FolderPlus className={iconSize(compact)} /></Button></Tip>
           </div>
@@ -976,6 +996,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
           {(() => {
           const renderProject = (p: typeof projects[number]) => {
             const taskList = tasks.filter(w => w.project_id === p.id && !w.archived);
+            const pendingForProject = pendingTaskList.filter(t => t.projectId === p.id);
             // Empty projects default to collapsed (no point pinning a blank
             // expanded row). User overrides stick: explicit true / false
             // wins; undefined falls back to emptiness-based default.
@@ -987,7 +1008,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
             // "picking the project up"; persisted collapse state is
             // untouched, so the rows return on drop exactly as they were.
             const collapsed = dragProjectId === p.id
-              || (explicit !== undefined ? explicit : taskList.length === 0);
+              || (explicit !== undefined ? explicit : taskList.length === 0 && pendingForProject.length === 0);
             // Compact + collapsed: surface aggregated activity on the
             // project monogram so a collapsed project still signals that
             // something underneath wants attention (attention > done).
@@ -1345,15 +1366,18 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                     New worktree action). One affordance instead of two
                     cramped side-by-side buttons that had to ellipsis at
                     narrow widths. */}
-                {!collapsed && taskList.length === 0 && !compact && pendingRepoRoot?.projectId !== p.id && (
+                {!collapsed && taskList.length === 0 && !compact && pendingRepoRoot?.projectId !== p.id && pendingForProject.length === 0 && (
                   <div
-                    className="ml-5 mr-1 mb-1 mt-0.5"
+                    className="ml-3 mr-1 mb-px"
                     onClick={e => e.stopPropagation()}
                   >
                     <DropdownRoot>
                       <DropdownTrigger asChild>
                         <button
-                          className="flex w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-[var(--color-border)] bg-transparent px-2 py-2 text-[12.5px] text-[var(--color-fg-dim)] hover:border-[var(--color-accent-soft)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)] data-[state=open]:border-[var(--color-accent-soft)] data-[state=open]:text-[var(--color-fg)]"
+                          data-testid={`project-empty-new-task-${p.id}`}
+                          // Same token as the task row it stands in for, so
+                          // the two cannot drift apart (see --task-row-h).
+                          className="flex h-[var(--task-row-h)] w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-[var(--color-border)] bg-transparent px-2 text-[13px] text-[var(--color-fg-dim)] hover:border-[var(--color-accent-soft)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)] data-[state=open]:border-[var(--color-accent-soft)] data-[state=open]:text-[var(--color-fg)]"
                         >
                           <Plus className="h-3.5 w-3.5 shrink-0" />
                           <span>New task</span>
@@ -1389,7 +1413,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                     the bottom), and a live drag splices the same array — an
                     extra sort here would fight the drag. */}
                 {!collapsed && taskList.map(w => (
-                  <TaskRow
+                  <TaskRowSlot
                     key={w.id}
                     w={w}
                     compact={compact}
@@ -1398,6 +1422,14 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                     onDragPointerDown={onTaskDragPointerDown}
                     clickSuppressed={taskClickSuppressed}
                   />
+                ))}
+                {/* Tasks mid-creation (GH #242) — a real Task doesn't exist
+                    yet, so these come from pendingTaskList, not taskList.
+                    Rendered after the real rows, compact mode excluded (same
+                    as TaskRow's own compact branch: no room for a labeled
+                    row on the icon rail). */}
+                {!collapsed && !compact && pendingForProject.map(t => (
+                  <PendingTaskRow key={t.id} pending={t} />
                 ))}
                 {/* Inline name prompt renders at the BOTTOM — that's
                     where a newly-created repo-root task lands in
@@ -1428,20 +1460,31 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                       const ui = useUI.getState();
                       inlineCreatingRef.current = true;
                       if (pr.mode === "worktree") {
-                        // Close the inline row and show the SAME progress UI the
-                        // New Task modal shows on submit (worktree add + copy can
-                        // take seconds; errors surface there too).
+                        // Same non-blocking shape as NewTaskDialog (GH #242):
+                        // pre-generate the id, subscribe to its progress
+                        // channel, register the pending row, THEN close the
+                        // inline row and fire the create in the background —
+                        // no modal, no locked window while worktree add +
+                        // copy runs.
+                        const id = crypto.randomUUID();
+                        const uOut = await listen<{ line: string }>(`setup-output://${id}`, ev => {
+                          usePendingTasks.getState().appendLine(id, ev.payload.line);
+                        });
+                        usePendingTasks.getState().add({
+                          id, projectId: pr.projectId, name, cli: pr.cli,
+                        });
+                        setActive(id);
                         setPendingRepoRoot(null);
-                        ui.setTaskCreateProgress({ phase: "creating", err: null });
                         try {
                           await createQuickTask({
-                            projectId: pr.projectId, mode: "worktree", cli: pr.cli,
+                            id, projectId: pr.projectId, mode: "worktree", cli: pr.cli,
                             name, branch: pr.branch.trim(),
                           });
-                          ui.setTaskCreateProgress(null); // success closes the overlay
+                          usePendingTasks.getState().remove(id);
                         } catch (err) {
-                          ui.setTaskCreateProgress({ phase: "error", err: String(err) });
+                          usePendingTasks.getState().fail(id, String(err));
                         } finally {
+                          uOut();
                           inlineCreatingRef.current = false;
                         }
                       } else {
@@ -1819,6 +1862,20 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
               <Keyboard className={iconSize(compact)} />
             </Button>
           </Tip>
+          {/* Activity monitor: per-agent CPU / memory. Opens a SEPARATE
+              window (not a dialog) so it keeps updating while you drive the
+              agent it is measuring. Sampling starts with that window and
+              stops when it closes. */}
+          <Tip content="Activity (CPU / memory per agent)">
+            <Button
+              size="icon"
+              variant="icon"
+              data-testid="open-activity"
+              onClick={() => { void procmonOpenWindow().catch(() => {}); }}
+            >
+              <Activity className={iconSize(compact)} />
+            </Button>
+          </Tip>
           {/* Right cluster: Add project, then Settings rightmost.
               Settings sits at the absolute edge so the gear is exactly
               where users reflexively reach for it (same position as
@@ -1890,6 +1947,101 @@ function iconSize(compact: boolean) {
 // `data-testid="work-badge"` + `data-work-state` are the DOM hook the e2e
 // suite asserts on: this badge is what a user actually sees, so specs read it
 // instead of peeking at `tab.workState` in the store.
+/** Picks the row a real task gets: the normal one, or the inert "Archiving…"
+ *  placeholder while its background archive runs (GH #246). A component, not
+ *  a branch inside the project section's map, so the archiving subscription is
+ *  per row — one archive re-renders one row, not every task in the project. */
+function TaskRowSlot(props: React.ComponentProps<typeof TaskRow>) {
+  const archiving = useIsArchiving(props.w.id);
+  if (archiving) return <ArchivingTaskRow w={props.w} compact={props.compact} />;
+  return <TaskRow {...props} />;
+}
+
+/** A task with an archive in flight (GH #246). The Task is still in the store
+ *  (it only leaves on the post-archive loadAll), but its worktree is being
+ *  torn down and its agents killed, so the row is inert: no click, no menu,
+ *  no tab children, nothing to drag. It reads as "on its way out" rather than
+ *  disappearing the moment the user confirms, which would leave a multi-second
+ *  gap where the archive silently might not have worked. */
+function ArchivingTaskRow({ w, compact }: { w: Task; compact: boolean }) {
+  if (compact) {
+    return (
+      <Tip content={`Archiving ${w.name}…`} side="right">
+        <div
+          data-sidebar-task-id={w.id}
+          data-task-archiving="true"
+          className="relative mx-auto flex h-8 w-8 items-center justify-center rounded-md text-[var(--color-fg-faint)] opacity-60"
+        >
+          <Spinner size={14} />
+        </div>
+      </Tip>
+    );
+  }
+  return (
+    <div className="mb-px" data-sidebar-task-row={w.id}>
+      <div
+        data-sidebar-task-id={w.id}
+        data-sidebar-task-project-id={w.project_id}
+        data-task-archiving="true"
+        className="ml-3 flex h-[var(--task-row-h)] items-center gap-1.5 rounded-md px-1 text-[13px] select-none text-[var(--color-fg-faint)] opacity-70"
+      >
+        <span className="shrink-0 h-3.5 w-3.5 mx-0.5" />
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="min-w-0 truncate font-medium line-through">{w.name}</span>
+        </div>
+        <Tip content="Archiving…">
+          <span
+            data-testid="archiving-badge"
+            aria-label="Archiving"
+            className="relative flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[var(--color-fg-faint)]"
+          >
+            <Spinner size={12} />
+          </span>
+        </Tip>
+      </div>
+    </div>
+  );
+}
+
+/** Sidebar row for a task still being created (GH #242). No real Task
+ *  exists yet — clicking it just activates the pending id, which MainArea
+ *  resolves to CreatingTaskPane (see usePendingTask there). No tabs, no
+ *  chevron, no menu: there's nothing to expand or act on until the worktree
+ *  is ready and the real TaskRow takes over (same id, so the click target
+ *  doesn't move under the user). */
+function PendingTaskRow({ pending }: { pending: import("@/store/pendingTasks").PendingTask }) {
+  const activeTaskId = useApp(s => s.activeTaskId);
+  const setActive = useApp(s => s.setActiveTask);
+  const isActive = activeTaskId === pending.id;
+  const isError = pending.phase === "error";
+  return (
+    <div className="mb-px" data-sidebar-task-row={pending.id}>
+      <div
+        data-sidebar-task-id={pending.id}
+        data-sidebar-task-project-id={pending.projectId}
+        data-pending-task-phase={pending.phase}
+        onClick={() => setActive(pending.id)}
+        className={cn(
+          "ml-3 flex items-center gap-1.5 rounded-md px-1 py-1 text-[13px] cursor-pointer select-none transition-colors",
+          isActive
+            ? "bg-[var(--color-sel)] text-[var(--color-fg)]"
+            : "text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]",
+        )}
+      >
+        <span className="shrink-0 h-3.5 w-3.5 mx-0.5" />
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="min-w-0 truncate font-medium">{pending.name}</span>
+        </div>
+        <Tip content={isError ? (pending.err ?? "Creation failed") : "Creating worktree…"}>
+          <span className="relative flex h-[18px] w-[18px] shrink-0 items-center justify-center">
+            {isError ? <TabBadge reason="attention" /> : <TabBadge reason="working" />}
+          </span>
+        </Tip>
+      </div>
+    </div>
+  );
+}
+
 function TabBadge({ reason }: { reason: "attention" | "done" | "working" }) {
   if (reason === "working") {
     return (
@@ -1979,6 +2131,9 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
   const setTaskCollapsed = useApp(s => s.setTaskCollapsed);
   const setTaskYolo = useApp(s => s.setTaskYolo);
   const ensureDefaultTab = useApp(s => s.ensureDefaultTab);
+  const addTab = useApp(s => s.addTab);
+  const resumeClosedTab = useApp(s => s.resumeClosedTab);
+  const setView = useApp(s => s.setView);
   const renameTab = useApp(s => s.renameTab);
   const clearTabCustomTitle = useApp(s => s.clearTabCustomTitle);
   const settledHighlight = usePrefs(s => s.settledHighlight);
@@ -2097,6 +2252,26 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
     catch (e) { useUI.getState().pushToast(String(e), "error"); }
   }
 
+  // ─ New terminal / agent, from the row's own menu (GH #197) ─
+  // People kept right-clicking the sidebar row hunting for "add another agent
+  // to this task" and never found the tab strip's "+". Same menu, same rows
+  // (NewTabMenuItems), one difference: picking here also ACTIVATES the task,
+  // because an unmounted task has no TaskView and so nothing would spawn the
+  // PTY the user just asked for. `addTab` self-focuses the new terminal, and
+  // the menu's onCloseAutoFocus already declines Radix's focus-return, so the
+  // focus lands in the new tab rather than snapping back to the kebab.
+  //
+  // ensureDefaultTab FIRST, exactly like the row-click path: on a task that
+  // was never opened (or was stopped) the seed/restore is what brings its
+  // persisted agent tabs back, and it bails the moment a main tab exists — so
+  // adding ours first would silently cost the user their restored session.
+  function spawnIntoTask(tab: Tab) {
+    setActive(w.id);
+    ensureDefaultTab(w.id, w.cli || "claude");
+    addTab(w.id, tab);
+    setMenuOpen(false);
+  }
+
   function commitTabRename() {
     if (!tabRenaming) return;
     const trimmed = tabRenaming.value.trim();
@@ -2183,7 +2358,10 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
         // the kebab button (which it anchors to).
         onContextMenu={(e) => { e.preventDefault(); setMenuOpen(true); }}
         className={cn(
-          "group/wsrow ml-3 flex items-center gap-1 rounded-md px-1 py-1 text-[13px] cursor-pointer select-none transition-colors",
+          // Fixed height rather than padding around a line box: the line box
+          // is the system's to decide (see --task-row-h) and the rows have to
+          // stay level with each other and with the empty-project placeholder.
+          "group/wsrow ml-3 flex h-[var(--task-row-h)] items-center gap-1 rounded-md px-1 text-[13px] cursor-pointer select-none transition-colors",
           // Strong selection on the header when active AND no child row
           // carries it: collapsed (children hidden) OR the active tab is an
           // edit/diff view (no row). Expanded with an active terminal tab
@@ -2334,6 +2512,53 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
               // the trigger highlighted with a focus ring is just noise.
               onCloseAutoFocus={(e) => e.preventDefault()}
             >
+              {/* Leads the menu: "what else can I put in this task" is the
+                  question people bring to a task row (GH #197). A submenu,
+                  not a flat section, so the row's own actions stay one
+                  glance tall. */}
+              <DropdownSub>
+                <DropdownSubTrigger className="justify-between">
+                  <span className="flex items-center gap-2">
+                    <Plus className="h-4 w-4" />
+                    <span>New</span>
+                  </span>
+                  <ChevronRight className="h-3.5 w-3.5 text-[var(--color-fg-faint)]" />
+                </DropdownSubTrigger>
+                <DropdownSubContent>
+                  <NewTabMenuItems
+                    taskId={w.id}
+                    onSpawnCli={(cli) => spawnIntoTask({
+                      id: crypto.randomUUID(),
+                      type: "terminal",
+                      title: agentDisplayName(cli, agents),
+                      cli,
+                    })}
+                    onSpawnShell={() => spawnIntoTask({
+                      id: crypto.randomUUID(),
+                      type: "terminal",
+                      title: "Terminal",
+                      cli: "shell",
+                    })}
+                    onScratchpad={() => {
+                      // Same activate-first rule as spawnIntoTask: an
+                      // unmounted task has no TaskView, so nothing would
+                      // restore its other pads or render this one.
+                      setActive(w.id);
+                      ensureDefaultTab(w.id, w.cli || "claude");
+                      void newScratchTab(w.id);
+                      setMenuOpen(false);
+                    }}
+                    onResume={(entryId) => {
+                      setActive(w.id);
+                      ensureDefaultTab(w.id, w.cli || "claude");
+                      resumeClosedTab(w.id, entryId);
+                      setMenuOpen(false);
+                    }}
+                    onMore={() => { setMenuOpen(false); setView("history"); }}
+                  />
+                </DropdownSubContent>
+              </DropdownSub>
+              <DropdownSeparator />
               {spotlightAvailable && (
                 <DropdownItem
                   className="items-center [&>svg]:mt-0"
@@ -2433,6 +2658,17 @@ function TaskRow({ w, compact, dragging = false, dragTy = 0, onDragPointerDown, 
                   <span>Copy branch name</span>
                 </DropdownItem>
               )}
+              {/* Paste-ready briefing that teaches ANOTHER agent to drive
+                  THIS task over the CLI, so two agents can hand each other
+                  work. See lib/agentBriefing for why the block steers both
+                  sides off `--wait` and onto prompting each other. */}
+              <DropdownItem
+                className="items-center [&>svg]:mt-0"
+                onSelect={() => { void copyAgentBriefing(w, project?.name); }}
+              >
+                <Waypoints className="h-4 w-4" />
+                <span>Copy agent CLI briefing</span>
+              </DropdownItem>
               {/* Duplicate: only for worktree tasks (the repo-root
                   entry IS the project's checkout, can't be branched
                   off cleanly). Pre-fills the New worktree dialog with

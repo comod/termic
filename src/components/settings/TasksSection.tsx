@@ -46,6 +46,10 @@ export function TasksSection() {
   const setQueueMinIntervalMs = usePrefs(s => s.setQueueMinIntervalMs);
   const confirmBeforeCloseAgentTab = usePrefs(s => s.confirmBeforeCloseAgentTab);
   const setConfirmBeforeCloseAgentTab = usePrefs(s => s.setConfirmBeforeCloseAgentTab);
+  const confirmBeforeArchiveTask = usePrefs(s => s.confirmBeforeArchiveTask);
+  const setConfirmBeforeArchiveTask = usePrefs(s => s.setConfirmBeforeArchiveTask);
+  const archiveDeleteBranch = usePrefs(s => s.archiveDeleteBranch);
+  const setArchiveDeleteBranch = usePrefs(s => s.setArchiveDeleteBranch);
 
   const hydrated = useRef(false);
   useEffect(() => {
@@ -197,17 +201,18 @@ export function TasksSection() {
       </Block>
 
       {/* Worktree config symlinks (personal). A project's agent config
-          (.claude/ etc.) is often gitignored, so a plain worktree checkout
-          omits it and agents there lose their project subagents/skills. These
-          repo-root dirs get symlinked into each new worktree task. Only ones
-          that exist in the repo are linked; clear the list to disable. */}
+          (.claude/, .mcp.json etc.) is often gitignored, so a plain worktree
+          checkout omits it and agents there lose their project subagents,
+          skills and MCP servers. These repo-root paths get symlinked into each
+          new worktree task. Only ones that exist in the repo are linked; clear
+          the list to disable. Files as well as dirs (GH #251). */}
       <Block>
         <div className="text-[14px] font-medium">Worktree config symlinks</div>
         <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
-          Repo-root dirs symlinked into each new worktree task, one per line, so agents keep project config (subagents, skills, commands) that is gitignored out of a plain checkout. Only dirs that exist in the repo are linked. Clear the list to turn this off.
+          Repo-root files and folders symlinked into each new worktree task, one per line, so agents keep project config (subagents, skills, commands, MCP servers) that is gitignored out of a plain checkout. Only entries that exist in the repo are linked. Clear the list to turn this off.
         </div>
         <div className="mt-3">
-          <ListField label="Paths to symlink" placeholder={".claude\n.gemini\n.codex"} value={symlinkPaths} onChange={setSymlinkPaths} />
+          <ListField label="Paths to symlink" placeholder={".claude\n.gemini\n.codex\n.mcp.json"} value={symlinkPaths} onChange={setSymlinkPaths} />
         </div>
         <div className="mt-3">
           <Button variant="primary" disabled={!symlinkDirty || busy} onClick={saveSymlinkPaths}>
@@ -240,6 +245,34 @@ export function TasksSection() {
           hint="Ask before closing a non-shell terminal or agent tab. Turning this off (or unchecking it once from the close dialog) closes tabs immediately; a toast then points back to the '+' menu's Resume section to bring one back."
           value={confirmBeforeCloseAgentTab}
           onChange={setConfirmBeforeCloseAgentTab}
+        />
+      </Block>
+
+      {/* The dialog's "Show this every time" checkbox writes this toggle, so
+          anyone who unticked it there has a visible way back. */}
+      <Block>
+        <Toggle
+          label="Confirm before archiving a task"
+          hint={"Ask before archiving a task. With this off (or after unticking \"Show this every time\" in the dialog), archiving happens straight away and a toast points at History."}
+          value={confirmBeforeArchiveTask}
+          onChange={setConfirmBeforeArchiveTask}
+        />
+      </Block>
+
+      {/* Always shown, whichever way the confirmation toggle is set. With the
+          dialog on it seeds that dialog's checkbox, which is still the answer
+          for that one archive; with the dialog off it IS the answer. Hiding it
+          while confirmation was on meant a user who deletes branches every
+          time had to re-tick the box on every single archive, with no way to
+          change the default. */}
+      <Block>
+        <Toggle
+          label="Delete the branch when archiving"
+          hint={confirmBeforeArchiveTask
+            ? "Start the archive dialog's \"Delete the git branch\" box ticked. You can still untick it for any single archive. A project's main checkout is never affected."
+            : "Archiving also deletes the task's branch. A project's main checkout is never affected."}
+          value={archiveDeleteBranch}
+          onChange={setArchiveDeleteBranch}
         />
       </Block>
     </div>

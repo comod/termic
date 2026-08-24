@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Task, CreateTaskArgs, CreateMultiArgs, Settings, DiscoveredRepo,
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, CheckoutResult, UpdateMode, UpdateResult, UpdateInfo, FileEntry, Agent, RepoConfig,
-  SandboxMode, TaskDiffSummary, CliInstallStatus, BranchContext,
+  SandboxMode, TaskDiffSummary, CliInstallStatus, McpStatus, BranchContext, BlameFile, GitCommit, GitCompare, GitFile, GitLogPage, GitRef,
 } from "./types";
 import type { CustomThemeFile } from "./customTheme";
 import {
@@ -60,6 +60,9 @@ export const taskOpenRepo = (
   command?: string,
   /** Externally-started session the agent resumes on first spawn (GH #169). */
   resumeSessionId?: string,
+  /** Resume-args override, applied from the first spawn. Same field as the
+   *  task menu's "Resume override" (`taskSetResumeOverride`). */
+  resumeOverride?: string,
 ) =>
   invoke<Task>("task_open_repo", {
     projectId, cli, name, command,
@@ -67,7 +70,7 @@ export const taskOpenRepo = (
     sandboxMode: sandbox?.mode,
     sandboxRwPaths: sandbox?.rwPaths,
     sandboxAllowedHosts: sandbox?.allowedHosts,
-    resumeSessionId,
+    resumeSessionId, resumeOverride,
   });
 /** List a project's git worktrees not yet open as tasks (issue #5). */
 export const taskImportableWorktrees = (projectId: string) =>
@@ -83,6 +86,9 @@ export const taskImportWorktree = (
   sandbox?: { enabled: boolean; mode?: SandboxMode; rwPaths: string[]; allowedHosts: string[] },
   /** Externally-started session the agent resumes on first spawn (GH #169). */
   resumeSessionId?: string,
+  /** Resume-args override, applied from the first spawn. Same field as the
+   *  task menu's "Resume override" (`taskSetResumeOverride`). */
+  resumeOverride?: string,
   yolo?: boolean,
 ) =>
   invoke<Task>("task_import_worktree", {
@@ -91,7 +97,7 @@ export const taskImportWorktree = (
     sandboxMode: sandbox?.mode,
     sandboxRwPaths: sandbox?.rwPaths,
     sandboxAllowedHosts: sandbox?.allowedHosts,
-    resumeSessionId, yolo,
+    resumeSessionId, resumeOverride, yolo,
   });
 export const taskArchive  = (id: string, deleteBranch?: boolean) => invoke<void>("task_archive", { id, deleteBranch });
 export const taskRestore  = (id: string) => invoke<Task>("task_restore", { id });
@@ -132,15 +138,38 @@ export const taskMatchIgnoredFiles = (id: string, clicked: string) =>
 
 // ───────────────────────────── find in files ─────────────────────────────
 
-export interface GrepHit { path: string; line: number; col: number; preview: string }
+export interface GrepHit {
+  path: string;
+  line: number;
+  col: number;
+  preview: string;
+  /** UTF-16 `[start, end)` offsets of every match on the line, straight
+   *  from the search engine. ripgrep reports them; `git grep` can't, and
+   *  sends `[]` so the frontend re-matches the preview (findMatches.ts). */
+  ranges: Array<[number, number]>;
+}
 
-/** How the query is matched. `regex` is a POSIX ERE (git grep -E), NOT
- *  PCRE — git is not always compiled with libpcre. Kept as one object so
- *  the two flags can't be swapped at a call site, and so the search and
- *  its result highlighting always read the same pair. */
+/** Which program backs find-in-files. Picks the regex flavor and whether
+ *  the dialog offers the install hint. */
+export type FindBackend = "ripgrep" | "git-grep";
+
+/** `settled: false` means the answer could still improve: Rust probes the
+ *  login-shell PATH off-thread, and until it lands an installed `rg` may
+ *  not be visible yet. Don't cache an unsettled answer, or the dialog
+ *  keeps offering "install ripgrep" to someone who already has it. */
+export interface FindBackendInfo { backend: FindBackend; settled: boolean }
+
+export const taskFindBackend = () => invoke<FindBackendInfo>("task_find_backend");
+
+/** How the query is matched. `regex` is a Rust regex under ripgrep and a
+ *  POSIX ERE (git grep -E) on the fallback, never PCRE — git is not always
+ *  compiled with libpcre. Kept as one object so the two flags can't be
+ *  swapped at a call site, and so the search and its result highlighting
+ *  always read the same pair. */
 export interface GrepOpts { regex: boolean; case_sensitive: boolean }
 
-/** Start a streaming `git grep` in the task. Results arrive via
+/** Start a streaming search in the task (ripgrep, or `git grep` where rg
+ *  isn't installed). Results arrive via
  *  `grep-result://<searchId>` events (see `onGrepResult`) and a final
  *  `grep-done://<searchId>` (`onGrepDone`). The caller generates a fresh
  *  `searchId` per keystroke so we can ignore late events from cancelled
@@ -319,8 +348,6 @@ export const taskSetTabs = (id: string, tabs: import("@/lib/types").PersistedTab
 export const taskSetTabSessionId = (id: string, tabId: string, uuid: string) =>
   invoke<void>("task_set_tab_session_id", { id, tabId, uuid });
 
-export const taskSetTabPreviousSessionId = (id: string, tabId: string, uuid: string) =>
-  invoke<void>("task_set_tab_previous_session_id", { id, tabId, uuid });
 /** Persist the JSON-encoded SplitTree for a task. Pass null to clear. */
 export const taskSetSplitLayout = (id: string, layout: string | null) =>
   invoke<void>("task_set_split_layout", { id, layout });
@@ -365,9 +392,18 @@ export type DiffSides = {
   original_bytes: number;
   modified_bytes: number;
 };
-export const taskFileDiffSides = (id: string, path: string, scope?: "unstaged" | "staged") =>
-  invoke<DiffSides>("task_file_diff_sides", { id, path, scope: scope ?? null });
+export const taskFileDiffSides = (
+  id: string,
+  path: string,
+  scope?: "unstaged" | "staged" | `commit:${string}` | `base:${string}`,
+) => invoke<DiffSides>("task_file_diff_sides", { id, path, scope: scope ?? null });
 export const taskFileRead = (id: string, path: string) => invoke<string>("task_file_read", { id, path });
+/** Read a text file by ABSOLUTE path, outside any task (GH #240). Backs the
+ *  read-only tab for a cmd+clicked path that resolves outside the task.
+ *  Rejects non-UTF-8, anything over 2 MB, and anything that is not a regular
+ *  file, so a binary or a directory surfaces as an error the caller can fall
+ *  back on rather than a hung read. There is deliberately NO write twin. */
+export const fileReadExternal = (path: string) => invoke<string>("file_read_external", { path });
 /** Read a task image or PDF as base64, for the markdown preview's inline
  *  images or the file-tree preview pane (image/PDF extensions, 20 MB cap).
  *  Member-aware + worktree-contained, same checks as taskFileRead. Pass the
@@ -394,6 +430,46 @@ export const taskPathStat = (id: string, path: string) =>
 export const taskFileWrite = (id: string, path: string, content: string) =>
   invoke<void>("task_file_write", { id, path, content });
 export const taskFiles    = (id: string) => invoke<string[]>("task_files", { id });
+
+// ─────────────────────────── scratchpads (GH #244) ───────────────────────────
+// Untitled buffers scoped to one task, stored under `<data_dir>/scratch/<taskId>/`
+// so nothing ever appears in `git status`. See `ScratchTab` in lib/types.
+
+export type ScratchRecord = {
+  id: string;
+  title: string;
+  syntax?: string;
+  order: number;
+  created_at: string;
+  updated_at: string;
+};
+/** The task's pads, ordered. Read once when a task's tabs are restored. */
+export const scratchList  = (taskId: string) => invoke<ScratchRecord[]>("scratch_list", { taskId });
+export const scratchRead  = (taskId: string, id: string) => invoke<string>("scratch_read", { taskId, id });
+/** Crash safety, NOT saving: this never clears the tab's dirty dot. Debounced
+ *  by the caller and bailed when unchanged (performance.md bear trap 8). */
+export const scratchWrite = (taskId: string, id: string, content: string) =>
+  invoke<void>("scratch_write", { taskId, id, content });
+/** Index-only update. Every field is optional so the debounced title
+ *  derivation can't race a syntax pick into a stale value. Pass `syntax: ""`
+ *  to clear a manual pick. */
+export const scratchSetMeta = (
+  taskId: string, id: string,
+  meta: { title?: string; syntax?: string; order?: number },
+) => invoke<void>("scratch_set_meta", {
+  taskId, id,
+  title: meta.title ?? null, syntax: meta.syntax ?? null, order: meta.order ?? null,
+});
+export const scratchDelete = (taskId: string, id: string) =>
+  invoke<void>("scratch_delete", { taskId, id });
+/** Write the pad's buffer to a task-relative path and drop the pad. ONE
+ *  command so promotion resolves its target through the same member-aware
+ *  containment checks every other write uses. Rejects an existing target
+ *  unless `overwrite`. */
+export const scratchPromote = (taskId: string, id: string, relPath: string, overwrite = false) =>
+  invoke<void>("scratch_promote", { taskId, id, relPath, overwrite });
+export const scratchPromoteTargetExists = (taskId: string, relPath: string) =>
+  invoke<boolean>("scratch_promote_target_exists", { taskId, relPath });
 // `heal` restores any missing repo-root member symlink while listing the
 // root — only worth doing at intentional moments (task launch, manual
 // refresh), not on every agent-settle reload, so the caller opts in.
@@ -410,9 +486,59 @@ export const taskRevealPath = (id: string, path: string) =>
 export const taskChanges  = (id: string) => invoke<Changes>("task_changes", { id });
 // Fork-style staging: staged/unstaged split per repo + stage/unstage/commit.
 export const taskGitStatus = (id: string) => invoke<GitStatus>("task_git_status", { id });
+/** One page of committed history for the Graph section (GH #199). `skip` pages
+ *  through it (the panel appends), `allBranches` swaps this branch's history
+ *  for `--all`. Newest first, `--topo-order` so a branch stays contiguous. */
+/** `allBranches` is `--all`; otherwise `refs` names the ones to walk (the
+ *  History scope picker's multi-select), and an empty list means HEAD alone.
+ *  Refs are allowlisted against the repo's real refs on the Rust side. */
+export const taskGitLog = (
+  id: string, dirName: string, skip: number, limit: number, allBranches: boolean,
+  refs: string[] = [],
+  /** Follow only the first parent of each merge, so a merged side branch
+   *  collapses into the merge that brought it in ("what landed here, in
+   *  order") instead of opening a lane. Ignored under allBranches. */
+  firstParent = false,
+  /** Literal, case-insensitive message search (`git log --grep`), run over the
+   *  whole history rather than over the page already on screen. */
+  grep = "",
+) => invoke<GitLogPage>("task_git_log", { id, dirName, skip, limit, allBranches, refs, firstParent, grep });
+/** Every ref the scope picker may offer: local branches, remote-tracking
+ *  branches and tags, freshest first. */
+export const taskGitRefs = (id: string, dirName: string) =>
+  invoke<GitRef[]>("task_git_refs", { id, dirName });
+/** Push the repo's current branch without committing, for the Push button.
+ *  Creates the upstream when the branch has none, same as Commit and Push. */
+export const taskGitPush = (id: string, dirName: string) =>
+  invoke<void>("task_git_push", { id, dirName });
+/** Whole-file blame for one editor tab, in one call. Deduped to a commit
+ *  table + a per-line index on the Rust side; blames the working tree so the
+ *  line numbers line up with the buffer on screen. Async on the Rust side
+ *  (a few hundred ms on a big file), and cached per file by `blameCache`. */
+export const taskGitBlame = (id: string, path: string) =>
+  invoke<BlameFile>("task_git_blame", { id, path });
+/** How many commits sit between HEAD and `sha`, i.e. the page `skip` that lands
+ *  on it. Lets "show this commit in History" jump straight there instead of
+ *  paging forward: on a monorepo the target can be tens of thousands of rows
+ *  down, where paging is not slow so much as hopeless. */
+export const taskGitCommitOffset = (id: string, dirName: string, sha: string) =>
+  invoke<number>("task_git_commit_offset", { id, dirName, sha });
+/** One commit in full (subject + body + author + date), for the blame popup's
+ *  hover card. Fetched only when a card opens, and cached per sha: a file's
+ *  blame can name a hundred-odd commits and the reader looks at one. */
+export const taskGitCommitMeta = (id: string, path: string, sha: string) =>
+  invoke<GitCommit>("task_git_commit_meta", { id, path, sha });
+/** The files one commit touched (merges report against their first parent). */
+export const taskGitCommitFiles = (id: string, dirName: string, sha: string) =>
+  invoke<GitFile[]>("task_git_commit_files", { id, dirName, sha });
 /** Local branch names for a task's repo (host, or a member via dirName). */
 export const taskGitBranches = (id: string, dirName: string) =>
   invoke<string[]>("task_git_branches", { id, dirName });
+/** Everything differing between `base` and the working tree — History › Compare
+ *  (GH #208). `mergeBase` picks three-dot semantics ("what this branch added",
+ *  the default) over a literal tip-to-tree diff. */
+export const taskGitCompare = (id: string, dirName: string, base: string, mergeBase: boolean) =>
+  invoke<GitCompare>("task_git_compare", { id, dirName, base, mergeBase });
 /** Local branch names for a project's repo, before any task exists. Feeds the
  *  New Task dialog's auto-numbering of the proposed branch (issue #129). */
 export const projectGitBranches = (projectId: string) =>
@@ -450,6 +576,10 @@ export const taskRunScript= (id: string, which: "setup" | "run" = "run") =>
  *  event topic because Tauri rejects dots and other punctuation. */
 export const taskRunScriptStream = (id: string, kind: "setup" | "run", member?: string) =>
   invoke<void>("task_run_script_stream", { id, kind, member: member ?? null });
+/** GH #196 on-the-fly ports: freeze newly configured names into the task's
+ *  buffer and return the fresh record. Called right before spawning a tab. */
+export const taskEnsureExtraPorts = (id: string) =>
+  invoke<Task>("task_ensure_extra_ports", { id });
 export const taskStopScript = (id: string, kind: "setup" | "run", member?: string) =>
   invoke<void>("task_stop_script", { id, kind, member: member ?? null });
 
@@ -480,7 +610,17 @@ export interface SpawnArgs {
   /** Mirrors Rust's `PtyRole`. `tab_id` is the stable selector `--tab`
    *  resolves to (index and title both move; the tab uuid does not). */
   role?: { task_id: string; tab_id?: string; kind: "agent" | "aux"; is_default?: boolean };
+  /** Mirrors Rust's `PtyOwner`: REPORTING ONLY, read by the Activity
+   *  monitor to group rows under their project / task / tab. Set it on
+   *  every spawn, including shells and run scripts — unlike `task_id`
+   *  (which arms the sandbox) and `role` (which makes the PTY
+   *  CLI-addressable and allocates a retention ring), this field has no
+   *  behavior attached to it. */
+  owner?: { task_id?: string; tab_id?: string; kind: PtyOwnerKind };
 }
+
+/** What a PTY is running, for the Activity monitor's icon + fallback label. */
+export type PtyOwnerKind = "agent" | "shell" | "aux" | "run" | "setup" | "custom";
 
 /** Sandbox status returned alongside the PTY id - tells the caller
  *  whether the cage actually closed (vs. degraded to "filesystem-only,
@@ -501,6 +641,72 @@ export const ptyWrite  = (ptyId: string, data: number[]) => invoke<void>("pty_wr
 export const ptyResize = (ptyId: string, rows: number, cols: number) => invoke<void>("pty_resize", { ptyId, rows, cols });
 export const ptyKill   = (ptyId: string) => invoke<void>("pty_kill", { ptyId });
 
+// ── Activity monitor (src-tauri/src/procmon.rs) ────────────────────────
+// Sampling is PULL-based: the Activity window's interval is the clock, so
+// nothing is measured while the window is closed. Never poll these from
+// the main window.
+
+/** One process in a row's subtree. */
+export interface ProcChild {
+  pid: number;
+  label: string;
+  cpu_pct: number | null;
+  mem_bytes: number;
+}
+
+/** One monitored subtree: a PTY we spawned, Termic itself, or one of our
+ *  WebKit sidecars. */
+export interface ProcRow {
+  /** Stable across samples, so sparkline history lines up. */
+  key: string;
+  kind: PtyOwnerKind | "app" | `webkit-${string}` | string;
+  ptyId: string | null;
+  taskId: string | null;
+  tabId: string | null;
+  pid: number;
+  /** Process name of the real workload (`sandbox-exec` wrappers skipped). */
+  label: string;
+  /** null on the first sample of a session: CPU% is a delta and there is
+   *  no previous snapshot to diff against yet. Render a dash, never a 0. */
+  cpuPct: number | null;
+  /** Sum of `phys_footprint` over the subtree (what Activity Monitor calls
+   *  "Memory"), NOT an RSS sum, which double-counts shared pages. */
+  memBytes: number;
+  rssBytes: number;
+  procCount: number;
+  threads: number;
+  cpuMs: number;
+  uptimeMs: number;
+  /** PTY output bytes/sec: the "who is repainting the screen" signal. */
+  outBps: number | null;
+  alive: boolean;
+  cpuHistory: number[];
+  children: ProcChild[];
+}
+
+export interface ProcSnapshot {
+  session: number;
+  unixMs: number;
+  rows: ProcRow[];
+  /** What this snapshot cost to take, surfaced in the UI so the monitor's
+   *  own overhead is visible rather than assumed. */
+  sampleMs: number;
+  /** True when the WebKit sidecars could not be attributed to us (the
+   *  private responsibility symbol is gone on this macOS). */
+  webkitUnavailable: boolean;
+}
+
+export const procmonStart  = () => invoke<ProcSnapshot>("procmon_start");
+export const procmonSample = (session: number) =>
+  invoke<ProcSnapshot>("procmon_sample", { session });
+export const procmonStop   = (session: number) => invoke<void>("procmon_stop", { session });
+/** Signals are restricted Rust-side to pids inside one of our PTY subtrees. */
+export const procmonSignal = (pid: number, signal: "TERM" | "KILL" | "INT" | "STOP" | "CONT") =>
+  invoke<void>("procmon_signal", { pid, signal });
+/** Open or re-focus the Activity window (a real window, not a modal, so it
+ *  keeps updating while you drive the agent it is measuring). */
+export const procmonOpenWindow = () => invoke<void>("procmon_open_window");
+
 // The user's login shell ($SHELL, falling back to zsh/bash/fish/sh).
 // See lib/loginShell.ts for the cached wrapper used by the terminals.
 export const defaultShell = () => invoke<string>("default_shell");
@@ -513,6 +719,12 @@ export const defaultShell = () => invoke<string>("default_shell");
 export function onPtyData(ptyId: string, cb: (data: Uint8Array) => void): Promise<UnlistenFn> {
   return listen<{ data: number[] }>(`pty://${ptyId}`, ev => cb(new Uint8Array(ev.payload.data)));
 }
+/** Tell Rust this PTY has a listener, so its output may start flowing.
+ *  MUST be called right after `onPtyData` resolves: a Tauri event emitted
+ *  before `listen()` registers reaches nobody, so a CLI that prints a banner
+ *  and one OSC title at startup can lose both and leave a blank terminal.
+ *  Rust holds the output until this lands (bounded by a 3s grace). */
+export const ptyAttached = (ptyId: string) => invoke<void>("pty_attached", { id: ptyId });
 /** Whether a PTY slot is still live (pty_write silently no-ops on a
  *  dead id, so delivery confirmation re-checks with this). */
 export const ptyAlive = (ptyId: string) => invoke<boolean>("pty_alive", { id: ptyId });
@@ -560,6 +772,18 @@ export const cliInstallSymlink = (system: boolean) =>
  *  (termic / termic-dev / termic-beta), and whether that location is on
  *  the user's login PATH. */
 export const cliInstallStatus  = () => invoke<CliInstallStatus>("cli_install_status");
+/** Live MCP endpoint state: the bound URL and the token file's path.
+ *  Whether the feature is on comes from `settings.mcp_enabled`, not here. */
+export const mcpStatus         = () => invoke<McpStatus>("mcp_status");
+/** The endpoint's credential, for the Settings copy affordance ONLY. Fetch
+ *  it on click and hand it straight to the clipboard; never put it in
+ *  component state or render it. Null when the endpoint is not bound. */
+export const mcpToken          = () => invoke<string | null>("mcp_token");
+/** Register the running endpoint with a client ("claude" | "codex"), so
+ *  setup is a button rather than a config block pasted by hand. Resolves
+ *  to a human-readable confirmation; rejects with the reason. */
+export const mcpInstallClient  = (client: "claude" | "codex") =>
+  invoke<string>("mcp_install_client", { client });
 export const listMonospaceFonts = () => invoke<string[]>("list_monospace_fonts");
 /** Every installed font family, unfiltered — for hiding curated picker
  *  entries whose font isn't installed. See list_font_families in lib.rs
@@ -717,6 +941,20 @@ async function resolveCompletionSoundValue(
 }
 
 export const openPath  = (path: string) => invoke<void>("open_path", { path });
+/** What `openExternalUrl` did: "default" (nothing configured, OS default took
+ *  it), "browser" (the configured command took it) or "fallback" (it failed
+ *  and the OS default took it). `reason` is set only for "fallback". */
+export interface BrowserOpen { used: "default" | "browser" | "fallback"; reason: string | null }
+/** Open a web URL, honouring the user's configured browser command (GH #245).
+ *  Pass "" for the OS default, which is the pre-#245 code path exactly.
+ *  Prefer `openWebUrl` in `lib/previewBrowser.ts`: it adds the fallback toast
+ *  so a misconfigured command can never leave a link silently dead. */
+export const openExternalUrl = (url: string, browser: string) =>
+  invoke<BrowserOpen>("open_external_url", { url, browser });
+/** Validate a browser command template for the Settings UI. Rejects an
+ *  unparseable template and a launcher that is not on PATH. */
+export const browserCommandCheck = (command: string) =>
+  invoke<void>("browser_command_check", { command });
 /** Reveal an absolute path in the OS file manager (select it on macOS/Windows,
  *  open its parent on Linux). For task-relative paths use taskRevealPath. */
 export const revealPath = (path: string) => invoke<void>("reveal_path", { path });
@@ -727,6 +965,12 @@ export const revealPath = (path: string) => invoke<void>("reveal_path", { path }
 export const openFileExternal = (path: string) =>
   invoke<"opened" | "revealed">("open_file_external", { path });
 export const homeDir   = () => invoke<string>("home_dir");
+/** `$HOME`, fetched at most once per process. The cmd-click path resolver
+ *  needs it on every `~/…` click (GH #240) and a home dir cannot change
+ *  mid-session, so the round trip is memoized. Resolves to "" if the command
+ *  fails, which callers must read as "unknown", never as a real path. */
+let homeDirOnce: Promise<string> | null = null;
+export const cachedHomeDir = () => (homeDirOnce ??= homeDir().catch(() => ""));
 export const pathExists= (path: string) => invoke<boolean>("path_exists", { path });
 export const pathIsGitRepo = (path: string) => invoke<boolean>("path_is_git_repo", { path });
 export const logLine   = (msg: string) => invoke<void>("log_line", { msg });

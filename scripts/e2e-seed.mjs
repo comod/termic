@@ -4,7 +4,7 @@
 // Exposed as seed(opts) so wdio.conf can seed an ISOLATED profile per parallel
 // worker (own data dir + fixture repo + tasks/worktree base). Idempotent.
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -33,8 +33,14 @@ export function seed(o = {}) {
   const e2e = path.join(repoRoot, ".e2e");
   const dataDir = o.dataDir ?? path.join(e2e, "profile");
   const fixture = o.fixture ?? path.join(e2e, "fixture-repo");
-  const tasksPath =
-    o.tasksPath ?? path.join(home, "termic_dev", "tasks", "fixture-repo");
+  // Inside `.e2e/`, NOT `~/termic_dev/tasks/`. The suite creates worktree
+  // tasks with fixed names, so a run that dies mid-spec leaves a worktree
+  // behind and the next run's `task_create` fails with "a worktree already
+  // lives at …". Pointing them at the dev profile's tasks directory also put
+  // e2e worktrees next to (and indistinguishable from) the developer's own,
+  // so nothing could safely clean them up. Here they are exclusively ours,
+  // and `prune` below wipes them on every seed.
+  const tasksPath = o.tasksPath ?? path.join(e2e, "tasks", "fixture-repo");
   const sbcheck =
     o.sbcheck ??
     path.join(home, "termic_dev", "workspaces", "fixture-repo", "sbcheck");
@@ -170,7 +176,40 @@ export function seed(o = {}) {
   }
 
   // 3. Profile (settings + projects) from templates, paths filled in.
+  // Task records themselves are swept by wdio.conf's onPrepare, which runs on
+  // every `test:e2e` — including the ones that skip this script.
   mkdirSync(path.join(dataDir, "tasks"), { recursive: true });
+  // Scratchpads are keyed by task id under the same profile (GH #244). The
+  // task records are recreated by the specs, so every pad still on disk here
+  // belongs to a task that no longer exists.
+  rmSync(path.join(dataDir, "scratch"), { recursive: true, force: true });
+  // Every worktree under `tasksPath` belongs to a previous run: task records
+  // are recreated by the specs themselves, so anything still on disk here is
+  // debris from a run that was interrupted before its `after` hook. Drop it,
+  // then let git forget the worktrees it still has registered — otherwise
+  // `git worktree add` refuses the same path (and `branch -D` the same
+  // branch) for the rest of time.
+  rmSync(tasksPath, { recursive: true, force: true });
+  // Legacy debris, one-time: worktree tasks used to be created under
+  // ~/termic_dev/tasks/fixture-repo. Those left by a run that died are still
+  // REGISTERED with the fixture repo, so git refuses to reuse their branch
+  // ("already checked out elsewhere") no matter how often the suite cleans up
+  // its own path. Only the `e2e-` namespace the suite creates is removed —
+  // anything else a developer parked in that directory is left alone. Can be
+  // deleted once no working copy has the old layout.
+  const legacyTasks = path.join(home, "termic_dev", "tasks", "fixture-repo");
+  if (existsSync(legacyTasks)) {
+    for (const entry of readdirSync(legacyTasks)) {
+      if (!entry.startsWith("e2e-")) continue;
+      const stale = path.join(legacyTasks, entry);
+      try {
+        sh(`git worktree remove --force "${stale}"`, fixture);
+      } catch {
+        rmSync(stale, { recursive: true, force: true });
+      }
+    }
+  }
+  try { sh("git worktree prune", fixture); } catch { /* not a repo yet */ }
   mkdirSync(tasksPath, { recursive: true });
   const fill = (s) =>
     s

@@ -19,7 +19,7 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import os from "node:os";
 import { dataDir } from "../../wdio.conf.js";
-import { archiveTask, cliRpc as rpc, openTask, requireTermicApi, waitForAppShell } from "../helpers.js";
+import { archiveTask, cliRpc as rpc, openTask, requireTermicApi, waitForAppShell, waitForClisDetected } from "../helpers.js";
 
 /**
  * Poll a tab's live PTY (spawn is async), through BOTH sides that have to
@@ -84,6 +84,13 @@ describe("termic tab: ids are addressable end to end (GH #138 part 2)", () => {
         ),
       { timeout: 20_000, timeoutMsg: "default agent PTY never spawned" },
     );
+    // The tab verbs below hydrate the agent registry INLINE when PATH
+    // detection has not landed yet, and that probe (one login shell per
+    // configured agent) takes seconds — long enough on a slow shell to blow
+    // the CLI's own 10s "did the UI answer?" deadline and fail four cases
+    // that have nothing to do with detection. Wait for the pass the app
+    // already started at launch instead of racing it.
+    await waitForClisDetected();
   });
 
   it("opens a second agent tab and returns its stable id", async () => {
@@ -169,16 +176,35 @@ describe("termic tab: ids are addressable end to end (GH #138 part 2)", () => {
       prompt: marker,
     });
     expect(r.ok).toBe(true);
-    const newId = r.data.tab_id;
+    const newId: string = r.data.tab_id;
     expect(r.data.prompt.mode).toBeTruthy();
-    // The rode-along prompt goes through the targeted send route, so the
-    // echo must appear in the NEW tab's ring (spawn + settle beat first).
+    // The rode-along prompt is injected in the BACKGROUND, after a settle beat
+    // that lets the agent finish booting. Wait for that through the STORE
+    // (`lastInputAt` is stamped the moment the write lands) rather than by
+    // polling `logs`: every `logs` call is a round trip through the CLI socket
+    // AND back into the webview, and doing that ~10x/s across the delivery
+    // window starved the write itself — `pty_write` is a synchronous command,
+    // so it queues behind that traffic on the main thread and the injection
+    // sat unresolved for the whole 40s.
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (tid, tab) =>
+            (window.__termic!.useApp.getState().tabs[tid] ?? []).some(
+              (t: any) => t.id === tab && !!t.lastInputAt,
+            ),
+          taskId,
+          newId,
+        ),
+      { timeout: 40_000, interval: 500, timeoutMsg: "tab -p's prompt was never injected" },
+    );
+    // …and it landed in the NEW tab's ring, not somewhere else.
     await browser.waitUntil(
       async () => {
         const logs = await rpc({ cmd: "logs", task: "cli-tabs", tab: newId });
         return logs.ok && logs.data.data.includes(`FAKE-AGENT echo: ${marker}`);
       },
-      { timeout: 40_000, timeoutMsg: "tab -p's prompt never reached the new tab" },
+      { timeout: 20_000, interval: 500, timeoutMsg: "tab -p's prompt never reached the new tab" },
     );
   });
 
@@ -301,7 +327,7 @@ describe("termic tab close: one tab, not the task (GH #185)", () => {
     // only side that can report the process died.
     const opened = await rpc({ cmd: "tab", task: "cli-tab-close", kind: { tab: "shell" } });
     expect(opened.ok).toBe(true);
-    const shellTabId = opened.data.tab_id;
+    const shellTabId: string = opened.data.tab_id;
     await browser.waitUntil(
       () =>
         browser.execute(
@@ -581,7 +607,7 @@ describe("termic new --from: adopt an existing worktree (GH #169)", () => {
         (window.__termic!.useApp.getState().tabs[id!] ?? []).find((t: any) => t.id === tab)
           ?.sessionId,
       adoptedId,
-      r.data.tab_id,
+      r.data.tab_id as string,
     );
     expect(tabSession).toBe("SESSION-TAB");
   });

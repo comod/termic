@@ -14,10 +14,11 @@ import { cn } from "@/lib/utils";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { attachCmdClickLinkOpener, registerPathLinkProvider, type ClickTarget } from "@/lib/termLinkOpener";
-import { resolvePathClick, normalizePath } from "@/lib/pathMatch";
-import { TerminalPathMenu } from "@/components/task/TerminalPathMenu";
+import { attachCmdClickLinkOpener, registerPathLinkProvider, isAbsoluteToken, type ClickTarget } from "@/lib/termLinkOpener";
+import { resolvePathClick, normalizePath, expandTilde, resolveAbsoluteClick, type TaskRoot } from "@/lib/pathMatch";
+import { TerminalPathMenu, type ExternalTarget } from "@/components/task/TerminalPathMenu";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { openWebUrl, browserCommandForTask } from "@/lib/previewBrowser";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { Osc52Base64 } from "@/lib/osc52";
 import { makeCtrlSniffer } from "@/lib/ctrlSniffer";
@@ -173,7 +174,9 @@ export function TerminalPane({ task, tab, active }: Props) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [pathMenu, setPathMenu] = useState<{ x: number; y: number; candidates: string[]; line?: number; col?: number } | null>(null);
+  const [pathMenu, setPathMenu] = useState<
+    { x: number; y: number; candidates: string[]; line?: number; col?: number; external?: ExternalTarget } | null
+  >(null);
   const openPathFile = useCallback((path: string, line?: number, col?: number) => {
     useApp.getState().openPreviewTab(task.id, {
       type: "edit",
@@ -205,6 +208,9 @@ export function TerminalPane({ task, tab, active }: Props) {
   // (below) stamps the final value once the burst ends, so the store
   // never understates the real last-output time by the window width.
   const lastOutputPatchRef = useRef(0);
+  // Whether firstOutputAt has been stamped for the CURRENT PTY, so the
+  // data handler patches it once rather than per chunk.
+  const firstOutputPatchedRef = useRef(false);
   const lastOutputTrailerRef = useRef<number | null>(null);
   // Scrollback line count over time. Real work GROWS the scrollback
   // (agent prints lines that scroll off). Status-bar ticks ("Cooking
@@ -253,12 +259,6 @@ export function TerminalPane({ task, tab, active }: Props) {
   const lastSpawnWasResumeRef = useRef(false);
   const failedResumeRef = useRef(false);
   const RESUME_FAILURE_MS = 2000;
-  // The uuid a resume attempt failed on during THIS app run. Only used to
-  // word the recovery banner: the stashed session is a known-bad resume
-  // ("Couldn't resume") when it matches, and a still-usable session we
-  // swapped away from ("switch back") when it doesn't (including after a
-  // restart, where the failure is no longer news).
-  const [failedUuid, setFailedUuid] = useState<string | null>(null);
 
   const patchTab = useApp(s => s.patchTab);
   const markAttention = useApp(s => s.markAttention);
@@ -276,6 +276,12 @@ export function TerminalPane({ task, tab, active }: Props) {
   // Writes timestamped lines to termic-pty-<task>-<cli>-<ptyId>.log in
   // the OS temp dir. Find path: python3 -c 'import tempfile; print(tempfile.gettempdir())'
   const debugLogRef = useRef<((tag: string, content: string) => void) | null>(null);
+  // A session uuid termic minted for THIS spawn, held back until the user
+  // actually submits (issue #102). Persisting it at spawn time meant a
+  // close+reopen before the first prompt resumed a session the agent had
+  // never written to disk, and claude answers that with "No conversation
+  // found". Cleared once persisted, and on every respawn.
+  const pendingSessionUuidRef = useRef<string | null>(null);
   // True once the user has submitted (Enter) since THIS PTY spawned.
   // Stored as a ref so it survives across re-renders and can be set from
   // both the spawn effect (term.onData) and a lastInputAt watcher (broadcast).
@@ -330,6 +336,18 @@ const captureArmedRef = useRef(false);
   // skipping the ceilings below it. Every other outcome (fired, acknowledged,
   // drained into the message queue, or already spent this turn) returns true —
   // the turn needs nothing further.
+  // Persist the uuid this spawn minted, on the FIRST real submit (keyboard
+  // Enter or a broadcast stamping lastInputAt). One-shot: the ref clears, so
+  // later submits cost nothing. Before this, a fresh agent closed and reopened
+  // without a single prompt came back with `--resume <uuid>` for a session the
+  // CLI had never written, i.e. "No conversation found" (issue #102).
+  const persistMintedSession = useCallback(() => {
+    const uuid = pendingSessionUuidRef.current;
+    if (!uuid) return;
+    pendingSessionUuidRef.current = null;
+    useApp.getState().setTabSessionId(task.id, tab.id, uuid);
+  }, [task.id, tab.id]);
+
   const fireDone = useCallback((reason: string, attn: "done" | "attention" = "done", seen = false, force = false): boolean => {
     if (doneFiredSinceSubmitRef.current) {
       debugLogRef.current?.("done-suppressed", `already fired this turn (${reason})`);
@@ -551,6 +569,13 @@ const captureArmedRef = useRef(false);
     // opens, not the WKWebView (window.open silently no-ops).
     const openLink = (via: string) => (uri: string) => {
       ipc.logLine(`[link] agent activate via=${via} uri=${uri}`).catch(() => {});
+      // GH #245: a configured browser takes the argv path in Rust. With
+      // NOTHING configured (the default) this falls through to the exact
+      // plugin-opener call that shipped before the setting existed, so the
+      // default carries none of the new path's risk. Link activation itself
+      // (#14, #58, #117) is untouched — this is only the handoff to the OS.
+      const browser = browserCommandForTask(task.id);
+      if (browser) { void openWebUrl(uri, browser); return; }
       openUrl(uri)
         .then(() => ipc.logLine("[link] agent open ok").catch(() => {}))
         .catch((e) => ipc.logLine(`[link] agent open FAILED: ${e}`).catch(() => {}));
@@ -627,7 +652,62 @@ const captureArmedRef = useRef(false);
     // swallows the click so nothing double-fires. Must attach AFTER
     // term.open (it reads .xterm-screen geometry).
     // GH #117: the same opener also resolves file-path references.
+    // GH #240: an ABSOLUTE path says exactly where it lives, so it is resolved
+    // against the task's roots rather than suffix-matched against its file
+    // list. Landing outside every root is a real answer ("this file is not in
+    // this task"), not a reason to go hunting for a same-named file — which is
+    // how `~/notes/todo.md` used to open an unrelated `docs/notes/todo.md`.
+    async function handleAbsoluteTarget(
+      target: { path: string; line?: number; col?: number }, x: number, y: number,
+    ) {
+      const abs = expandTilde(target.path, await ipc.cachedHomeDir());
+      // `task.path` and `task.composition` are frozen for a task's lifetime,
+      // so capturing them in this long-lived effect cannot go stale.
+      const roots: TaskRoot[] = [
+        { path: task.path, prefix: "" },
+        ...(task.composition ?? []).map(m => ({ path: m.path, prefix: m.dir_name })),
+      ];
+      const resolved = resolveAbsoluteClick(abs, roots);
+      if (resolved.kind === "inside") {
+        const stat = await ipc.taskPathStat(task.id, resolved.rel).catch(() => null);
+        if (stat?.exists && !stat.is_dir) {
+          openPathFile(resolved.rel, target.line, target.col);
+          return;
+        }
+        // Inside the task but not a readable file (deleted since it was
+        // printed, or a directory). Fall through to the OS actions below,
+        // which can still reveal a directory.
+      }
+      if (!(await ipc.pathExists(abs).catch(() => false))) {
+        useUI.getState().pushToast("That path no longer exists", "error");
+        return;
+      }
+      // Is it text? Not answerable from the extension: `.ts` is TypeScript AND
+      // MPEG transport stream, `.txt`/`LICENSE`/dotfiles carry no grammar at
+      // all, and a 2 GB `.json` is still `.json`. The read itself already caps
+      // size, requires UTF-8 and rejects anything that is not a regular file,
+      // so its verdict IS the answer. Costs one extra read of a ≤2 MB file on
+      // the click (EditorPane reads again on mount); worth it to decide
+      // between an editor tab and the OS menu BEFORE showing either.
+      const readable = await ipc.fileReadExternal(abs).then(() => true).catch(() => false);
+      if (readable) {
+        useApp.getState().openPreviewTab(task.id, {
+          type: "external",
+          path: abs,
+          title: abs.split("/").pop() || abs,
+          revealAt: target.line ? { line: target.line, col: target.col } : undefined,
+        });
+        return;
+      }
+      // Binary, oversized, or a directory: nothing the editor can show, so
+      // hand it to the OS actions instead of an error state.
+      setPathMenu({ x, y, candidates: [], external: { abs } });
+    }
     function handlePathTarget(target: { path: string; line?: number; col?: number }, x: number, y: number) {
+      if (isAbsoluteToken(target.path)) {
+        void handleAbsoluteTarget(target, x, y);
+        return;
+      }
       ipc.taskListFilesForFinder(task.id)
         .then(async files => {
           let matches = resolvePathClick(files, target.path);
@@ -926,6 +1006,7 @@ const captureArmedRef = useRef(false);
     // submit-window and submittedSinceSpawn on launch.
     spawnStartedAtRef.current = Date.now();
     // Reset submit-window refs for this new PTY session.
+    pendingSessionUuidRef.current = null;
     submitWindowUntilRef.current = 0;
     submitAtRef.current = 0;
     preSubmitHashRef.current = 0;
@@ -1336,7 +1417,10 @@ const captureArmedRef = useRef(false);
     // Without that, a pending render frame fires after term._core._store is
     // nulled and throws "undefined is not an object (... _isDisposed)".
     // Renderer addon — WebGL by default; localStorage override for A/B.
-    const rendererAddon = loadTerminalRenderer(term);
+    // The log sink is read lazily: debugLogRef is wired later, inside the
+    // spawn IIFE, and is null unless localStorage.ptyDebug === "1".
+    const rendererAddon = loadTerminalRenderer(term, (tag, content) =>
+      debugLogRef.current?.(tag, content));
 
     // Decide synchronously — BEFORE the rAF await in the spawn IIFE below —
     // whether this is the task's "primary" agent tab (the one allowed to
@@ -1390,6 +1474,30 @@ const captureArmedRef = useRef(false);
       captureCapable && storedUuid && !failedResumeRef.current
         ? resumeIdArgsForCli(tab.cli, storedUuid).join(" ") || undefined
         : undefined;
+    // Harvest the session ID a capture-resume agent created lazily, once per
+    // tab. Called from two places (5s after the first Enter, and again on
+    // exit as a backstop) and no-ops after either one lands. Every step is
+    // logged: the whole path is silent on failure by design (an empty
+    // capture is indistinguishable from "no session yet"), which is exactly
+    // what made GH #243 impossible to tell apart from a resume bug.
+    const captureSessionId = (reason: string) => {
+      if (!captureCapable) return;
+      const liveTab = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
+      if (liveTab?.sessionId) return;
+      const capture = postLaunchCaptureForCli(tab.cli);
+      if (!capture) return;
+      dbg("session-capture", `${reason}: running \`${capture.command}\` in ${task.path}`);
+      ipc.runCaptureCommand(capture.command, task.path)
+        .then(id => {
+          if (id) {
+            dbg("session-capture", `${reason}: captured ${id}`);
+            useApp.getState().setTabSessionId(task.id, tab.id, id);
+          } else {
+            dbg("session-capture", `${reason}: no output (CLI missing from PATH, or no session yet)`);
+          }
+        })
+        .catch(e => dbg("session-capture", `${reason}: failed — ${String(e)}`));
+    };
     const decision = decideResume({
       isAgent,
       idCapable,
@@ -1507,6 +1615,20 @@ const captureArmedRef = useRef(false);
           unattended: !!(tab as TerminalTab).unattended,
           task,
         });
+        // On-the-fly ports (GH #196): names configured after this task
+        // was created freeze into its buffer now, so this tab's env sees
+        // them. Best-effort: a failure spawns with the already-frozen
+        // pairs. The store refresh (loadAll) only fires when pairs were
+        // actually added, so the common path costs one cheap IPC.
+        let extraPorts = task.extra_named_ports ?? [];
+        try {
+          const fresh = await ipc.taskEnsureExtraPorts(task.id);
+          const freshPorts = fresh.extra_named_ports ?? [];
+          if (freshPorts.length !== extraPorts.length) {
+            extraPorts = freshPorts;
+            void useApp.getState().loadAll();
+          }
+        } catch { /* keep the frozen pairs */ }
         const spawn = await ipc.ptySpawn({
           cwd: task.path,
           cmd: spawnCmd,
@@ -1519,6 +1641,13 @@ const captureArmedRef = useRef(false);
           // parent env, so anything set here always trumps a system env.
           env: {
             TERMIC_PORT: String(task.port),
+            // Extra named ports (GH #196): frozen name→port pairs under
+            // the exact names the user configured (topped up just above).
+            // Before the per-agent block below, so a power user's env
+            // overrides still win.
+            ...Object.fromEntries(
+              extraPorts.map(np => [np.name, String(np.port)]),
+            ),
             TERMIC_WORKSPACE_NAME: task.name,
             COLORFGBG: currentColorFgBg(),
             // Registry entries (agents AND terminal-kind) carry a
@@ -1562,12 +1691,27 @@ const captureArmedRef = useRef(false);
                 is_default: isPrimaryTab && tab.cli === task.cli,
               }
             : undefined,
+          // Activity monitor provenance (reporting only). Unlike `task_id`
+          // and `role` above, EVERY tab type sets this: a run script or a
+          // scratch shell eating a core is exactly what the monitor is for,
+          // and without an owner it would show up unattributed.
+          owner: {
+            task_id: task.id,
+            tab_id: tab.id,
+            kind: (tab as TerminalTab).runTab
+              ? ((tab as TerminalTab).runTab!.kind === "setup" ? "setup" : "run")
+              : isShell ? "shell"
+              : isAgent || isRegistryTerminal ? "agent"
+              : "custom",
+          },
           rows, cols,
         });
         const ptyId = spawn.id;
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }
         ptyRef.current = ptyId;
-        patchTab(task.id, tab.id, { ptyId, lastOutputAt: Date.now() });
+        // firstOutputAt starts null: this PTY has not painted yet.
+        firstOutputPatchedRef.current = false;
+        patchTab(task.id, tab.id, { ptyId, lastOutputAt: Date.now(), firstOutputAt: null });
         // Per-PTY debug logger — active only when localStorage.ptyDebug === "1".
         // Writes to termic-pty-<task>-<cli>-<ptyId>.log in OS temp dir.
         // Find it: python3 -c 'import tempfile; print(tempfile.gettempdir())'
@@ -1614,13 +1758,15 @@ const captureArmedRef = useRef(false);
           // spawn means we have a usable session regardless of whether
           // this one was a resume or a fallback fresh.
           failedResumeRef.current = false;
-          // Just minted a uuid for THIS tab: persist it (per-tab, so each
-          // agent in the task resumes independently) so the next spawn
-          // — this session or after a restart — uses --resume <uuid> instead
-          // of --session-id <uuid>. setTabSessionId updates both the
-          // in-memory tab and disk.
+          // Just minted a uuid for THIS tab: hold it until the first real
+          // submit (see persistMintedSession), then persist it per-tab so each
+          // agent in the task resumes independently and the next spawn — this
+          // session or after a restart — uses --resume <uuid> instead of
+          // --session-id <uuid>. The agent only writes its session file once
+          // there is a conversation, so persisting at spawn time hands the
+          // next spawn a --resume id that does not exist yet.
           if (decision.kind === "mint" && sessionUuid) {
-            useApp.getState().setTabSessionId(task.id, tab.id, sessionUuid);
+            pendingSessionUuidRef.current = sessionUuid;
           }
           // Cwd-resume agents (codex) + legacy worktree continue: keep the
           // has_resumable_history flag flow so the next worktree spawn (this
@@ -1666,6 +1812,11 @@ const captureArmedRef = useRef(false);
           ctrlSniffer?.(u8);
           const now = Date.now();
           lastDataAtRef.current = now;
+          // One patch per PTY lifetime: the agent has started painting.
+          if (!firstOutputPatchedRef.current) {
+            firstOutputPatchedRef.current = true;
+            patchTab(task.id, tab.id, { firstOutputAt: now });
+          }
           if (now - lastOutputPatchRef.current >= 500) {
             lastOutputPatchRef.current = now;
             patchTab(task.id, tab.id, { lastOutputAt: now });
@@ -1709,9 +1860,19 @@ const captureArmedRef = useRef(false);
             }
           }
         });
-        // Compose data + sandbox unlisteners into the existing ref so
-        // cleanup tears down both. Avoids adding another ref.
+        // The effect cleanup calls this (with unlistenExitRef) before any
+        // respawn, so the listener never outlives its PTY. NB: a previous
+        // comment here claimed this COMPOSED several unlisteners into one ref;
+        // it does not, it assigns. Anything else that needs tearing down wants
+        // its own ref, not this one — assigning over it would silently drop
+        // whatever was already there and leak a listener per respawn.
         unlistenDataRef.current = unlistenData;
+        // Rust holds this PTY's output until the ack lands, because a Tauri
+        // event emitted before `listen()` registers reaches nobody. Without
+        // it an agent that prints its banner and one OSC title at startup and
+        // then blocks on stdin can lose both to the spawn round trip and show
+        // an empty terminal with no live title, for good.
+        ipc.ptyAttached(ptyId).catch(() => {});
 
         const unlistenExit = await ipc.onPtyExit(ptyId, (code) => {
           ptyRef.current = null;
@@ -1740,21 +1901,18 @@ const captureArmedRef = useRef(false);
             // task prop refreshes.
             failedResumeRef.current = true;
             if (decision.kind === "resume-id") {
-              // This tab's stored uuid didn't resolve on this spawn. Don't
-              // discard it — the failure may be transient (the session's
-              // transcript still exists on disk), and nuking the pointer
-              // turns that into permanent conversation loss. Stash it as the
-              // tab's previous session so the recover banner can offer it,
-              // then clear the live slot so the immediate retry mints fresh.
-              // An occupied stash is left alone: it holds the session we
-              // swapped away from to try this one, which is worth keeping
-              // over a uuid that just proved unresumable.
-              const stashed = (useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as
-                TerminalTab | undefined)?.previousSessionId;
-              if (storedUuid) {
-                if (!stashed) useApp.getState().setTabPreviousSessionId(task.id, tab.id, storedUuid);
-                setFailedUuid(storedUuid);
-              }
+              // This tab's stored uuid no longer resolves, so clear the slot
+              // and let the immediate retry mint a fresh session. Say so once,
+              // now: termic losing its pointer does NOT delete the transcript,
+              // and every id-resuming agent has its own picker for it
+              // (`claude --resume`, `opencode session list`). We used to stash
+              // the uuid and offer a "Resume it" banner instead; it outlived
+              // the failure it described, never cleared itself, and came back
+              // on every relaunch worded as if nothing had gone wrong.
+              useUI.getState().pushToast(
+                `Couldn't resume the previous ${agentDisplayName(tab.cli)} session. Started a fresh one.`,
+                "info",
+              );
               useApp.getState().setTabSessionId(task.id, tab.id, "");
             } else if (!useIdResume) {
               // Worktree rapid-exit on `--continue` = "no conversation"
@@ -1798,17 +1956,7 @@ const captureArmedRef = useRef(false);
           // Capture-based session resume (opencode): on the first normal exit
           // when no session ID is stored, run the capture command so the next
           // spawn can use --session <id> instead of starting fresh.
-          if (captureCapable) {
-            const liveTab = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as import("@/lib/types").TerminalTab | undefined;
-            if (!liveTab?.sessionId) {
-              const capture = postLaunchCaptureForCli(tab.cli);
-              if (capture) {
-                ipc.runCaptureCommand(capture.command, task.path)
-                  .then(id => { if (id) useApp.getState().setTabSessionId(task.id, tab.id, id); })
-                  .catch(() => {});
-              }
-            }
-          }
+          captureSessionId("exit");
           // Clear the PTY id — the process is gone. Otherwise the dead
           // id lingers on the tab and features that enumerate live PTYs
           // (Broadcast) would target a corpse. A Restart respawns and
@@ -1853,6 +2001,7 @@ const captureArmedRef = useRef(false);
             }
             patchTab(task.id, tab.id, { lastInputAt: Date.now() });
             submittedSinceSpawnRef.current = true;
+            persistMintedSession();
             noteSubmit(tab.cli);
             submitAtRef.current = Date.now();
             submitWindowUntilRef.current = submitAtRef.current + 5_000;
@@ -1866,17 +2015,10 @@ const captureArmedRef = useRef(false);
             // stored session ID, wait 5s then harvest the session ID the
             // CLI just created. Strictly one-shot per spawn.
             if (captureCapable && !captureArmedRef.current) {
-              const liveTab = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as import("@/lib/types").TerminalTab | undefined;
+              const liveTab = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
               if (!liveTab?.sessionId) {
-                const capture = postLaunchCaptureForCli(tab.cli);
-                if (capture) {
-                  captureArmedRef.current = true;
-                  window.setTimeout(() => {
-                    ipc.runCaptureCommand(capture.command, task.path)
-                      .then(id => { if (id) useApp.getState().setTabSessionId(task.id, tab.id, id); })
-                      .catch(() => {});
-                  }, 5000);
-                }
+                captureArmedRef.current = true;
+                window.setTimeout(() => captureSessionId("first-submit"), 5000);
               }
             }
           }
@@ -1978,6 +2120,7 @@ const captureArmedRef = useRef(false);
     const t = tab.lastInputAt;
     if (t && t > (spawnStartedAtRef.current || 0)) {
       submittedSinceSpawnRef.current = true;
+      persistMintedSession();
       noteSubmit(tab.cli);
       submitAtRef.current = t;
       submitWindowUntilRef.current = t + 5_000;
@@ -2325,45 +2468,6 @@ const captureArmedRef = useRef(false);
           } : undefined}
         />
       )}
-      {!exited && tab.previousSessionId && (
-        // A --resume attempt fast-exited and we fell back to a fresh session;
-        // the old session id was stashed, not discarded, so offer to recover
-        // it. In-flow (like the exited banner) so it pushes the live terminal
-        // down instead of covering it. The banner outlives the failure (it's
-        // persisted, and the fallback session may be days old by the time it's
-        // clicked), so it swaps the two uuids rather than dropping the live
-        // one, and words itself by whether the stashed session is the one that
-        // failed to resume in this run.
-        <TerminalExitedBanner
-          label={tab.previousSessionId === failedUuid
-            ? "Couldn't resume your previous session."
-            : "Your previous session is still available."}
-          actionLabel={tab.previousSessionId === failedUuid ? "Resume it" : "Switch back"}
-          tone="warning"
-          onAction={() => {
-            const live = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as
-              TerminalTab | undefined;
-            const prev = live?.previousSessionId;
-            if (!prev) return;
-            // SWAP, don't discard: the session we're leaving is a real
-            // conversation too (the user may have been working in it since the
-            // failed resume), and dropping its uuid is the same permanent loss
-            // this banner exists to prevent. Then respawn: reset the fail flag
-            // + bump gen so the spawn effect re-reads the uuid live and resumes
-            // it via --resume.
-            useApp.getState().setTabSessionId(task.id, tab.id, prev);
-            useApp.getState().setTabPreviousSessionId(task.id, tab.id, live?.sessionId ?? "");
-            failedResumeRef.current = false;
-            setGen(g => g + 1);
-          }}
-          secondary={{
-            label: "Dismiss",
-            title: "Keep the current session and forget the previous one",
-            icon: X,
-            onAction: () => useApp.getState().setTabPreviousSessionId(task.id, tab.id, ""),
-          }}
-        />
-      )}
       {/* data-* hooks: the terminal renders to a WebGL canvas, so e2e has no
           text to select this pane by (see the drop spec in files.e2e.ts). */}
       <div ref={hostRef} data-terminal-host={tab.id} className="min-h-0 flex-1 bg-[var(--color-bg)]" />
@@ -2372,6 +2476,7 @@ const captureArmedRef = useRef(false);
           x={pathMenu.x}
           y={pathMenu.y}
           candidates={pathMenu.candidates}
+          external={pathMenu.external}
           onPick={(path) => { openPathFile(path, pathMenu.line, pathMenu.col); setPathMenu(null); }}
           onClose={() => setPathMenu(null)}
           onCloseAutoFocus={(e, picked) => {
@@ -2439,7 +2544,7 @@ export function FooterBar({ task, sandboxWarning }: {
 }) {
   const splitOpen     = useApp(s => !!s.terminalSplit[task.id]);
   const splitCollapsed = useApp(s => !!s.terminalSplitCollapsed[task.id]);
-  const toggleSplit = useApp(s => s.toggleTerminalSplit);
+  const toggleBottomTerminal = useApp(s => s.toggleBottomTerminal);
   const mode = effectiveSandboxMode(task);
 
   // no right-split agent queue state needed; split panes show their own queue via SplitView
@@ -2501,11 +2606,13 @@ export function FooterBar({ task, sandboxWarning }: {
           affordance reachable from any tab regardless of split state. */}
       <ReviewCommentsBar taskId={task.id} />
       {/* +Terminal opens the bottom split. Hidden when the split is already
-          open — no point offering to add what's there. */}
+          open — no point offering to add what's there. Goes through
+          toggleBottomTerminal (the ⌘J action) so the new shell also takes
+          focus; a raw toggleTerminalSplit leaves the seeded shell unfocused. */}
       {!splitOpen && (
         <button
           type="button"
-          onClick={() => toggleSplit(task.id)}
+          onClick={() => toggleBottomTerminal(task.id)}
           title="Open a bottom terminal split"
           className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[12.5px] text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-fg)]"
         >

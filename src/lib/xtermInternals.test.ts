@@ -26,6 +26,10 @@ const REACH_INS: Record<string, string> = {
   getLinkData: "termLinkOpener",
   // lib/terminalRenderer.ts — renderer debug snapshot.
   _coreBrowserService: "terminalRenderer",
+  // lib/terminalRenderer.ts — paused render service in the rebuild log line
+  // (a paused xterm draws nothing on ANY renderer, so the field log needs it).
+  _renderService: "terminalRenderer",
+  _isPaused: "terminalRenderer",
 };
 
 describe("xterm bundle still exposes our private reach-ins", () => {
@@ -42,6 +46,12 @@ const webglBundle = readFileSync(require.resolve("@xterm/addon-webgl"), "utf8");
 const WEBGL_REACH_INS: Record<string, string> = {
   // Addon's handle to its WebglRenderer (dumpRenderer + atlasCanvasGuard).
   _renderer: "terminalRenderer, atlasCanvasGuard",
+  // lib/terminalRenderer.ts — wake-guard probe for silently-lost GL contexts.
+  _gl: "terminalRenderer",
+  // lib/terminalRenderer.ts — the canvas we bind webglcontextlost /
+  // webglcontextrestored on, because xterm's derived onContextLoss never
+  // fires for a RESTORED context and its in-place repair leaves a stale atlas.
+  _canvas: "terminalRenderer",
   // lib/atlasCanvasGuard.ts — glyph-atlas scratch canvas adoption.
   _charAtlas: "atlasCanvasGuard",
   _tmpCanvas: "atlasCanvasGuard",

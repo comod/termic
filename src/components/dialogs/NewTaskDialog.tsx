@@ -10,13 +10,16 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
-import { cliSupportsResumeById, visibleCliIds } from "@/lib/agents";
-import { taskCreate, taskCreateMulti, settingsLoad, taskImportableWorktrees, taskImportWorktree, sandboxAvailable, taskOpenRepo, projectGitBranches } from "@/lib/ipc";
+import { visibleCliIds, isTerminalCli, agentDisplayName } from "@/lib/agents";
+import { taskCreate, taskCreateMulti, settingsLoad, taskImportableWorktrees, taskImportWorktree, sandboxAvailable, taskOpenRepo, projectGitBranches, projectBranchContext } from "@/lib/ipc";
 import { launchSetupTab } from "@/lib/runTabs";
+import { seedPromptWhenReady } from "@/lib/seedPrompt";
+import { MAX_PROMPT_CHARS } from "@/lib/deepLink";
 import { withCreateLock } from "@/lib/createLock";
-import { uniqueBranch } from "@/lib/quickTask";
-import { slugify, branchify, cn } from "@/lib/utils";
-import { Check, Loader2, AlertTriangle, GitBranch, Link2, FolderGit2, Plus } from "lucide-react";
+import { usePendingTasks } from "@/store/pendingTasks";
+import { uniqueBranch, derivedBranch } from "@/lib/quickTask";
+import { cn } from "@/lib/utils";
+import { Check, Loader2, AlertTriangle, GitBranch, Link2, FolderGit2, Plus, History } from "lucide-react";
 import { SandboxModeSelector } from "@/components/SandboxModeSelector";
 import { SANDBOX_PRESETS } from "@/lib/sandboxPresets";
 import type { MemberMode, ImportableWorktree, SandboxMode } from "@/lib/types";
@@ -44,7 +47,15 @@ function persistLast(key: string, val: string) { try { localStorage.setItem(key,
 
 export function NewTaskDialog() {
   const projectId = useUI(s => s.newTaskProjectId);
+  // Subscribed, not read imperatively: this is what makes a re-open (a second
+  // deep link) re-run the reset effect below. Scalar, so an unrelated store
+  // write can't re-render the dialog through it.
+  const seedNonce = useUI(s => s.newTaskSeed?.nonce ?? 0);
   const close = useUI(s => s.closeNewTask);
+  const pendingAdd = usePendingTasks(s => s.add);
+  const pendingAppendLine = usePendingTasks(s => s.appendLine);
+  const pendingFail = usePendingTasks(s => s.fail);
+  const pendingRemove = usePendingTasks(s => s.remove);
   const project = useApp(s => projectId ? s.projects.find(p => p.id === projectId) : null);
   const setActive = useApp(s => s.setActiveTask);
   const loadAll = useApp(s => s.loadAll);
@@ -73,6 +84,10 @@ export function NewTaskDialog() {
   const [branch, setBranch] = useState("");
   const [branchEdited, setBranchEdited] = useState(false);
   const [base, setBase] = useState("");
+  /** A deep-link `base=` this repo has no ref for; shown under the field. */
+  const [baseUnknown, setBaseUnknown] = useState<string | null>(null);
+  /** A deep-link `agent=` this install doesn't offer; shown under the picker. */
+  const [agentUnknown, setAgentUnknown] = useState<string | null>(null);
   // Single-repo task shape: "worktree" (branch a fresh working dir) or
   // "repo_root" (no worktree — launch the agent in the repo's live checkout,
   // the same shape as the sidebar's "Run in repo with <agent>"). Main checkout
@@ -136,23 +151,77 @@ export function NewTaskDialog() {
   const [importList, setImportList] = useState<ImportableWorktree[]>([]);
   const [importLoading, setImportLoading] = useState(false);
   const [importSelected, setImportSelected] = useState<string | null>(null);
-  // Attach an externally-started agent session (GH #169): the id seeds the
-  // first spawn's resume args. Offered in every single-repo mode (create,
-  // main checkout, import) for id-resume-capable agents; one shared field
-  // element serves both spots in the form.
-  const [resumeSession, setResumeSession] = useState("");
-  const resumeSessionField = (
+  // Resume-args override, set at create so it applies from the FIRST spawn.
+  // Exactly the field the task menu's "Resume override" edits
+  // (Task.resume_override, task_set_resume_override): same storage, same
+  // placeholder expansion, same "the agent owns a missing session" stance.
+  //
+  // It replaced a "Resume session ID" box that only accepted a bare uuid and
+  // only appeared for agents declaring `resume_id_args` (claude, opencode,
+  // copilot). Codex, gemini and agy resume with `--continue` / `resume
+  // --last`, which take no id, so those agents got no field at all even
+  // though raw resume args work fine for them (GH #169).
+  const [resumeOverride, setResumeOverride] = useState("");
+  // Optional first message, typed into the agent once it finishes booting
+  // (GH #192). Blank by default and blank for every existing entry point —
+  // this exists so a `termic://` link can arrive with a summarized ticket
+  // already in the box, and so the user SEES that text and can edit or
+  // clear it before anything is created. Never auto-submitted from the
+  // link: the Create button is the confirmation.
+  const [prompt, setPrompt] = useState("");
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+  // Agents that can't take a typed first message (a plain shell has no
+  // prompt box to type into) hide the field rather than silently dropping
+  // the text at create time.
+  const canPrompt = cli !== "shell" && !isTerminalCli(cli);
+  const agentLabel = agentDisplayName(cli);
+  // Auto-grow to fit the content, capped by max-height (then it scrolls).
+  // Runs on seed as well as on typing, so a link-delivered prompt opens at
+  // its real height instead of a 3-row window the user has to scroll.
+  function growPrompt(el: HTMLTextAreaElement | null) {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }
+  useEffect(() => { growPrompt(promptRef.current); }, [prompt]);
+  // A plain shell or a registry terminal entry (docker, ssh) has no agent
+  // session to resume, so there is nothing for an override to replace. Every
+  // real agent takes resume args, whether or not it can address a session by
+  // id, which is the whole point of this being an args override.
+  const canResumeOverride = cli !== "shell" && !isTerminalCli(cli);
+  /** The override as sent to Rust: capability-gated, trimmed, blank → unset. */
+  const resumeOverrideArg = () =>
+    canResumeOverride ? resumeOverride.trim() || undefined : undefined;
+  // Collapsed by default: a label + hint + input is three lines of a form
+  // that already scrolls, spent on something almost nobody sets at create
+  // time (the task menu edits it afterwards for the rest). Expanded state is
+  // per-open, not remembered: typing a value keeps it visible on its own.
+  const [resumeOpen, setResumeOpen] = useState(false);
+  // Same copy as ResumeOverrideDialog, trimmed to one line: this one is a
+  // field in a long form, not a dialog whose whole subject is the override.
+  const resumeOverrideField = resumeOpen ? (
     <Field
-      label="Resume session ID (optional)"
-      hint="A session started outside Termic. The agent resumes it on its first spawn here; leave empty to start fresh."
+      label="Resume args override (optional)"
+      hint={`Replaces ${agentLabel}'s default resume arguments. {WORKSPACE_NAME}, {WORKSPACE_SLUG} and {BRANCH} expand at launch. Editable later from the task menu.`}
     >
       <Input
-        value={resumeSession}
-        onChange={e => setResumeSession(e.target.value)}
-        placeholder="e.g. 018f2c1e-6f7a-7c2e-9c1a-2f3b4c5d6e7f"
-        spellCheck={false}
+        value={resumeOverride}
+        onChange={e => setResumeOverride(e.target.value)}
+        placeholder="--resume {WORKSPACE_NAME}"
+        className="font-mono"
+        autoFocus
       />
     </Field>
+  ) : (
+    <button
+      type="button"
+      data-testid="resume-override-toggle"
+      onClick={() => setResumeOpen(true)}
+      className="-mb-1 inline-flex items-center gap-1.5 self-start text-[12.5px] text-[var(--color-fg-dim)] hover:text-[var(--color-accent)]"
+    >
+      <History className="h-3.5 w-3.5" />
+      Override resume args
+    </button>
   );
   // Existing local branch names in the project's repo, loaded on open so the
   // auto-filled branch can dodge one still hanging around from an archived
@@ -168,12 +237,6 @@ export function NewTaskDialog() {
   // submit() so concurrent calls see the truth immediately.
   const submittingRef = useRef(false);
   const [err, setErr] = useState<string | null>(null);
-  // Progress phase: form (default) → creating (worktree+copy in flight) →
-  // setup (running setup script with live output) → done (success, 2s flash) → error.
-  const [phase, setPhase] = useState<"form" | "creating" | "setup" | "done" | "error">("form");
-  const [setupLog, setSetupLog] = useState<string[]>([]);
-  const [createdTaskId, setCreatedTaskId] = useState<string | null>(null);
-  const outputRef = useRef<HTMLDivElement>(null);
 
   // Reset the form ONLY when the dialog opens for a different project —
   // never on re-fetches of the same project's data. Window-focus events fire
@@ -182,6 +245,13 @@ export function NewTaskDialog() {
   // every field the user just typed. Depending on `projectId` (a stable
   // string) avoids that. We seed CLI/base from the project but read them
   // imperatively at effect-time via getState so we don't need them in deps.
+  //
+  // `seedNonce` is the second key: a deep link arriving while the dialog is
+  // ALREADY open for the same project changes no other dependency, so without
+  // it the window would raise onto the previous link's name and prompt (GH
+  // #192). It is bumped by `openNewTask` itself, so it can only change on an
+  // explicit open — never on the `loadAll()` refetches this effect must
+  // ignore.
   useEffect(() => {
     if (!projectId) return;
     const p = useApp.getState().projects.find(x => x.id === projectId);
@@ -189,9 +259,41 @@ export function NewTaskDialog() {
     // "Duplicate task" flow to pre-fill `base` with the source
     // task's branch tip + optionally seed a name prefix.
     const seed = useUI.getState().newTaskSeed;
-    setName(seed?.namePrefix ?? "");
-    setBranch(""); setBranchEdited(false); setErr(null);
+    const seededName = seed?.namePrefix ?? "";
+    setName(seededName);
+    // Seed the branch HERE, in the same pass as the name, rather than
+    // blanking it and leaving the job to the derive effect below. A deep
+    // link arrives with the name already filled, so the user is looking at
+    // a populated Name and an empty "Branch name" until they touch the
+    // Name field, which is the one thing a link is supposed to save them
+    // (GH #192 follow-up). `existingBranches` is empty at this point; the
+    // derive effect still runs when the repo's branch list lands and bumps
+    // the suffix if this one collides (#129).
+    // Read imperatively, like the CLI/base seeds above: the effect must not
+    // re-run (and re-blank the form) just because the prefix pref changed.
+    setBranch(derivedBranch(seededName, usePrefs.getState().branchPrefix));
+    setBranchEdited(false); setErr(null);
     setBase(seed?.baseBranch ?? p?.base_branch ?? "");
+    // A LINK-supplied base is the one nobody can see before pressing Create:
+    // a typo'd `base=` used to surface as a git error at create time, several
+    // seconds later and with no hint that the URL caused it. So check it here
+    // and say so next to the field.
+    //
+    // A warning, not a refusal, and not a blocked Create: create fetches the
+    // base ref first (`git_fetch_base`), so a branch that exists only on the
+    // remote and has never been fetched locally is legitimate — refusing it
+    // would break links that work.
+    setBaseUnknown(null);
+    const seededBase = seed?.baseBranch;
+    if (seededBase) {
+      projectBranchContext(projectId)
+        .then(ctx => {
+          if (useUI.getState().newTaskProjectId !== projectId) return;
+          const known = [...ctx.local, ...ctx.remote];
+          if (!known.includes(seededBase)) setBaseUnknown(seededBase);
+        })
+        .catch(() => { /* no branch list ⇒ nothing to contradict */ });
+    }
     // Pick a CLI that's actually present and respects the project's
     // saved default whenever usable. Order:
     //   1. project default — IF it's "shell" (always usable), or
@@ -205,8 +307,19 @@ export function NewTaskDialog() {
     const isInstalled = (id: string) => detected[id]?.found === true;
     const isUsable = (id: string) =>
       id === "shell" || !detectionRan || isInstalled(id);
+    //   0. an explicitly seeded agent (deep link) — but only if this
+    //      install actually offers it, so a link naming an agent the user
+    //      doesn't have falls through to the normal pick instead of
+    //      selecting a pill that isn't there.
+    const seededAgent =
+      seed?.agent && list.some(a => !a.disabled && a.id === seed.agent) ? seed.agent
+      : seed?.agent === "shell" ? "shell"
+      : null;
     const projectDefault = p?.default_cli || "";
-    if (projectDefault && isUsable(projectDefault)) {
+    setAgentUnknown(seed?.agent && !seededAgent ? seed.agent : null);
+    if (seededAgent) {
+      setCli(seededAgent);
+    } else if (projectDefault && isUsable(projectDefault)) {
       setCli(projectDefault);
     } else {
       const firstInstalled = list.find(a => !a.disabled && isInstalled(a.id))?.id;
@@ -284,7 +397,8 @@ export function NewTaskDialog() {
     const canImp = (p?.type ?? "single") !== "multi" && !p?.non_git;
     const wantImport = !!seed?.importMode && canImp;
     setImportSelected(null); setImportList([]); setImportLoading(false);
-    setResumeSession("");
+    setResumeOverride(""); setResumeOpen(false);
+    setPrompt(seed?.prompt ?? "");
     setImportMode(wantImport);
     // Load existing branches so `derived` can auto-number past a collision
     // (#129). Only meaningful for single-repo git projects (worktree mode).
@@ -296,17 +410,15 @@ export function NewTaskDialog() {
     // restores the user's last-used type (main checkout by default). Shares
     // the `newTaskLastMode` key with the sidebar quick menu, so the toggle
     // choice carries across both surfaces.
-    setMode(p?.non_git ? "repo_root" : (readLastMode() ?? "repo_root"));
+    // A seeded mode (deep link) outranks the remembered choice — the link
+    // asked for a specific shape. The non-git clamp still wins over both;
+    // parseDeepLink rejects `worktree` on a non-git project up front, so
+    // this only ever catches a project that lost its git dir since.
+    setMode(p?.non_git ? "repo_root" : (seed?.mode ?? readLastMode() ?? "repo_root"));
     if (canImp) loadImportable(projectId);
-    setPhase("form"); setSetupLog([]); setCreatedTaskId(null);
-    // CRITICAL: also reset `busy`. On a successful prior creation we
-    // intentionally leave busy=true (so the form can't be re-submitted
-    // during the streaming-setup phase). Without this reset, the NEXT
-    // time the dialog opens, busy is still true → Create button stays
-    // disabled even with all fields filled.
     setBusy(false);
     submittingRef.current = false;
-  }, [projectId]);
+  }, [projectId, seedNonce]);
 
   // Tauri event unlisten handles. Owned by submit() (which registers them
   // imperatively BEFORE invoking taskCreate — guaranteed ordering vs
@@ -318,32 +430,16 @@ export function NewTaskDialog() {
     unlistenRef.current = [];
   }, []);
 
-  // Auto-scroll setup output as new lines arrive.
-  useEffect(() => {
-    const el = outputRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [setupLog]);
-
   // Branch auto-fills from the name, but ONLY until the user touches the
   // branch field — after that it's theirs and we never clobber it (#15:
   // no more fighting a prefix you didn't want). Default shape is
   // `feature/<name>`, fully editable. A name that's already a qualified
   // branch (contains a "/", e.g. a Linear "username/my-feature" pasted
   // straight in) is taken verbatim with no prefix.
-  const derived = useMemo(() => {
-    const trimmed = name.trim();
-    if (!trimmed) return "";
-    const base = trimmed.includes("/")
-      ? branchify(trimmed)
-      // Normalize the user's prefix at use time: drop surrounding slashes /
-      // whitespace. An empty prefix yields a bare slug (no leading slash).
-      : (() => {
-          const prefix = branchPrefix.trim().replace(/^\/+|\/+$/g, "");
-          const slug = slugify(trimmed);
-          return prefix ? `${prefix}/${slug}` : slug;
-        })();
-    return uniqueBranch(base, existingBranches);
-  }, [name, branchPrefix, existingBranches]);
+  const derived = useMemo(
+    () => uniqueBranch(derivedBranch(name, branchPrefix), existingBranches),
+    [name, branchPrefix, existingBranches],
+  );
   useEffect(() => { if (!branchEdited) setBranch(derived); }, [derived, branchEdited]);
 
   // Load the project's importable (existing, unopened) worktrees.
@@ -373,6 +469,14 @@ export function NewTaskDialog() {
     setName(wt.branch || baseName);
   }
 
+  // The first message, if the user left one AND the chosen agent can take
+  // one. Typed into the task's default tab once its agent finishes booting
+  // (lib/seedPrompt); best-effort, so a create never fails over a prompt.
+  function seedFirstMessage(taskId: string) {
+    if (!canPrompt) return;
+    seedPromptWhenReady(taskId, prompt.trim());
+  }
+
   // Adopt an existing worktree. No worktree-add / file-copy / setup
   // script, so this skips the streaming phases entirely.
   async function submitImport() {
@@ -385,13 +489,15 @@ export function NewTaskDialog() {
       const w = await withCreateLock(() => taskImportWorktree(
         projectId, importSelected, name.trim(), cli,
         { enabled: sandbox, mode: sandboxMode, rwPaths: splitLines(sbRw), allowedHosts: splitLines(sbHosts) },
+        undefined, // no externally-started session id from this dialog
         // Gated on capability, not just field state: the input hides when
-        // the agent switches to one that cannot resume by id, but the
-        // typed value would otherwise still ride along.
-        cliSupportsResumeById(cli) ? resumeSession.trim() || undefined : undefined,
+        // the agent switches to one with nothing to resume, but the typed
+        // value would otherwise still ride along.
+        resumeOverrideArg(),
       ));
       await loadAll();
       setActive(w.id);
+      seedFirstMessage(w.id);
       close();
     } catch (e) {
       setErr(String(e));
@@ -417,10 +523,12 @@ export function NewTaskDialog() {
         projectId, cli, name.trim(),
         { enabled: sandbox, mode: sandboxMode, rwPaths: splitLines(sbRw), allowedHosts: splitLines(sbHosts) },
         undefined,
-        cliSupportsResumeById(cli) ? resumeSession.trim() || undefined : undefined,
+        undefined, // no externally-started session id from this dialog
+        resumeOverrideArg(),
       ));
       await loadAll();
       setActive(w.id);
+      seedFirstMessage(w.id);
       close();
     } catch (e) {
       setErr(String(e));
@@ -448,39 +556,32 @@ export function NewTaskDialog() {
     if (!projectId || !name.trim() || !branch.trim()) return;
     if (submittingRef.current) return;
     submittingRef.current = true;
-    setBusy(true); setErr(null); setPhase("creating"); setSetupLog([]);
     const taskId = crypto.randomUUID();
-    setCreatedTaskId(taskId);
     // Clean up any prior unlisteners from a previous (errored) submission
     // before registering new ones.
     for (const u of unlistenRef.current) u();
     unlistenRef.current = [];
-    // Multi-repo still runs its (possibly several, sequential) member setup
-    // scripts synchronously on the Rust side and streams progress here —
-    // that path is unchanged, so keep waiting on it. Single-repo setup runs
-    // as an unfocused background tab instead (see below), so it needs
-    // neither of these listeners. Pre-generate + `await listen(...)` BEFORE
-    // invoking taskCreateMulti: the earlier useEffect-based subscription
-    // wasn't guaranteed to attach in time — for empty setup scripts Rust
-    // emits setup-done synchronously, so the done event could fire while
-    // React was still scheduling the effect → dialog hung forever on
-    // "Waiting for output…". `await listen()` returns once the
-    // subscription is confirmed by the Tauri backend, eliminating the race.
-    if (isMulti) {
-      const uOut = await listen<{ line: string }>(`setup-output://${taskId}`, ev => {
-        setSetupLog(log => [...log, ev.payload.line]);
-      });
-      const uDone = await listen<{ code: number | null; success: boolean }>(`setup-done://${taskId}`, ev => {
-        if (ev.payload.success) {
-          setPhase("done");
-          window.setTimeout(() => { setActive(taskId); close(); }, 2000);
-        } else {
-          setPhase("error");
-          setErr(`Setup script exited with code ${ev.payload.code ?? "?"}.`);
-        }
-      });
-      unlistenRef.current = [uOut, uDone];
-    }
+    // Register the progress listener BEFORE invoking taskCreate/
+    // taskCreateMulti — `await listen()` returns once the Tauri backend has
+    // confirmed the subscription, so no line emitted the instant the Rust
+    // side starts running can race past an unmounted listener (the same
+    // ordering guarantee the old setup-output subscription relied on).
+    // Both create paths emit onto this ONE channel now (worktree add, file
+    // copy, port allocation — see emit_create_progress in lib.rs — and,
+    // for single-repo, the setup script that follows via launchSetupTab
+    // below), so the pending pane's log is the whole creation timeline
+    // with no second event name to wire up.
+    const uOut = await listen<{ line: string }>(`setup-output://${taskId}`, ev => {
+      pendingAppendLine(taskId, ev.payload.line);
+    });
+    unlistenRef.current = [uOut];
+    // Represent the in-flight task in the sidebar + main pane right away —
+    // this IS the fix for GH #242 (worktree creation no longer locks the
+    // whole window behind a modal). The dialog closes on the next line;
+    // CreatingTaskPane (MainArea) and PendingTaskRow (Sidebar) take over.
+    pendingAdd({ id: taskId, projectId, name: name.trim(), cli });
+    setActive(taskId);
+    close();
     try {
       // Snap textareas → string[]. Done at submit so blank lines
       // during typing don't roundtrip through the array state.
@@ -507,57 +608,59 @@ export function NewTaskDialog() {
           sandbox_mode: sandboxMode,
           sandbox_rw_paths:       sandbox ? splitLines(sbRw)    : undefined,
           sandbox_allowed_hosts:  sandbox ? splitLines(sbHosts) : undefined,
+          resume_override: resumeOverrideArg(),
         }));
-        await loadAll();
-        setPhase("setup");
-        // On success, submittingRef stays true until the dialog closes —
-        // guards against any re-submit during the streaming-setup phase.
-        return;
+      } else {
+        await withCreateLock(() => taskCreate({
+          id: taskId,
+          project_id: projectId,
+          name: name.trim(),
+          cli,
+          base_branch: base.trim() || null,
+          branch: branch.trim(),
+          // Capability-gated like import: the field hides when the agent has
+          // nothing to resume, but typed state would otherwise ride along.
+          resume_override: resumeOverrideArg(),
+          sandbox_enabled: sandbox,
+          sandbox_mode: sandboxMode,
+          // Only send lists when sandbox is on - keeps the JSON tidy
+          // for unsandboxed tasks (they don't need these saved).
+          sandbox_rw_paths:       sandbox ? splitLines(sbRw)    : undefined,
+          sandbox_allowed_hosts:  sandbox ? splitLines(sbHosts) : undefined,
+        }));
       }
-      await withCreateLock(() => taskCreate({
-        id: taskId,
-        project_id: projectId,
-        name: name.trim(),
-        cli,
-        base_branch: base.trim() || null,
-        branch: branch.trim(),
-        // Capability-gated like import: the field hides when the agent
-        // cannot resume by id, but typed state would otherwise ride along.
-        resume_session_id:
-          cliSupportsResumeById(cli) ? resumeSession.trim() || undefined : undefined,
-        sandbox_enabled: sandbox,
-        sandbox_mode: sandboxMode,
-        // Only send lists when sandbox is on - keeps the JSON tidy
-        // for unsandboxed tasks (they don't need these saved).
-        sandbox_rw_paths:       sandbox ? splitLines(sbRw)    : undefined,
-        sandbox_allowed_hosts:  sandbox ? splitLines(sbHosts) : undefined,
-      }));
       await loadAll();
-      // Single-repo worktree: open immediately and focus the main agent —
-      // no blocking "running setup…" phase. If the project has a setup
-      // script, it fires right after as an unfocused background tab
-      // (ensureDefaultTab excludes setup-kind tabs from its "already
-      // mounted" check, so the two can't race each other out).
-      setActive(taskId);
-      close();
-      launchSetupTab(taskId, { focus: false }).catch(() => {});
+      // The real task now exists — MainArea/Sidebar prefer it over the
+      // pending entry the moment `tasks` carries it, so drop the pending
+      // entry here rather than leaving a stale duplicate row behind.
+      pendingRemove(taskId);
+      seedFirstMessage(taskId);
+      // Single-repo worktree: no blocking "running setup…" phase — if the
+      // project has a setup script, it fires right after as an unfocused
+      // background tab (ensureDefaultTab excludes setup-kind tabs from its
+      // "already mounted" check, so the two can't race each other out).
+      // Multi-repo's member setup scripts already run this way from the
+      // Rust side (task_create_multi_sync spawns them in a background
+      // thread and returns immediately — see setup-output/-done emits
+      // there), so both paths land the user on a live task with the same
+      // "agent gets focus now, setup streams in its own tab" shape.
+      if (!isMulti) launchSetupTab(taskId, { focus: false }).catch(() => {});
     } catch (e) {
-      setErr(String(e)); setBusy(false); setPhase("error");
+      // Worktree/branch creation itself failed. Leave the pending entry in
+      // place (now in "error" phase) so the sidebar row and, if the user is
+      // still looking at it, the main pane surface exactly what failed —
+      // no separate toast, no reopening a dialog.
+      pendingFail(taskId, String(e));
+    } finally {
       submittingRef.current = false;
-      return;
     }
-    // Success: for multi, submittingRef stays true until the dialog closes
-    // (guards against a re-submit during the streaming-setup phase). For
-    // single-repo, the dialog is already closed above — tidy up so a later
-    // mount of this component starts clean.
-    if (!isMulti) { setBusy(false); submittingRef.current = false; }
   }
 
   return (
     <AppDialog
-      // Lock dialog while creating — clicking outside or Escape would leave
-      // the user staring at no feedback while the worktree/file-copy chugs
-      // for several seconds on big repos.
+      // Locked only while busy — which, since GH #242, is just the brief
+      // window an instant import/repo-root create is actually in flight
+      // (worktree/multi creates close the dialog immediately; see submit()).
       open={!!projectId}
       onOpenChange={(v) => { if (!v && !busy) close(); }}
       title={isMulti ? "New multi-repo task" : importMode ? "Import existing worktree" : mode === "repo_root" ? "New task in the main checkout" : "New task in a worktree"}
@@ -574,30 +677,38 @@ export function NewTaskDialog() {
           ? (isMulti ? "max-w-[95.5rem]" : importMode ? "max-w-[83.5rem]" : "max-w-[71.5rem]")
           : (isMulti ? "max-w-3xl" : importMode ? "max-w-2xl" : "max-w-xl")
       }
+      // A long worktree form (sandbox panel, multi-repo members, …) can
+      // exceed the viewport — pin Cancel/Create to the bottom instead of
+      // letting them scroll away with the fields (the user has to be able
+      // to see and press Create without scrolling to find it).
+      stickyFooter={
+        <>
+          {err && <p className="mb-2 text-[13.5px] text-[var(--color-err)]">{err}</p>}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" type="button" onClick={close}>Cancel</Button>
+            <Button
+              variant="primary"
+              type="submit"
+              form="new-task-form"
+              disabled={busy || !name.trim() || (mode === "repo_root" ? false : importMode ? !importSelected : !branch.trim())}
+            >
+              {importMode ? "Import" : "Create"}
+            </Button>
+          </div>
+        </>
+      }
     >
-      {/* Phase-aware body: form on start, then progress view while creating
-          + running setup. Form stays unmounted in non-form phases so its
-          state doesn't fight the progress UI. */}
-      {phase !== "form" && (
-        <ProgressBody
-          phase={phase}
-          err={err}
-          setupLog={setupLog}
-          outputRef={outputRef}
-          onClose={() => { if (!busy || phase === "error") { setPhase("form"); setBusy(false); close(); } }}
-        />
-      )}
-      {phase === "form" && (
       <form
+        id="new-task-form"
         onSubmit={(e) => { e.preventDefault(); submit(); }}
-        className="mt-1.5 flex flex-col gap-6"
+        className="mt-1.5 flex flex-col gap-4"
       >
       {/* Columns row: the left form + the sandbox config as a second column
           when a cage is enabled. Left is flex-1 (can't overflow); the sandbox
           column is flex-1 too, and the dialog max-width (below) is sized in REM
           so each column resolves to the SAME width in both states. */}
       <div className="flex">
-      <div className="flex min-w-0 flex-1 flex-col gap-6">
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
         {/* Every field uses the same structure: label on its own line, optional
             hint underneath, control on a new line. Previous version inlined
             the segmented controls next to the label and put hints on the same
@@ -620,7 +731,7 @@ export function NewTaskDialog() {
         {canImport && importMode && (
           <button
             type="button"
-            onClick={() => { setImportMode(false); setImportSelected(null); setResumeSession(""); setErr(null); }}
+            onClick={() => { setImportMode(false); setImportSelected(null); setResumeOverride(""); setResumeOpen(false); setErr(null); }}
             className="-mb-1 inline-flex items-center gap-1.5 self-start text-[12.5px] text-[var(--color-fg-dim)] hover:text-[var(--color-accent)]"
           >
             <Plus className="h-3.5 w-3.5" />
@@ -668,19 +779,18 @@ export function NewTaskDialog() {
           </Field>
         )}
 
-        {/* Attach an externally-started agent session (GH #169): the id
-            seeds the first spawn's resume args. Hidden for agents that
-            cannot resume a specific session by id. */}
-        {importMode && cliSupportsResumeById(cli) && resumeSessionField}
-
         {/* Worktree vs repo-root toggle (single-repo only — multi has its
             own per-member toggle below). Repo root hides the branch + sandbox
             fields and creates in the repo's live checkout. Non-git projects
             can't worktree, so the Worktree button is disabled there. */}
         {!isMulti && !importMode && (
-          <Field label="Task type">
-            <div className="flex flex-col gap-1.5">
-              <div className="inline-flex self-start items-stretch rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
+          <div className="flex flex-col gap-1.5">
+            {/* Label + toggle share one row (not label-above-control like
+                every other Field) — this is the field people re-adjust most
+                often, so it's the one worth the extra vertical inch back. */}
+            <div className="flex items-center justify-between gap-3">
+              <label className="text-[13px] font-medium text-[var(--color-fg)]">Task type</label>
+              <div className="inline-flex shrink-0 items-stretch rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
                 <button
                   type="button"
                   onClick={() => chooseMode("repo_root")}
@@ -707,20 +817,72 @@ export function NewTaskDialog() {
                   <GitBranch className="h-3.5 w-3.5" /> Worktree
                 </button>
               </div>
-              <p className="text-[12px] text-[var(--color-fg-faint)]">
-                {mode === "worktree"
-                  ? "Isolated branch in its own working directory. Run agents in parallel without touching your main checkout."
-                  : "No worktree. The agent runs in the repo's main checkout, on its current branch. Edits land on your real files."}
-              </p>
             </div>
-          </Field>
+            <p className="text-[12px] text-[var(--color-fg-faint)]">
+              {mode === "worktree"
+                ? "Isolated branch in its own working directory. Run agents in parallel without touching your main checkout."
+                : "No worktree. The agent runs in the repo's main checkout, on its current branch. Edits land on your real files."}
+            </p>
+          </div>
         )}
 
-        <Field label="Name">
-          <Input value={name} onChange={e => setName(e.target.value)} placeholder="fix login bug" autoFocus required />
-        </Field>
+        {/* Name + branch fields grouped tightly (gap-2, vs. gap-4 between
+            fields elsewhere): the branch is DERIVED from the name (see
+            `derived` above), so they read as one cluster rather than three
+            unrelated questions. Default CLI (a real question, unrelated to
+            naming) follows as its own field, not folded into this group. */}
+        <div className="flex flex-col gap-2">
+          <Field label="Name">
+            <Input value={name} onChange={e => setName(e.target.value)} placeholder="fix login bug" autoFocus required />
+          </Field>
 
-        <Field label="Default CLI" hint="Auto-launches on first open. You can spawn other agents anytime via the task's + button.">
+          {!importMode && mode === "worktree" && (<>
+          {/* Always editable. Auto-fills as “feature/<name>” while you type
+              the name, then stops the moment you touch it, so pasting a
+              branch from Linear (“username/my-feature”) is a true one-shot:
+              select all, paste, done. No prefix control to fight (#15). */}
+          <FieldInline label="Branch name" hint="Auto-fills from the name.">
+            <Input
+              value={branch}
+              onChange={e => { setBranch(e.target.value); setBranchEdited(true); }}
+              placeholder="feature/fix-login-bug"
+              required
+            />
+          </FieldInline>
+
+          {/* The multi-repo host variant's hint is a full sentence (members
+              fall back separately) — too long for FieldInline's one line,
+              so it keeps Field's stacked layout. */}
+          {isMulti ? (
+            <Field label="Host branch from" hint="Blank = host repo default. Members fall back to their own defaults below.">
+              <Input
+                value={base}
+                onChange={e => { setBase(e.target.value); setBaseUnknown(null); }}
+                placeholder="origin/master"
+              />
+            </Field>
+          ) : (
+            <FieldInline label="Branch from" hint="Blank = repo default.">
+              <div className="flex flex-col gap-1">
+                <Input
+                  value={base}
+                  // Typing here is the user taking ownership of the field, so
+                  // the link's warning stops applying.
+                  onChange={e => { setBase(e.target.value); setBaseUnknown(null); }}
+                  placeholder="origin/master"
+                />
+                {baseUnknown && base === baseUnknown && (
+                  <p data-testid="base-unknown" className="text-[11.5px] text-[var(--color-warn)]">
+                    This link asked to branch from "{baseUnknown}", which this repo has no ref for. Creating will only work if it exists on the remote.
+                  </p>
+                )}
+              </div>
+            </FieldInline>
+          )}
+          </>)}
+        </div>
+
+        <Field label="Default CLI">
           {/* Pulled from the editable agent registry (Settings → Agent
               CLIs), not hard-coded — custom agents show up here. Disabled
               and not-installed agents are filtered out (see cliChoices).
@@ -728,7 +890,8 @@ export function NewTaskDialog() {
           <div className="inline-flex flex-wrap items-stretch gap-y-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
             {cliChoices.map(a => (
               <button
-                key={a.id} type="button" onClick={() => setCli(a.id)}
+                // Picking one yourself answers the warning, so it goes.
+                key={a.id} type="button" onClick={() => { setCli(a.id); setAgentUnknown(null); }}
                 className={cn(
                   "flex h-7 items-center gap-1.5 rounded-[5px] px-2.5 text-[12.5px] transition-colors",
                   cli === a.id
@@ -746,35 +909,70 @@ export function NewTaskDialog() {
               </button>
             ))}
           </div>
+          {/* Same deal as the base warning below: a link naming an agent this
+              install doesn't offer falls back to the normal pick, which is
+              right, but doing it silently means the user creates a task with
+              a different agent than the link asked for and never learns why. */}
+          {agentUnknown && (
+            <p data-testid="agent-unknown" className="mt-1 text-[11.5px] text-[var(--color-warn)]">
+              This link asked for "{agentUnknown}", which isn't available here. Using {cliChoices.find(a => a.id === cli)?.display_name ?? cli} instead.
+            </p>
+          )}
         </Field>
 
-        {!importMode && mode === "worktree" && (<>
-        {/* Always editable. Auto-fills as “feature/<name>” while you type
-            the name, then stops the moment you touch it, so pasting a
-            branch from Linear (“username/my-feature”) is a true one-shot:
-            select all, paste, done. No prefix control to fight (#15). */}
-        <Field
-          label="Branch name"
-          hint="Auto-fills from the name. Edit or paste a full branch directly; once you change it, it stays."
-        >
-          <Input
-            value={branch}
-            onChange={e => { setBranch(e.target.value); setBranchEdited(true); }}
-            placeholder="feature/fix-login-bug"
-            required
-          />
-        </Field>
+        {/* Optional first message (GH #192). Sent to the agent once it
+            finishes booting. Hidden for a plain terminal, which has no
+            prompt box to type into. Starts at 1 row — growPrompt() (below)
+            grows it as the user types, so the hint that used to explain
+            "typed once ready, nothing sent until Create" isn't needed to
+            justify the extra height; the placeholder carries that now. */}
+        {canPrompt && (
+          <Field label="Initial prompt">
+            <div className="flex flex-col gap-1">
+              <textarea
+                ref={promptRef}
+                value={prompt}
+                onChange={e => setPrompt(e.target.value.slice(0, MAX_PROMPT_CHARS))}
+                rows={1}
+                // Enter inserts a newline and nothing else. A textarea
+                // never submits its form on Enter, but the dialog above it
+                // does bind keys, and a multi-line first message must not
+                // be able to trip anything mid-sentence.
+                onKeyDown={e => { if (e.key === "Enter") e.stopPropagation(); }}
+                // No native autocorrect / autocapitalize / spellcheck: this
+                // is agent input, not prose, and macOS text substitution
+                // mangling a path or a flag is never wanted. Same reasoning
+                // as the broadcast composer.
+                autoCorrect="off"
+                autoCapitalize="off"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={"Describe the task, paste a ticket, or leave empty to start the agent idle."}
+                className="max-h-[30vh] w-full resize-none overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-[13px] leading-relaxed text-[var(--color-fg)] outline-none focus:border-[var(--color-accent-soft)]"
+              />
+              {/* Counter appears only as the cap gets close, so the common
+                  case (a couple of sentences) stays uncluttered. */}
+              {prompt.length > MAX_PROMPT_CHARS * 0.8 && (
+                <span className={cn(
+                  "self-end text-[11.5px] tabular-nums",
+                  prompt.length >= MAX_PROMPT_CHARS
+                    ? "text-[var(--color-warn)]"
+                    : "text-[var(--color-fg-faint)]",
+                )}>
+                  {prompt.length} / {MAX_PROMPT_CHARS}
+                </span>
+              )}
+            </div>
+          </Field>
+        )}
 
-        <Field label={isMulti ? "Host branch from" : "Branch from"} hint={isMulti ? "Blank = host repo default. Members fall back to their own defaults below." : "Blank = repo default."}>
-          <Input value={base} onChange={e => setBase(e.target.value)} placeholder="origin/master" />
-        </Field>
-        </>)}
-
-        {/* Attach an externally-started agent session (GH #169): the id
-            seeds the first spawn's resume args. Hidden for agents that
-            cannot resume a specific session by id. Import mode renders its
-            own copy below the worktree picker. */}
-        {!isMulti && !importMode && cliSupportsResumeById(cli) && resumeSessionField}
+        {/* Resume-args override: the same field the task menu's "Resume
+            override" edits, just available before the first spawn instead of
+            after it. Sits BELOW the first message because it is the rarer of
+            the two: almost every task types a first message, almost none
+            override resume args at create. Shown for multi as well, where it
+            lands on the host task. */}
+        {canResumeOverride && resumeOverrideField}
 
         {/* Multi-repo: per-member mode + branch picker. Each member
             row renders a small toggle (Worktree | Repo root) and, when
@@ -943,88 +1141,8 @@ export function NewTaskDialog() {
         </div>
       )}
       </div>{/* end columns row */}
-
-      {/* Error + actions row, below the columns. */}
-      <div>
-        {err && <p className="mb-2 text-[13.5px] text-[var(--color-err)]">{err}</p>}
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" type="button" onClick={close}>Cancel</Button>
-          <Button
-            variant="primary"
-            type="submit"
-            disabled={busy || !name.trim() || (mode === "repo_root" ? false : importMode ? !importSelected : !branch.trim())}
-          >
-            {importMode ? "Import" : "Create"}
-          </Button>
-        </div>
-      </div>
       </form>
-      )}
     </AppDialog>
-  );
-}
-
-/** Progress view shown while creating a task. Three sub-states:
- *  - creating: worktree + file-copy in flight (task_create has not yet returned)
- *  - setup: setup script running; stream stdout/stderr line by line
- *  - done: success flash, dialog auto-closes 2s later
- *  - error: surfaces the failure + lets the user dismiss and try again
- */
-export function ProgressBody({ phase, err, setupLog, outputRef, onClose }: {
-  phase: "creating" | "setup" | "done" | "error";
-  err: string | null;
-  setupLog: string[];
-  outputRef: React.RefObject<HTMLDivElement | null>;
-  onClose: () => void;
-}) {
-  const status =
-    phase === "creating" ? { icon: <Loader2 className="h-5 w-5 animate-spin" />, label: "Creating worktree & copying files…" } :
-    phase === "setup"    ? { icon: <Loader2 className="h-5 w-5 animate-spin" />, label: "Running setup script…" } :
-    phase === "done"     ? { icon: <Check className="h-5 w-5" />, label: "Done." } :
-                           { icon: <AlertTriangle className="h-5 w-5" />, label: "Setup failed." };
-  const tone =
-    phase === "done"  ? "text-[var(--color-ok)]" :
-    phase === "error" ? "text-[var(--color-err)]" :
-                        "text-[var(--color-fg-dim)]";
-  return (
-    // min-w-0 is required because the parent is a CSS grid (`Dialog.Content`
-    // uses `grid`) — grid items default to `min-width: auto` which means
-    // their column refuses to shrink below the intrinsic width of their
-    // content. Long monospace lines (pip dep dumps, etc.) then push the
-    // whole dialog wider than `max-w-md`. min-w-0 lets the column hit zero
-    // and our inner `overflow-auto` actually clip + scroll.
-    <div className="flex min-w-0 flex-col gap-3">
-      <div className={cn("flex items-center gap-2 text-[13px] font-medium", tone)}>
-        {status.icon}
-        <span>{status.label}</span>
-      </div>
-      {(phase === "setup" || phase === "done" || (phase === "error" && setupLog.length > 0)) && (
-        <div
-          ref={outputRef}
-          data-selectable
-          // max-w-full + overflow-x-hidden belt-and-braces against any single
-          // unbreakable token (urls, base64, long hashes) that `break-words`
-          // can't split — those would otherwise stretch the box past the
-          // dialog edge again.
-          className="h-[220px] max-w-full overflow-auto overflow-x-hidden rounded-md border border-[var(--color-border-soft)] bg-[var(--color-bg)] p-2.5 font-mono text-[11.5px] leading-snug text-[var(--color-fg-dim)]"
-        >
-          {setupLog.length === 0
-            ? <span className="text-[var(--color-fg-faint)]">Waiting for output…</span>
-            : setupLog.map((line, i) => <div key={i} className="whitespace-pre-wrap break-words">{line}</div>)
-          }
-        </div>
-      )}
-      {phase === "error" && err && (
-        <p className="text-[12.5px] text-[var(--color-err)]">{err}</p>
-      )}
-      {(phase === "error" || phase === "done") && (
-        <div className="mt-1 flex justify-end gap-2">
-          <Button variant="ghost" type="button" onClick={onClose}>
-            {phase === "done" ? "Open now" : "Close"}
-          </Button>
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -1041,6 +1159,28 @@ function Field({ label, hint, children }: {
     <div className="flex flex-col gap-2">
       <label className="text-[13px] font-medium text-[var(--color-fg)]">{label}</label>
       {hint && <div className="text-[12px] leading-snug text-[var(--color-fg-faint)] -mt-1">{hint}</div>}
+      {children}
+    </div>
+  );
+}
+
+/** Field variant for when the hint is short enough to share the label's
+ *  line instead of wrapping to its own — Branch name / Branch from's hints
+ *  ("Auto-fills from the name.", "Blank = repo default.") are a few words,
+ *  so a whole extra line for them was pure air. Falls back to Field's
+ *  stacked layout the instant a longer hint (e.g. the multi-repo host
+ *  variant) would crowd the label — pass it via `hint` on Field instead. */
+function FieldInline({ label, hint, children }: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-baseline gap-2">
+        <label className="text-[13px] font-medium text-[var(--color-fg)]">{label}</label>
+        {hint && <span className="truncate text-[12px] text-[var(--color-fg-faint)]">{hint}</span>}
+      </div>
       {children}
     </div>
   );

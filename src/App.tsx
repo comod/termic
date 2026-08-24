@@ -13,6 +13,8 @@ import { installPointerEventsGuard } from "@/lib/pointerEventsGuard";
 import { initCliRpc } from "@/lib/cliRpc";
 import { initAgentStatePush } from "@/lib/cliAgentState";
 import { initTrayAttention } from "@/lib/trayAttention";
+import { initActivityTitleBridge } from "@/lib/activityTitleBridge";
+import { initDeepLinks } from "@/lib/deepLink";
 import { cn } from "@/lib/utils";
 import { Sidebar } from "@/components/sidebar/Sidebar";
 import { UnifiedBar } from "@/components/UnifiedBar";
@@ -66,7 +68,13 @@ export function App() {
     // IO for projects/tasks, a different metric with a different owner.
     recordFirstPaint();
     installPointerEventsGuard();
-    loadAll();
+    // `termic://` deep links (GH #192) drain AFTER loadAll: a link names
+    // its project by name, and resolving that against an empty store would
+    // reject the very link that launched the app. A failed load still wires
+    // the listener, so later links keep working.
+    const deepLinks = Promise.resolve(loadAll())
+      .catch(() => {})
+      .then(() => initDeepLinks());
     // CLI install detection runs at startup + when Settings → Agent CLIs
     // opens (AgentsSection drives the latter). Deliberately NOT on every
     // window focus — `loadAll` re-runs on focus, detection does not.
@@ -99,6 +107,9 @@ export function App() {
     // Keep the tray dropdown/badge in sync with tasks waiting on the user
     // or done (lib/trayAttention.ts).
     const stopTrayAttention = initTrayAttention();
+    // Answer the separate Activity window's title requests — it cannot read
+    // this window's Zustand state (lib/activityTitleBridge.ts).
+    const stopActivityTitles = initActivityTitleBridge();
     const onFocus = () => {
       loadAll();
       // Restore focus to whichever terminal/editor was last active when the
@@ -129,8 +140,10 @@ export function App() {
       window.removeEventListener("focus", onFocus);
       unlistenStatus.then(u => u());
       unlistenCliRpc.then(u => u());
+      deepLinks.then(u => u());
       stopAgentPush();
       stopTrayAttention();
+      stopActivityTitles();
     };
   }, [loadAll]);
 

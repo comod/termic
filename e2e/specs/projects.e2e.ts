@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clickByText, dismissOverlays, pointerDrag, requireTermicApi, snap, waitForAppShell, waitVisible } from "../helpers";
+import { clickByText, clickMenuItemUntil, clickWhenVisible, dismissOverlays, pointerDrag, requireTermicApi, keysIn, snap, waitForAppShell, waitForText, waitGone, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -45,6 +45,41 @@ describe("project add/remove", () => {
         ),
       { timeout: 8_000, timeoutMsg: "added project never appeared" },
     );
+  });
+
+  // The dashed "New task" placeholder stands in for the task rows an empty
+  // project does not have yet, so it must be the same height as one. It used
+  // to be ~11px taller, which broke the sidebar rhythm.
+  it("sizes the empty-project placeholder like a task row", async () => {
+    const id = projectId!;
+    await browser.execute((i) => {
+      window.__termic!.useApp.getState().setProjectCollapsed(i, false);
+    }, id);
+    const trigger = `[data-testid="project-empty-new-task-${id}"]`;
+    await waitVisible(trigger);
+    const placeholderH = await browser.execute(
+      (sel) => (document.querySelector(sel) as HTMLElement).offsetHeight,
+      trigger,
+    );
+
+    const taskId = await browser.execute(async (i) => {
+      const t = window.__termic!;
+      const task = await t.ipc.taskOpenRepo(i, "fakeagent", "placeholder-size");
+      await t.useApp.getState().loadAll();
+      return task.id as string;
+    }, id);
+    const row = `[data-sidebar-task-id="${taskId}"]`;
+    await waitVisible(row);
+    const rowH = await browser.execute(
+      (sel) => (document.querySelector(sel) as HTMLElement).offsetHeight,
+      row,
+    );
+
+    expect(placeholderH).toEqual(rowH);
+    await browser.execute(async (i) => {
+      await window.__termic!.ipc.taskArchive(i);
+      await window.__termic!.useApp.getState().loadAll();
+    }, taskId);
   });
 
   it("reorders projects", async () => {
@@ -290,6 +325,107 @@ describe("branch new tasks from", () => {
 
   const checkout = (branch: string) => execSync(`git -C "${dir}" checkout -q ${branch}`);
 
+  /** The open new-task menu's visible text. Takes the first menu with a real
+   *  box, not the first in the DOM: Radix leaves a closing menu mounted until
+   *  its animation ends, and animations are frozen while the window is
+   *  occluded (which the harness always is), so a zero-sized husk can sit in
+   *  front of the menu this actually means. */
+  const menuText = async () =>
+    (await browser.execute(() => {
+      const m = [...document.querySelectorAll('[role="menu"]')].find(
+        (e) => e.getBoundingClientRect().width > 0,
+      ) as HTMLElement | null;
+      return m?.innerText ?? "";
+    })) as string;
+
+  /** Wait for the menu to finish re-rendering into `mode` before clicking
+   *  anything in it.
+   *
+   *  The mode is remembered app-wide, so clicking "Worktree" / "Main checkout"
+   *  usually CHANGES it, and the menu then re-renders to add or drop its
+   *  "Branch from" row. An item clicked into that re-render lands on a node
+   *  Radix is replacing and is simply lost: no name prompt, no task, and only
+   *  on a machine slow enough to put the click inside the window — i.e. CI.
+   *  5eff3f3 fixed exactly this for the main-checkout case; the worktree ones
+   *  had the same hole. */
+  const settleMenuMode = async (mode: "worktree" | "main") => {
+    const wantsBranchFrom = mode === "worktree";
+    const label = mode === "worktree" ? "Worktree" : "Main checkout";
+    await browser.waitUntil(
+      async () => {
+        const text = await menuText();
+        // The menu must EXIST, not merely lack the row. Radix remounts the
+        // content while the mode flips, so there is a beat where the query
+        // finds nothing — and "" trivially satisfies "no Branch from row",
+        // which let the main-checkout case settle on a menu that was not
+        // there yet and click into the remount.
+        if (text.length === 0) return false;
+        if (text.includes("Branch from") === wantsBranchFrom) return true;
+        // Still on the other mode: the toggle click can be lost to the same
+        // remount as the items are, and then this would just wait out its
+        // timeout on a mode nothing is going to change. Click it again. The
+        // buttons are idempotent (they set a mode, they do not flip one), so a
+        // repeat is free.
+        await browser.execute((t) => {
+          const el = [...document.querySelectorAll('[role="menu"] button')].find(
+            (e) => e.textContent?.trim() === t && e.getBoundingClientRect().width > 0,
+          );
+          if (el) (el as HTMLElement).click();
+        }, label);
+        return false;
+      },
+      { timeout: 8_000, interval: 250, timeoutMsg: `the menu never settled into ${mode} mode` },
+    );
+  };
+
+  /** Open the project's New task menu. Radix opens on pointerdown, so a bare
+   *  .click() is not enough. */
+  const openNewTaskMenu = async (pid: string) => {
+    const trigger = `[data-testid="project-new-task-${pid}"]`;
+    await waitVisible(trigger);
+    await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.click();
+    }, trigger);
+    await waitVisible('[role="menu"]');
+  };
+
+  /** Drive the menu into `mode`, pick `item`, and retry the WHOLE gesture if
+   *  nothing comes of it.
+   *
+   *  settleMenuMode closes most of the remount window, and CI still lands
+   *  inside it: the run for 41b3c5e timed out here with no menu, no menu item
+   *  and no prompt anywhere on screen. That shape says the click did select
+   *  (Radix closes the menu when it does) while the handler that opens the
+   *  prompt went with the node being replaced. Waiting longer cannot help,
+   *  because there is nothing left on screen to wait for, and no state that
+   *  says so before the fact. Re-open and do it again instead. The gesture is
+   *  idempotent up to the point it works: a lost click creates nothing. */
+  const pickFromNewTaskMenu = async (
+    pid: string,
+    mode: "worktree" | "main",
+    item: string,
+    doneSelector: string,
+    attempts = 3,
+  ) => {
+    for (let attempt = 1; ; attempt++) {
+      await openNewTaskMenu(pid);
+      await settleMenuMode(mode);
+      try {
+        await clickMenuItemUntil(item, doneSelector, 6_000);
+        return;
+      } catch (e) {
+        if (attempt === attempts) throw e;
+        // The menu is usually already gone; this is for the case where the
+        // click never landed at all and it is still up.
+        await browser.keys("Escape");
+      }
+    }
+  };
+
   /** Alphabetical on purpose: "bitbucket" must sort before "origin". */
   const remotes = ["bitbucket", "origin"];
   const remotePath = (r: string) =>
@@ -432,37 +568,15 @@ describe("branch new tasks from", () => {
   });
 
   it("shows the base in the project menu, worktree mode only", async () => {
-    const trigger = `[data-testid="project-new-task-${projectId}"]`;
-    await waitVisible(trigger);
-    // Radix opens on pointerdown, so a bare .click() isn't enough.
-    await browser.execute((sel) => {
-      const el = document.querySelector(sel) as HTMLElement;
-      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
-      el.dispatchEvent(new PointerEvent("pointerdown", opts));
-      el.dispatchEvent(new PointerEvent("pointerup", opts));
-      el.click();
-    }, trigger);
-    await waitVisible('[role="menu"]');
-
-    const menuText = async () =>
-      (await browser.execute(() => {
-        const m = document.querySelector('[role="menu"]') as HTMLElement | null;
-        return m?.innerText ?? "";
-      })) as string;
+    await openNewTaskMenu(projectId);
 
     // Mode is remembered app-wide, so don't assume where we start: drive it.
     // Main checkout runs on the live branch, so there's no base to pick.
     await clickByText("Main checkout");
-    await browser.waitUntil(async () => !(await menuText()).includes("Branch from"), {
-      timeout: 8_000,
-      timeoutMsg: '"Branch from" row still shown in main-checkout mode',
-    });
+    await settleMenuMode("main");
 
     await clickByText("Worktree");
-    await browser.waitUntil(async () => (await menuText()).includes("Branch from"), {
-      timeout: 8_000,
-      timeoutMsg: '"Branch from" row never appeared in worktree mode',
-    });
+    await settleMenuMode("worktree");
     // The row names the PINNED base ("main" from the previous case), which is
     // the disclosure the quick path never had. HEAD is on `dev`, so a row
     // reading "dev" would mean the base is following the checkout again.
@@ -471,10 +585,100 @@ describe("branch new tasks from", () => {
     await browser.keys("Escape");
   });
 
+  // Terminal used to bypass the inline name prompt in main-checkout mode
+  // (create-at-once, Rust auto-names it), unlike every other item in this
+  // menu. It now goes through the same prompt as the agent items.
+  it("prompts for a name before creating a main-checkout Terminal task", async () => {
+    const nameInput = 'input[placeholder="Task name"]';
+    // Menu closes, an inline name input takes its place instead of a task
+    // appearing immediately.
+    await pickFromNewTaskMenu(projectId, "main", "Terminal", nameInput);
+    await waitVisible(nameInput);
+    const prefilled = await browser.execute(
+      (sel) => (document.querySelector(sel) as HTMLInputElement).value,
+      nameInput,
+    );
+    expect(prefilled).toMatch(/^terminal-\d+$/);
+
+    await keysIn(nameInput, "Enter");
+    await browser.waitUntil(
+      async () =>
+        browser.execute(
+          (pid, n) =>
+            window.__termic!.useApp
+              .getState()
+              .tasks.some((t: any) => t.project_id === pid && t.name === n),
+          projectId,
+          prefilled,
+        ),
+      { timeout: 8_000, timeoutMsg: "named main-checkout terminal task never appeared" },
+    );
+    const created = await browser.execute(
+      (pid, n) =>
+        window.__termic!.useApp
+          .getState()
+          .tasks.find((t: any) => t.project_id === pid && t.name === n),
+      projectId,
+      prefilled,
+    );
+    createdTaskIds.push((created as any).id);
+  });
+
+  // GH #242: the sidebar's quick-create row is a SECOND worktree-creation
+  // implementation, separate from NewTaskDialog, and used to block behind
+  // its own overlay (QuickCreateProgressDialog) the same way the modal did.
+  // Prove the inline row commits without blocking too: the menu/name-input
+  // closes immediately, well before the worktree is actually ready, and the
+  // task still lands on its own branch.
+  it("creates a worktree task from the inline quick-create row without blocking", async () => {
+    const nameInput = 'input[placeholder="Task name"]';
+    await pickFromNewTaskMenu(projectId, "worktree", "Terminal", nameInput);
+    await waitVisible(nameInput);
+    await browser.execute((sel) => {
+      const input = document.querySelector(sel) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "e2e-quick-wt");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, nameInput);
+    await keysIn(nameInput, "Enter");
+
+    // The inline row (name + branch inputs) is gone right away — it does not
+    // wait for `git worktree add` to finish, same fix as the dialog case in
+    // task.e2e.ts.
+    await waitGone(nameInput, 2_000);
+
+    // ...and the worktree still lands once it's actually ready, on its own
+    // branch (not the main checkout).
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (pid) =>
+            window.__termic!.useApp
+              .getState()
+              .tasks.some((t: any) => t.project_id === pid && t.name === "e2e-quick-wt"),
+          projectId,
+        ),
+      { timeout: 15_000, timeoutMsg: "quick-create worktree task never landed after the row closed early" },
+    );
+    const created = await browser.execute(
+      (pid) =>
+        window.__termic!.useApp
+          .getState()
+          .tasks.find((t: any) => t.project_id === pid && t.name === "e2e-quick-wt"),
+      projectId,
+    );
+    expect((created as any).is_main_checkout).not.toBe(true);
+    createdTaskIds.push((created as any).id);
+  });
+
   it("offers one flat branch list, pin checked and HEAD marked", async () => {
     // The pin lives IN the list rather than in a separate "Project default"
-    // row, so there's one place to look. Reopen the menu: the previous case
-    // closed it with Escape.
+    // row, so there's one place to look. Mode is remembered app-wide (the
+    // previous case left it on Main checkout), so drive it rather than
+    // assume where we start.
     const trigger = `[data-testid="project-new-task-${projectId}"]`;
     await waitVisible(trigger);
     await browser.execute((sel) => {
@@ -485,6 +689,8 @@ describe("branch new tasks from", () => {
       el.click();
     }, trigger);
     await waitVisible('[role="menu"]');
+    await clickByText("Worktree");
+    await settleMenuMode("worktree");
 
     // Radix submenus open on hover; the trigger carries aria-haspopup.
     await browser.execute(() => {
@@ -771,5 +977,86 @@ describe("resume submenu", () => {
       { timeout: 10_000, timeoutMsg: "picking a Resume entry did not restore the task" },
     );
     await snap("resume-submenu.png");
+  });
+});
+
+// Issue #152: the dashboard's "No projects yet" card is the biggest thing a
+// new user sees and reads as actionable, so it must actually be a button that
+// opens the same Add project dialog as the sidebar "+" and the action card.
+// The seeded profile always has fixture-repo, so the empty state is rendered
+// by emptying the store's project list (disk untouched) and restored with
+// loadAll() afterwards.
+describe("dashboard empty state", () => {
+  const CARD = '[data-testid="empty-projects-card"]';
+
+  const showEmptyDashboard = async () => {
+    await browser.execute(() => {
+      window.__termic!.useApp.getState().setView("dashboard");
+      window.__termic!.useApp.setState({ projects: [] });
+    });
+    await waitVisible(CARD);
+  };
+  const closeDialog = async () => {
+    await browser.execute(() => window.__termic!.useUI.getState().closeNewProject());
+    await dismissOverlays();
+  };
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+  });
+  after(async () => {
+    await closeDialog();
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+  });
+
+  it("opens the Add project dialog when the card is clicked", async () => {
+    await showEmptyDashboard();
+    await clickWhenVisible(CARD);
+    await waitForText("Add project");
+    await browser.waitUntil(
+      () =>
+        browser.execute(() =>
+          [...document.querySelectorAll('[role="dialog"]')].some((d) =>
+            (d as HTMLElement).innerText.includes("Add project"),
+          ),
+        ),
+      { timeout: 8_000, timeoutMsg: "clicking the empty state did not open the Add project dialog" },
+    );
+    await snap("empty-projects-card.png");
+    await closeDialog();
+  });
+
+  it("is a real button, focusable and activated by the keyboard", async () => {
+    await showEmptyDashboard();
+    const tag = await browser.execute(
+      (sel) => (document.querySelector(sel) as HTMLElement).tagName,
+      CARD,
+    );
+    expect(tag).toEqual("BUTTON");
+
+    // Reachable by Tab and focusable: a <div onClick> fails both. We assert
+    // the tab order rather than pressing Enter, because native button
+    // activation from a WebDriver key event doesn't land on the offscreen
+    // window (the browser supplies that behaviour, we only supply the button).
+    const { tabIndex, disabled, focusable } = await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLButtonElement;
+      el.focus();
+      return {
+        tabIndex: el.tabIndex,
+        disabled: el.disabled,
+        focusable: document.activeElement === el,
+      };
+    }, CARD);
+    expect(tabIndex).toBeGreaterThanOrEqual(0);
+    expect(disabled).toBe(false);
+    expect(focusable).toBe(true);
+  });
+
+  it("goes back to the project list once a project exists", async () => {
+    await showEmptyDashboard();
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+    await waitGone(CARD);
   });
 });

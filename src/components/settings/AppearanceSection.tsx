@@ -15,7 +15,6 @@ import { homeDir } from "@/lib/ipc";
 import { IS_MAC, ALT_LABEL, CMD_LABEL } from "@/lib/shortcuts";
 import { EditorView } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
-import { javascript } from "@codemirror/lang-javascript";
 
 type AppearanceTab = "terminal" | "editor" | "interface";
 
@@ -60,6 +59,8 @@ export function AppearanceSection() {
   const uiScale = usePrefs(s => s.uiScale);
   const setUiScale = usePrefs(s => s.setUiScale);
   const codeLigatures = usePrefs(s => s.codeLigatures);
+  const inlineBlame = usePrefs(s => s.inlineBlame);
+  const setInlineBlame = usePrefs(s => s.setInlineBlame);
   const setCodeLigatures = usePrefs(s => s.setCodeLigatures);
   const showAllInstalledFonts = usePrefs(s => s.showAllInstalledFonts);
   const resetAppearance = usePrefs(s => s.resetAppearance);
@@ -105,6 +106,7 @@ export function AppearanceSection() {
     editorFontSize        === APPEARANCE_DEFAULTS.editorFontSize &&
     uiScale               === APPEARANCE_DEFAULTS.uiScale &&
     codeLigatures         === APPEARANCE_DEFAULTS.codeLigatures &&
+    inlineBlame           === APPEARANCE_DEFAULTS.inlineBlame &&
     showAllInstalledFonts === APPEARANCE_DEFAULTS.showAllInstalledFonts;
 
   return (
@@ -280,6 +282,13 @@ export function AppearanceSection() {
         hint="Render font ligatures like `=>`, `!==`, `>=` as combined glyphs in the editor."
         value={codeLigatures}
         onChange={setCodeLigatures}
+      />
+
+      <Toggle
+        label="Inline git blame"
+        hint="Show who last changed the line the cursor is on, after the code. Click it to open that commit's diff."
+        value={inlineBlame}
+        onChange={setInlineBlame}
       />
       </div>}
 
@@ -616,6 +625,24 @@ function CodePreview() {
   const hostRef  = useRef<HTMLDivElement>(null);
   const viewRef  = useRef<EditorView | null>(null);
   const themeComp = useRef(new Compartment());
+  const langComp = useRef(new Compartment());
+
+  // The grammar is fetched, not imported. This pane is in the MAIN chunk, and
+  // a static `@codemirror/lang-*` import here does two bad things: it puts a
+  // grammar on the app-start path, and it pins that package into the main
+  // chunk, where the namespace object the registry's own `import()` receives
+  // comes back missing its exports — every .ts and .js file in the app lost
+  // its highlighting that way. `lib/mainChunkGuard.test.ts` pins it now.
+  useEffect(() => {
+    let alive = true;
+    import("@/lib/languageExts")
+      .then(m => m.langForId("TypeScript"))
+      .then(ext => {
+        if (!alive || !ext) return;
+        viewRef.current?.dispatch({ effects: langComp.current.reconfigure([ext]) });
+      });
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -623,7 +650,7 @@ function CodePreview() {
       state: EditorState.create({
         doc: CODE_SAMPLE,
         extensions: [
-          javascript({ typescript: true }),
+          langComp.current.of([]),
           EditorView.editable.of(false),
           EditorView.theme({ "&.cm-editor": { outline: "none" } }),
           themeComp.current.of([

@@ -11,18 +11,25 @@ import {
   Search, Plus, FileText, Pencil, GitBranch, Archive, Zap, ShieldCheck,
   PanelLeft, PanelRight, PanelBottom, Palette, Keyboard, Settings as SettingsIcon,
   FolderCog, RefreshCw, ScrollText, Bug, SlidersHorizontal, Bot, BookText,
-  Check, ChevronLeft, ListTodo, Bell, SquareTerminal, type LucideIcon,
+  Check, ChevronLeft, ListTodo, Bell, SquareTerminal, FolderPlus, History, Square,
+  Play, Swords, Megaphone, Columns2, Rows2, Clock, UserPen, Activity, Code2,
+  NotepadText, Waypoints, type LucideIcon,
 } from "lucide-react";
 import { useUI } from "@/store/ui";
 import { copyToClipboard } from "@/lib/clipboard";
+import { copyAgentBriefing } from "@/lib/agentBriefing";
 import { useApp } from "@/store/app";
+import { jumpToNextWaiting } from "@/lib/waitingAgents";
+import { newScratchTab } from "@/lib/scratchTabs";
+import { readRecents, recentIds, recordRecent } from "@/lib/paletteRecent";
 import { usePrefs, type BuiltinThemeMode, type ThemeMode } from "@/store/prefs";
 import { useUpdate } from "@/store/update";
 import { fuzzyMatch, Highlighted } from "@/lib/fuzzy";
 import { bindingGlyphs, type ShortcutId } from "@/lib/shortcuts";
 import { confirmAndArchive } from "@/lib/archiveTask";
-import { taskSetYolo, openPath } from "@/lib/ipc";
+import { taskSetYolo, openPath, procmonOpenWindow } from "@/lib/ipc";
 import { isCustomId } from "@/lib/customTheme";
+import { effectiveLanguageId, languageLabel } from "@/lib/languages";
 import { effectiveSandboxMode, isSandboxEnforced } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +39,11 @@ const ISSUE_URL = "https://github.com/simion/termic/issues/new";
 // Section render order. Sections with no (filtered) commands are dropped.
 const SECTION_ORDER = ["Task", "Agent", "View", "Application", "Settings"] as const;
 type Section = (typeof SECTION_ORDER)[number];
+
+/** Pseudo-section pinned above the rest, holding what you last ran (expiry and
+ *  ordering live in lib/paletteRecent). Not in SECTION_ORDER: it is built from
+ *  the other sections' commands rather than being a home for any of them. */
+const RECENT_SECTION = "Recent";
 
 interface Cmd {
   id: string;
@@ -46,7 +58,20 @@ interface Cmd {
   shortcutId?: ShortcutId;
   /** Extra search terms (not shown) so e.g. "palette" finds "Command…". */
   keywords?: string;
+  /** Float this command to the TOP of its section on an empty query. For a
+   *  command whose relevance depends on what is on screen rather than on
+   *  where it was pushed: "Set syntax…" is a minor view preference for a
+   *  file, and the only way to declare what the buffer is for a scratchpad.
+   *  Insertion order decides everything else, so this stays rare. */
+  priority?: boolean;
   destructive?: boolean;
+  /** Keep this command OUT of the Recent section. The top Recent row is the
+   *  pre-selected one, so Enter on a freshly-opened palette runs it — which is
+   *  fine for "Open settings" and emphatically not for anything that ends an
+   *  agent or a task. Archiving twice in a row is not a workflow worth
+   *  optimising; doing it by accident is a real risk, more so once the user has
+   *  unticked "Show this every time" on the archive confirm. */
+  noRecent?: boolean;
   run: () => void;
 }
 
@@ -71,6 +96,7 @@ export function CommandPalette() {
   const themeMode = usePrefs(s => s.themeMode);
   const customThemes = usePrefs(s => s.customThemes);
   const binds = usePrefs(s => s.shortcuts);
+  const inlineBlame = usePrefs(s => s.inlineBlame);
 
   // Built-ins first, then the custom theme files — the submenu's order.
   const themeEntries = useMemo<{ id: ThemeMode; label: string }[]>(
@@ -98,6 +124,16 @@ export function CommandPalette() {
   const themeOriginalRef = useRef<ThemeMode | null>(null);
 
   const task = useMemo(() => tasks.find(w => w.id === activeTaskId) ?? null, [tasks, activeTaskId]);
+  // The active main-pane tab when it is an editor. "Set syntax" re-highlights
+  // ONE buffer, so the row only exists while there is a buffer to act on.
+  const activeEditTab = useApp(s => {
+    const id = s.activeTaskId;
+    if (!id) return null;
+    const t = (s.tabs[id] ?? []).find(tt => tt.id === s.activeTab[id]);
+    // Scratchpads too (GH #244): with no extension to go on, the picker is
+    // the only way to tell the buffer what it is.
+    return t?.type === "edit" || t?.type === "scratch" ? t : null;
+  });
   const proj = useMemo(() => (task ? projects.find(p => p.id === task.project_id) ?? null : null), [projects, task]);
 
   // Roll the live theme preview back and leave the submenu.
@@ -118,9 +154,7 @@ export function CommandPalette() {
       themeOriginalRef.current = null;
     }
   }, [open]);
-  // Reset the highlight on query change…
-  useEffect(() => { setActiveIdx(0); }, [query]);
-  // …but when entering the theme submenu, start on the CURRENT theme so the
+  // When entering the theme submenu, start on the CURRENT theme so the
   // live preview doesn't jump the instant you open it.
   useEffect(() => {
     if (view === "theme") {
@@ -129,13 +163,22 @@ export function CommandPalette() {
     } else setActiveIdx(0);
   }, [view]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** Wrap an action so it closes the palette, then runs on the NEXT frame.
+  /** Wrap an action so it closes the palette, then runs once the click that
+   *  triggered it has fully settled.
+   *
    *  The defer matters when the action opens another dialog (Archive → confirm,
-   *  Sandbox, New task): the palette is non-modal, so the click that
-   *  triggered the row would otherwise reach the freshly-mounted dialog's
-   *  dismissable layer and dismiss it instantly. One frame lets the click
-   *  fully settle first. Harmless for synchronous actions. */
-  const act = (fn: () => void) => () => { close(); requestAnimationFrame(fn); };
+   *  Sandbox, New task): the palette is non-modal, so the click that triggered
+   *  the row would otherwise reach the freshly-mounted dialog's dismissable
+   *  layer and dismiss it instantly. Harmless for synchronous actions.
+   *
+   *  A TIMER, not `requestAnimationFrame`: rAF is frozen while the window is
+   *  occluded (another Space, another window on top), so a deferred effect
+   *  would sit queued until the window is visible again and then fire at an
+   *  arbitrary later moment — opening a dialog over whatever the user is doing
+   *  by then. A macrotask runs after event dispatch completes, which is all
+   *  this needs, and it runs whether the window is on screen or not. Same
+   *  reason `mouseDrag` in the e2e helpers yields with a timer. */
+  const act = (fn: () => void) => () => { close(); setTimeout(fn, 0); };
 
   // Build the full command list. Task/agent rows only exist when a
   // task is active. Everything reads live store state at build time.
@@ -161,6 +204,11 @@ export function CommandPalette() {
       icon: Plus, shortcutId: "new-task-quick", keywords: "create worktree project",
       run: act(() => useUI.getState().openProjectPicker()),
     });
+    cmds.push({
+      id: "new-project", section: "Task", label: "Add project…",
+      icon: FolderPlus, keywords: "repository repo clone discover add new",
+      run: act(() => useUI.getState().openNewProject()),
+    });
     if (task) {
       cmds.push({
         id: "file-picker", section: "Task", label: "File picker",
@@ -171,6 +219,12 @@ export function CommandPalette() {
         id: "find-in-files", section: "Task", label: "Find in files",
         icon: Search, shortcutId: "find-in-files", keywords: "grep search ripgrep",
         run: act(() => useUI.getState().openFindInFiles(task.id)),
+      });
+      cmds.push({
+        id: "new-scratchpad", section: "Task", label: "New scratchpad",
+        icon: NotepadText, shortcutId: "new-scratchpad",
+        keywords: "note untitled buffer temporary todo jot draft",
+        run: act(() => { void newScratchTab(task.id); }),
       });
       cmds.push({
         id: "rename-task", section: "Task", label: "Rename task",
@@ -185,15 +239,80 @@ export function CommandPalette() {
         });
       }
       cmds.push({
-        // Not styled destructive — confirmAndArchive shows a confirm modal
-        // (with the delete-branch checkbox), so the red isn't needed here.
+        // The paste-into-another-agent briefing (see lib/agentBriefing).
+        id: "copy-agent-briefing", section: "Task", label: "Copy agent CLI briefing",
+        suffix: "Paste into another agent to let it drive this task",
+        icon: Waypoints, keywords: "cli orchestrate remote control clipboard termic agents talk",
+        run: act(() => {
+          void copyAgentBriefing(task, useApp.getState().projects.find(p => p.id === task.project_id)?.name);
+        }),
+      });
+      cmds.push({
+        id: "resume-override", section: "Task", label: "Resume options…",
+        icon: History, keywords: "session continue previous conversation args",
+        run: act(() => useUI.getState().openResumeOverride(task.id)),
+      });
+      cmds.push({
+        // Ends every PTY in the task but keeps the task itself (GH #119).
+        // Also the only way to release a mounted task's terminals, which is
+        // what the idle-cost work made concrete.
+        id: "stop-task", section: "Task", label: `Stop "${task.name}"`,
+        suffix: "Ends its agents, keeps the task",
+        icon: Square, keywords: "kill terminate close ptys unmount free memory",
+        noRecent: true,
+        run: act(() => useApp.getState().stopTask(task.id)),
+      });
+      cmds.push({
+        // Not styled destructive — confirmAndArchive normally shows a confirm
+        // modal (with the delete-branch checkbox), so the red isn't needed.
+        // Once the user has unticked "Show this every time" there, this entry archives
+        // on Enter with no prompt; Settings › Tasks is the way back.
         id: "archive-task", section: "Task", label: `Archive "${task.name}"`,
         icon: Archive, keywords: "delete remove close worktree",
+        noRecent: true,
         run: act(() => { void confirmAndArchive(task); }),
+      });
+    }
+    if (proj) {
+      cmds.push({
+        id: "run-commands", section: "Task", label: "Run commands…",
+        suffix: proj.name, icon: Play, keywords: "script dev server build custom",
+        run: act(() => useUI.getState().openRunCommands(proj.id)),
       });
     }
 
     // ── Agent ──────────────────────────────────────────────────────────
+    cmds.push({
+      id: "prompt-palette", section: "Agent", label: "Prompt library…",
+      icon: BookText, shortcutId: "prompt-palette", keywords: "prompts snippets send template",
+      run: act(() => useUI.getState().openPromptPalette()),
+    });
+    cmds.push({
+      // Store-driven (lib/waitingAgents), shared with the top-bar jump pill —
+      // so it does the same thing from here as from the pill.
+      id: "jump-next-waiting", section: "Agent", label: "Jump to next waiting agent",
+      icon: Bell, shortcutId: "jump-next-waiting", keywords: "attention blocked done next cycle",
+      run: act(() => { jumpToNextWaiting(); }),
+    });
+    if (proj) {
+      cmds.push({
+        id: "race", section: "Agent", label: "Agent Race…",
+        suffix: proj.name, icon: Swords, keywords: "compare parallel multiple contest winner",
+        run: act(() => useUI.getState().openRace(proj.id)),
+      });
+      cmds.push({
+        id: "broadcast-project", section: "Agent", label: "Broadcast to project…",
+        suffix: proj.name, icon: Megaphone, keywords: "send all tasks message every agent",
+        run: act(() => useUI.getState().openProjectBroadcast(proj.id)),
+      });
+    }
+    if (task) {
+      cmds.push({
+        id: "broadcast", section: "Agent", label: "Broadcast to agents…",
+        icon: Megaphone, shortcutId: "broadcast", keywords: "send message all tabs",
+        run: act(() => useUI.getState().openBroadcast(task.id)),
+      });
+    }
     if (task) {
       const enforced = isSandboxEnforced(effectiveSandboxMode(task));
       cmds.push({
@@ -234,7 +353,42 @@ export function CommandPalette() {
         icon: PanelBottom, shortcutId: "toggle-terminal", keywords: "bottom split shell console hide show",
         run: act(() => useApp.getState().toggleBottomTerminal(task.id)),
       });
+      // splitPane targets the store's active pane, not DOM focus, so it means
+      // the same thing from here as from the chord. Its focus-dependent
+      // siblings (new-tab, close-tab, clear-terminal) are deliberately NOT
+      // here: each reads document.activeElement to decide WHICH pane it acts
+      // on, and from the palette that is the palette's own input.
+      cmds.push({
+        id: "split-right", section: "View", label: "Split pane right",
+        icon: Columns2, shortcutId: "split-pane-right", keywords: "pane vertical divider new",
+        run: act(() => { useApp.getState().splitPane(task.id, "v"); }),
+      });
+      cmds.push({
+        id: "split-down", section: "View", label: "Split pane down",
+        icon: Rows2, shortcutId: "split-pane-below", keywords: "pane horizontal divider new",
+        run: act(() => { useApp.getState().splitPane(task.id, "h"); }),
+      });
     }
+    if (task && activeEditTab) {
+      // On a SCRATCHPAD this is not a view preference, it is the only way to
+      // say what the buffer is: there is no extension, so nothing else can
+      // answer. It moves to the front section for that case rather than
+      // sitting third, under View, behind rows about panels and splits.
+      const pad = activeEditTab.type === "scratch";
+      cmds.push({
+        id: "set-syntax", section: pad ? "Task" : "View", label: "Set syntax…",
+        priority: pad,
+        suffix: languageLabel(effectiveLanguageId(activeEditTab)), icon: Code2,
+        keywords: "language highlighting grammar mode colour color file type markdown json",
+        run: act(() => useUI.getState().openSyntaxPalette(task.id, activeEditTab.id)),
+      });
+    }
+    cmds.push({
+      id: "toggle-inline-blame", section: "View", label: "Toggle inline git blame",
+      suffix: inlineBlame ? "On" : "Off", icon: UserPen,
+      keywords: "annotation decoration author commit who changed line history",
+      run: act(() => usePrefs.getState().toggleInlineBlame()),
+    });
     cmds.push({
       id: "change-theme", section: "View", label: "Change theme…",
       suffix: themeLabel(themeMode), icon: Palette, keywords: "appearance color dark light",
@@ -268,6 +422,12 @@ export function CommandPalette() {
       });
     }
     cmds.push({
+      id: "activity-monitor", section: "Application", label: "Activity monitor",
+      icon: Activity,
+      keywords: "cpu memory ram process task manager profiling performance slow hog",
+      run: act(() => { void procmonOpenWindow(); }),
+    });
+    cmds.push({
       id: "check-updates", section: "Application", label: "Check for updates",
       icon: RefreshCw, keywords: "version upgrade",
       run: act(async () => {
@@ -299,7 +459,7 @@ export function CommandPalette() {
       ["prompts", "Prompt library", BookText],
       ["shortcuts", "Keyboard shortcuts settings", Keyboard],
       ["sandbox", "Sandbox settings", ShieldCheck],
-      ["cli", "Termic CLI settings", SquareTerminal],
+      ["cli", "CLI & MCP settings", SquareTerminal],
     ];
     for (const [tab, label, icon] of settingsLinks) {
       cmds.push({
@@ -309,7 +469,18 @@ export function CommandPalette() {
     }
 
     return cmds;
-  }, [view, task, proj, themeMode, themeEntries]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [view, task, proj, themeMode, themeEntries, inlineBlame, activeEditTab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Recents, re-read on every open so an hour spent with the palette closed
+  // expires them (the list is only ever consulted at build time). Empty query
+  // only: once you are searching, you want the best match, and a pinned
+  // section would push it down and duplicate rows.
+  const recents = useMemo(
+    () => (open && view === "root" && !query
+      ? recentIds(readRecents(), new Set(commands.map(c => c.id)))
+      : []),
+    [open, view, query, commands],
+  );
 
   // Filter + score against the query, preserving section order. Each command
   // matches on "<label> <keywords>"; only label-range hits are highlighted.
@@ -331,18 +502,47 @@ export function CommandPalette() {
       arr.push(s);
       bySection.set(s.cmd.section, arr);
     }
-    const groups: Array<{ section: Section; items: Scored[] }> = [];
+    const groups: Array<{ section: string; items: Scored[] }> = [];
+    // Recent goes first and its members are LIFTED out of their home sections
+    // rather than duplicated — the same command twice in one list makes the
+    // arrow keys feel broken.
+    const recentSet = new Set(recents);
+    if (recentSet.size > 0) {
+      const byId = new Map(out.map(s => [s.cmd.id, s]));
+      const items = recents.map(id => byId.get(id)).filter(Boolean) as Scored[];
+      if (items.length > 0) groups.push({ section: RECENT_SECTION, items });
+    }
     for (const section of SECTION_ORDER) {
-      const items = bySection.get(section);
-      if (!items || items.length === 0) continue;
+      const items = (bySection.get(section) ?? []).filter(s => !recentSet.has(s.cmd.id));
+      if (items.length === 0) continue;
       if (query) items.sort((a, b) => b.score - a.score);
+      // Empty query: insertion order, except that a `priority` command floats
+      // to the head of its section. Array.prototype.sort is stable, so every
+      // other row keeps the order it was pushed in.
+      else items.sort((a, b) => Number(!!b.cmd.priority) - Number(!!a.cmd.priority));
       groups.push({ section, items });
     }
     const rows: Scored[] = groups.flatMap(g => g.items);
     return { groups, rows };
-  }, [commands, query]);
+  }, [commands, query, recents]);
 
   const rows = filtered.rows;
+
+  // Jump the highlight to the strongest match on query change, without
+  // touching row order (sections and insertion order stay put — see
+  // `filtered` above). Without this the highlight sat on row 0, i.e.
+  // whichever section happens to sort first, even when a later row is
+  // the obviously-intended match (e.g. "upd" landing on "Jump to next
+  // waiting agent" over "Check for updates").
+  useEffect(() => {
+    if (!query) { setActiveIdx(0); return; }
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].score > bestScore) { bestScore = rows[i].score; bestIdx = i; }
+    }
+    setActiveIdx(bestIdx);
+  }, [query, rows]);
 
   // Clamp the active index to the current row count.
   useEffect(() => {
@@ -371,7 +571,8 @@ export function CommandPalette() {
       setActiveIdx(i => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      rows[activeIdx]?.cmd.run();
+      const c = rows[activeIdx]?.cmd;
+      if (c) runCmd(c);
     } else if (e.key === "Escape") {
       e.preventDefault();
       if (view === "theme") cancelThemePreview(); else close();
@@ -383,6 +584,15 @@ export function CommandPalette() {
 
   // Resolve a command's shortcut glyphs (if it has a binding).
   const glyphsFor = (id?: ShortcutId) => (id && binds[id] ? bindingGlyphs(binds[id]) : null);
+
+  /** Every path that runs a command goes through here, so recording can't drift
+   *  from invocation. Theme submenu entries are not recorded: they are a live
+   *  preview you arrow through, and remembering the last one you happened to
+   *  land on is noise, not intent. */
+  const runCmd = (cmd: Cmd) => {
+    if (view === "root" && !cmd.noRecent) recordRecent(cmd.id);
+    cmd.run();
+  };
 
   let rowIdx = -1; // running index across sections for keyboard nav mapping
 
@@ -460,9 +670,20 @@ export function CommandPalette() {
               <div className="px-3 py-3 text-[13px] text-[var(--color-fg-faint)]">No matching commands</div>
             )}
             {filtered.groups.map(group => (
-              <div key={group.section}>
-                <div className="px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-[var(--color-fg-faint)]">
+              <div
+                key={group.section}
+                // Hairline under Recent so it reads as pinned above the real
+                // list rather than as just another section.
+                className={group.section === RECENT_SECTION
+                  ? "mb-1 border-b border-[var(--color-border-soft)] pb-1"
+                  : undefined}
+              >
+                <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-[var(--color-fg-faint)]">
+                  {group.section === RECENT_SECTION && <Clock className="h-3 w-3" />}
                   {group.section}
+                  {group.section === RECENT_SECTION && (
+                    <span className="normal-case tracking-normal opacity-70">· what you just ran</span>
+                  )}
                 </div>
                 {group.items.map(({ cmd, labelMatches }) => {
                   rowIdx += 1;
@@ -473,7 +694,10 @@ export function CommandPalette() {
                     <button
                       key={cmd.id}
                       data-row={i}
-                      onClick={() => cmd.run()}
+                      // Stable handle for the e2e suite: row order shifts with
+                      // the query, the command's id does not.
+                      data-cmd-id={cmd.id}
+                      onClick={() => runCmd(cmd)}
                       onMouseMove={() => setActiveIdx(i)}
                       // Subtle neutral highlight (Conductor-style) — a faint
                       // fg-tinted overlay, theme-aware, no accent/border.

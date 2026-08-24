@@ -3,15 +3,17 @@
 
 import { create } from "zustand";
 import { useUI } from "@/store/ui";
-import type { Project, Task, Tab, TerminalTab, PersistedTab, SplitTree, PaneLeaf, SplitDir } from "@/lib/types";
+import type { Project, Task, Tab, TerminalTab, DiffTab, PersistedTab, SplitTree, PaneLeaf, SplitDir } from "@/lib/types";
 import {
   findLeaf, getAllLeaves, countLeaves, replaceNode, removeLeaf,
-  addLeafTab, removeLeafTab, setLeafActiveTabId, pruneLeafTabs, dropEmptyLeaves,
+  addLeafTab, removeLeafTab, setLeafTabs, setLeafActiveTabId, pruneLeafTabs, dropEmptyLeaves,
   updateSplitRatio, findAdjacentPane, equalizeSplitsOnAxis,
 } from "@/lib/splitTree";
+import { pinBoundary } from "@/lib/tabActions";
 import * as ipc from "@/lib/ipc";
 import { groupOf } from "@/lib/projectGroups";
 import { useRace } from "@/store/race";
+import { useFileViewed } from "@/store/fileViewed";
 import { takeUnattendedSpawn } from "@/lib/unattendedSpawns";
 import { failCliQueuedPromptsInTabs } from "@/lib/cliPromptReports";
 import { focusTerminalTab, focusMainTab, focusPaneTab } from "@/lib/tabFocus";
@@ -88,7 +90,7 @@ export interface AppState {
   terminalSplitCollapsed: Record<string, boolean>;
   /** Per-task: bottom-terminal tab IDs (each = its own scratch shell).
    *  Lives in memory only — like the main terminal tabs, PTYs die with the app. */
-  bottomTabs: Record<string, { id: string; title: string; liveTitle?: string; autoFocus?: boolean }[]>;
+  bottomTabs: Record<string, { id: string; title: string; liveTitle?: string; autoFocus?: boolean; pinned?: boolean }[]>;
   /** Per-task: id of the active bottom-terminal tab. */
   activeBottomTab: Record<string, string>;
   /** Per-task: the iTerm-like split-pane tree for the main content area.
@@ -128,6 +130,11 @@ export interface AppState {
    *  `spawnArgsForCli` can consult `agent.command + args + capabilities`
    *  instead of hard-coding by CLI string. Empty until first loadAll. */
   agents: import("@/lib/types").Agent[];
+  /** App-wide browser command (`Settings.preview_browser`, GH #245). Mirrored
+   *  into the store because terminal link clicks need it synchronously — an
+   *  async settings read per Cmd+click would be a round trip on a hot path.
+   *  Written on load and again by Settings on save. "" = OS default. */
+  previewBrowser: string;
   /** PATH-detection results keyed by agent id. Empty until `refreshClis`
    *  first resolves — an empty map means "show every agent" so the
    *  pickers are never stranded before/without detection. Drives the
@@ -154,9 +161,9 @@ export interface AppState {
   /** Stop a task without archiving it (GH #119): evict it from mountedTasks
    *  so its TaskView unmounts and every PTY dies (TerminalPane/AuxTerminal
    *  cleanup), then clear the runtime-only tab fields so the task looks like
-   *  one not yet visited this session. The resume keys (sessionId /
-   *  previousSessionId) survive, so opening the task again respawns the
-   *  agents with their conversations resumed. */
+   *  one not yet visited this session. The resume key (sessionId) survives,
+   *  so opening the task again respawns the agents with their conversations
+   *  resumed. */
   stopTask: (taskId: string) => void;
   setView: (page: View["page"]) => void;
   openSettings: (tab?: View["settingsTab"], repoId?: string, highlight?: string) => void;
@@ -205,6 +212,10 @@ export interface AppState {
   addBottomTab: (taskId: string, opts?: { focus?: boolean }) => string;
   closeBottomTab: (taskId: string, tabId: string) => void;
   setActiveBottomTab: (taskId: string, tabId: string) => void;
+  /** `pinTab` / `unpinTab` for the bottom scratch shells. Those live in their
+   *  own array and are never persisted, so their pin lasts the session only. */
+  pinBottomTab: (taskId: string, tabId: string) => void;
+  unpinBottomTab: (taskId: string, tabId: string) => void;
   /** Update a bottom-shell tab's live OSC 0/2 title (what the shell emits,
    *  e.g. the running command or cwd). Falls back to the base "shell N" when
    *  empty. Idempotent. */
@@ -261,9 +272,6 @@ export interface AppState {
    *  to disk. Keyed by tab id so agents in one task resume
    *  independently. */
   setTabSessionId: (taskId: string, tabId: string, uuid: string) => void;
-  /** Stash (or clear, with "") the uuid a `--resume` just fast-exited on, so
-   *  a transient failure is one-click recoverable instead of lost. */
-  setTabPreviousSessionId: (taskId: string, tabId: string, uuid: string) => void;
   /** Mirror a just-persisted custom launch command into the in-memory
    *  task AND any open custom-command tabs so the next PTY respawn
    *  runs the new script (the disk write alone doesn't refresh either). */
@@ -287,6 +295,11 @@ export interface AppState {
    *  tab is pulled out (i.e. an index into the other tabs, 0..length-1).
    *  No-op if the order is unchanged. */
   reorderTab: (taskId: string, tabId: string, toIndex: number) => void;
+  /** Pin a tab: flag it and append it to its strip's pinned block. Unpin: clear
+   *  the flag and drop it to the first slot after that block (Chrome
+   *  semantics). Works for both main-strip and split-pane tabs. */
+  pinTab: (taskId: string, tabId: string) => void;
+  unpinTab: (taskId: string, tabId: string) => void;
   closeTab: (taskId: string, tabId: string) => void;
   /** Reopen a `closedTabs` entry as a fresh tab, forcing its original
    *  `sessionId` so the agent resumes via `--resume <uuid>` (see
@@ -295,11 +308,17 @@ export interface AppState {
   resumeClosedTab: (taskId: string, entryId: string) => void;
   setActiveTabId: (taskId: string, tabId: string) => void;
   persistTab: (taskId: string, tabId: string) => void;
-  openPreviewTab: (taskId: string, data: { type: "edit" | "diff" | "dir"; path: string; title: string; scope?: "unstaged" | "staged"; revealAt?: { line: number; col?: number }; revealHeading?: string }) => void;
+  openPreviewTab: (taskId: string, data: { type: "edit" | "diff" | "dir" | "external"; path: string; title: string; scope?: DiffTab["scope"]; revealAt?: { line: number; col?: number }; revealHeading?: string }) => void;
   /** Clear an edit tab's `revealAt` after EditorPane has consumed it,
    *  so a re-render doesn't re-jump the cursor. */
   consumeReveal: (taskId: string, tabId: string) => void;
   patchTab: (taskId: string, tabId: string, patch: Partial<Tab>) => void;
+  /** Turn a promoted scratchpad (GH #244) into an ordinary `edit` tab on
+   *  `path`. Same tab id and same slot in the strip, so the pad the user was
+   *  looking at is the file they are now looking at. The ONLY path that ends
+   *  a pad's permanent dirty state, because it is the only one that writes
+   *  the buffer somewhere the user chose. No-op if the tab isn't a pad. */
+  promoteScratchTab: (taskId: string, tabId: string, path: string) => void;
   /** Append a message to an agent tab's queue and wake the drain engine.
    *  Shared by the message-queue button and the prompt library so the
    *  queueKick-bump protocol (don't rely on a queueActive false->true edge)
@@ -418,14 +437,71 @@ function durablePersistedTabs(tabs: Tab[] | undefined): PersistedTab[] {
       is_default: !!t.is_default,
       command: t.command ?? null,
       session_id: t.sessionId ?? null,
-      previous_session_id: t.previousSessionId ?? null,
       pane_leaf_id: t.paneId ?? null,
       // Run pop-out tabs persist WITH their marker so the RunPane comes back
       // in its pane on relaunch (the run script re-fires, like custom tabs).
       run_member: t.runTab ? t.runTab.member : null,
+      pinned: !!t.pinned,
     }));
 }
 
+/**
+ * Move `tabId` to its strip's pin boundary and persist. Shared by `pinTab` and
+ * `unpinTab`: both send the tab to the SAME index, so this reads the flag that
+ * was just written rather than being told which way it went.
+ */
+function reseatAtPinBoundary(
+  set: (partial: Partial<AppState>) => void,
+  get: () => AppState,
+  taskId: string,
+  tabId: string,
+) {
+  const s = get();
+  const list = s.tabs[taskId] ?? [];
+  const tab = list.find(t => t.id === tabId);
+  if (!tab) return;
+  const paneId = (tab as TerminalTab).paneId;
+  if (paneId) {
+    const tree = s.splitTree[taskId];
+    if (!tree) return;
+    const leaf = findLeaf(tree, paneId);
+    if (!leaf) return;
+    const strip = leaf.tabIds.map(id => list.find(t => t.id === id)).filter(Boolean) as Tab[];
+    const without = leaf.tabIds.filter(id => id !== tabId);
+    without.splice(pinBoundary(strip, tabId), 0, tabId);
+    set({ splitTree: { ...s.splitTree, [taskId]: setLeafTabs(tree, paneId, without) } });
+    get().saveSplitLayout(taskId);
+  } else {
+    // reorderTab indexes into the FULL per-task array, which interleaves
+    // split-pane tabs — so anchor on the main tab that must follow this one
+    // (the same mapping useTabStripDrag does).
+    const main = list.filter(t => !(t as TerminalTab).paneId);
+    const mainWithout = main.filter(t => t.id !== tabId);
+    const anchor = mainWithout[pinBoundary(main, tabId)];
+    const fullWithout = list.filter(t => t.id !== tabId);
+    get().reorderTab(taskId, tabId, anchor
+      ? fullWithout.findIndex(t => t.id === anchor.id)
+      : fullWithout.length);
+  }
+  // reorderTab bails when the order is already right (a tab pinned while it
+  // sits at the boundary), but the flag itself still has to reach disk.
+  get().syncDurableTabs(taskId);
+}
+
+/** `reseatAtPinBoundary` for the bottom scratch shells (own array, no disk). */
+function reseatBottomAtPinBoundary(
+  set: (partial: Partial<AppState>) => void,
+  get: () => AppState,
+  taskId: string,
+  tabId: string,
+) {
+  const list = get().bottomTabs[taskId] ?? [];
+  const tab = list.find(t => t.id === tabId);
+  if (!tab) return;
+  const next = list.filter(t => t.id !== tabId);
+  next.splice(pinBoundary(list, tabId), 0, tab);
+  set({ bottomTabs: { ...get().bottomTabs, [taskId]: next } });
+}
 
 /**
  * True when the user can actually SEE this tab, and therefore does not need a
@@ -489,6 +565,7 @@ export const useApp = create<AppState>((set, get) => ({
   collapsedGroups: initialCollapsedGrp as Record<string, boolean>,
   groupColors: initialGroupColors as Record<string, string>,
   agents: [],
+  previewBrowser: "",
   detectedClis: {},
   spotlightTaskId: {},
 
@@ -528,11 +605,18 @@ export const useApp = create<AppState>((set, get) => ({
       );
       try { localStorage.setItem(LS_GROUP_COLORS, JSON.stringify(groupColors)); } catch {}
     }
-    set({ projects, tasks, collapsedGroups, groupColors, agents: (settings.agents as import("@/lib/types").Agent[]) ?? [] });
+    set({ projects, tasks, collapsedGroups, groupColors, agents: (settings.agents as import("@/lib/types").Agent[]) ?? [], previewBrowser: settings.preview_browser ?? "" });
     // Same housekeeping for Agent Race cohorts: once every task in a race is
     // archived or deleted, drop the race so the board and its localStorage
     // don't accumulate dead entries.
-    useRace.getState().prune(new Set(tasks.filter(t => !t.archived).map(t => t.id)));
+    const liveTaskIds = new Set(tasks.filter(t => !t.archived).map(t => t.id));
+    useRace.getState().prune(liveTaskIds);
+    // "Mark as viewed" marks are bounded the same way, by TASK liveness only
+    // (GH #248): the map is one namespace shared by the Git panel, the Compare
+    // panel and DiffPane's compare walk, so nothing that sees a partial slice
+    // of it may prune paths. Archived tasks keep their marks until the task is
+    // gone for good, matching the race prune above.
+    useFileViewed.getState().prune(new Set(tasks.map(t => t.id)));
   },
 
   refreshClis: async () => {
@@ -570,7 +654,7 @@ export const useApp = create<AppState>((set, get) => ({
       const cleared = failCliQueuedPromptsInTabs(
         (s.tabs[taskId] ?? []).map(t =>
           t.type === "terminal"
-            ? { ...t, ptyId: undefined, lastInputAt: null, lastOutputAt: null, workState: undefined }
+            ? { ...t, ptyId: undefined, lastInputAt: null, lastOutputAt: null, firstOutputAt: null, workState: undefined }
             : t,
         ),
         "the task was stopped before the queued prompt delivered",
@@ -743,11 +827,26 @@ export const useApp = create<AppState>((set, get) => ({
     try { localStorage.setItem(LS_SPLITH, JSON.stringify(next)); } catch {}
     return { terminalSplitHeight: next };
   }),
-  toggleTerminalSplitCollapsed: (taskId) => set(s => {
-    const next = { ...s.terminalSplitCollapsed, [taskId]: !s.terminalSplitCollapsed[taskId] };
-    try { localStorage.setItem(LS_SPLITC, JSON.stringify(next)); } catch {}
-    return { terminalSplitCollapsed: next };
-  }),
+  // Focus follows the collapse in BOTH directions, so the chevron in the strip
+  // and ⌘J behave the same. Collapsing hides the shell with display:none,
+  // which drops DOM focus to <body> and swallows every keystroke; expanding is
+  // an explicit request for the panel, so the shell takes focus.
+  toggleTerminalSplitCollapsed: (taskId) => {
+    const s = get();
+    const collapsed = !s.terminalSplitCollapsed[taskId];
+    set(st => {
+      const next = { ...st.terminalSplitCollapsed, [taskId]: collapsed };
+      try { localStorage.setItem(LS_SPLITC, JSON.stringify(next)); } catch {}
+      return { terminalSplitCollapsed: next };
+    });
+    if (!collapsed) { focusTerminalTab(s.activeBottomTab[taskId]); return; }
+    // Return focus to the active split pane or main pane, never <body>.
+    const tree = s.splitTree[taskId];
+    const activePaneId = tree ? s.activePaneId[taskId] : null;
+    const activePaneLeaf = (activePaneId && tree) ? findLeaf(tree, activePaneId) : null;
+    if (activePaneLeaf?.activeTabId) focusPaneTab(activePaneLeaf.activeTabId);
+    else focusMainTab(s.activeTab[taskId]);
+  },
   // ⌘J / command palette: VS Code-style 3-state cycle on the bottom-split
   // terminal. "Visible" = split open AND not collapsed.
   //   hidden/collapsed        → show, expand, seed a shell if empty, focus it.
@@ -768,21 +867,18 @@ export const useApp = create<AppState>((set, get) => ({
         focusTerminalTab(s.activeBottomTab[taskId]);
         return;
       }
+      // toggleTerminalSplitCollapsed hands focus back to the active pane.
       get().toggleTerminalSplitCollapsed(taskId);
-      // Return focus to the active split pane or main pane.
-      const tree = s.splitTree[taskId];
-      const activePaneId = tree ? s.activePaneId[taskId] : null;
-      const activePaneLeaf = (activePaneId && tree) ? findLeaf(tree, activePaneId) : null;
-      if (activePaneLeaf?.activeTabId) focusPaneTab(activePaneLeaf.activeTabId);
-      else focusMainTab(s.activeTab[taskId]);
       return;
     }
     if (!splitOpen) get().toggleTerminalSplit(taskId);
+    // Expanding already focuses the active shell, so only focus here when
+    // there was nothing to expand.
     if (isCollapsed) get().toggleTerminalSplitCollapsed(taskId);
     // addBottomTab focuses the new shell itself; TaskView's seed effect
     // sees the non-empty list and won't double-add.
     if ((get().bottomTabs[taskId]?.length ?? 0) === 0) get().addBottomTab(taskId);
-    else focusTerminalTab(get().activeBottomTab[taskId]);
+    else if (!isCollapsed) focusTerminalTab(get().activeBottomTab[taskId]);
   },
   enableFooterTerm:  (taskId) => set(s => ({ footerTerm: { ...s.footerTerm, [taskId]: true } })),
   disableFooterTerm: (taskId) => set(s => {
@@ -924,9 +1020,32 @@ export const useApp = create<AppState>((set, get) => ({
     });
     if (focusId) focusTerminalTab(focusId);
   },
-  setActiveBottomTab: (taskId, tabId) => set(s => ({
-    activeBottomTab: { ...s.activeBottomTab, [taskId]: tabId },
-  })),
+  // AuxTerminal deliberately doesn't grab focus when it becomes active (so
+  // opening the split / switching tasks doesn't steal focus from the agent),
+  // so the switch itself must move focus. Covers ⇧⌘[ / ⇧⌘] and clicking a
+  // pill in the strip.
+  setActiveBottomTab: (taskId, tabId) => {
+    set(s => ({ activeBottomTab: { ...s.activeBottomTab, [taskId]: tabId } }));
+    focusTerminalTab(tabId);
+  },
+  pinBottomTab: (taskId, tabId) => {
+    set(s => ({
+      bottomTabs: {
+        ...s.bottomTabs,
+        [taskId]: (s.bottomTabs[taskId] ?? []).map(t => t.id === tabId ? { ...t, pinned: true } : t),
+      },
+    }));
+    reseatBottomAtPinBoundary(set, get, taskId, tabId);
+  },
+  unpinBottomTab: (taskId, tabId) => {
+    set(s => ({
+      bottomTabs: {
+        ...s.bottomTabs,
+        [taskId]: (s.bottomTabs[taskId] ?? []).map(t => t.id === tabId ? { ...t, pinned: false } : t),
+      },
+    }));
+    reseatBottomAtPinBoundary(set, get, taskId, tabId);
+  },
   setBottomTabLiveTitle: (taskId, tabId, liveTitle) => set(s => {
     const list = s.bottomTabs[taskId];
     if (!list) return s;
@@ -1440,8 +1559,8 @@ export const useApp = create<AppState>((set, get) => ({
         is_default: !!pt.is_default,
         ...(pt.command ? { command: pt.command } : {}),
         ...(pt.session_id ? { sessionId: pt.session_id } : {}),
-        ...(pt.previous_session_id ? { previousSessionId: pt.previous_session_id } : {}),
         ...(unattendedRestore && pt.is_default ? { unattended: true } : {}),
+        ...(pt.pinned ? { pinned: true } : {}),
         // idle: restored run tabs keep their spot but never auto-fire the
         // script — the user presses play (RunPane placeholder / pill).
         ...(pt.run_member != null ? { runTab: { member: pt.run_member, previewUrl: null, idle: true } } : {}),
@@ -1484,10 +1603,10 @@ export const useApp = create<AppState>((set, get) => ({
                 : agentDisplayName(pt.cli, s.agents),
               customTitle: !!pt.custom_title,
               paneId: pt.pane_leaf_id!,
+              ...(pt.pinned ? { pinned: true } : {}),
               ...(pt.command ? { command: pt.command } : {}),
               ...(pt.session_id ? { sessionId: pt.session_id } : {}),
-              ...(pt.previous_session_id ? { previousSessionId: pt.previous_session_id } : {}),
-              ...(pt.run_member != null ? { runTab: { member: pt.run_member, previewUrl: null, idle: true } } : {}),
+                    ...(pt.run_member != null ? { runTab: { member: pt.run_member, previewUrl: null, idle: true } } : {}),
             });
           }
           // The saved tree can reference tabs that weren't restored (edit /
@@ -1646,28 +1765,6 @@ export const useApp = create<AppState>((set, get) => ({
     ipc.taskSetTabSessionId(taskId, tabId, uuid).catch(() => {});
   },
 
-  setTabPreviousSessionId: (taskId, tabId, uuid) => {
-    const val = uuid || undefined;
-    set(s => {
-      const list = s.tabs[taskId];
-      const nextTabs = list
-        ? list.map(t => (t.id === tabId && t.type === "terminal" ? { ...t, previousSessionId: val } as Tab : t))
-        : list;
-      const taskUpdate = {
-        tasks: s.tasks.map(w => w.id !== taskId ? w : {
-          ...w,
-          persisted_tabs: (w.persisted_tabs ?? []).map(pt =>
-            pt.id === tabId ? { ...pt, previous_session_id: uuid || null } : pt,
-          ),
-        }),
-      };
-      return {
-        ...(nextTabs ? { tabs: { ...s.tabs, [taskId]: nextTabs } } : {}),
-        ...taskUpdate,
-      };
-    });
-    ipc.taskSetTabPreviousSessionId(taskId, tabId, uuid).catch(() => {});
-  },
 
   setTaskYolo: (taskId, yolo) => set(s => ({
     tasks: s.tasks.map(w => w.id === taskId ? { ...w, yolo } : w),
@@ -1758,6 +1855,16 @@ export const useApp = create<AppState>((set, get) => ({
     });
     // Persist the new order so restore preserves it.
     if (changed) get().syncDurableTabs(taskId);
+  },
+
+  pinTab: (taskId, tabId) => {
+    get().patchTab(taskId, tabId, { pinned: true });
+    reseatAtPinBoundary(set, get, taskId, tabId);
+  },
+
+  unpinTab: (taskId, tabId) => {
+    get().patchTab(taskId, tabId, { pinned: false });
+    reseatAtPinBoundary(set, get, taskId, tabId);
   },
 
   closeTab: (taskId, tabId) => {
@@ -1908,10 +2015,11 @@ export const useApp = create<AppState>((set, get) => ({
         }
         return Object.keys(patch).length ? { ...t, ...patch } : t;
       }
-      if (t.unread) {
-        const patch: Partial<typeof t> = { unread: null };
-        return { ...t, ...patch };
-      }
+      // Every non-terminal tab type has only `unread` to clear. Spreading a
+      // `Partial<typeof t>` over the union widens `type` back to the union
+      // (TS distributes the spread, not the narrowing), so cast the result
+      // rather than the patch.
+      if (t.unread) return { ...t, unread: null } as Tab;
       return t;
     });
     return {
@@ -1931,6 +2039,30 @@ export const useApp = create<AppState>((set, get) => ({
         return updated;
       }
       return t;
+    });
+    return { tabs: { ...s.tabs, [taskId]: next } };
+  }),
+
+  promoteScratchTab: (taskId, tabId, path) => set(s => {
+    const list = s.tabs[taskId] || [];
+    const cur = list.find(t => t.id === tabId);
+    if (cur?.type !== "scratch") return s;
+    const next = list.map(t => {
+      if (t.id !== tabId) return t;
+      // Build the edit tab from BaseTab fields only. Spreading the old tab
+      // would carry `scratchId` and the pad's persisted `syntax` onto an
+      // EditTab, where the stale override would beat the extension the user
+      // just picked in the save dialog.
+      return {
+        id: t.id,
+        type: "edit",
+        path,
+        title: path.split("/").pop() || path,
+        ...(t.customTitle ? { customTitle: true, title: t.title } : {}),
+        ...(t.pinned ? { pinned: true } : {}),
+        ...(t.paneId ? { paneId: t.paneId } : {}),
+        dirty: false,
+      } as Tab;
     });
     return { tabs: { ...s.tabs, [taskId]: next } };
   }),
@@ -1994,7 +2126,11 @@ export const useApp = create<AppState>((set, get) => ({
     // remote images in a file the user never actually approved, just
     // because a PREVIOUS file shown in this same tab slot was unblocked.
     const revealPatch = {
-      revealAt: data.type === "edit" ? data.revealAt : undefined,
+      // `external` (GH #240) carries a reveal target too — a clicked
+      // `path:line:col` outside the task jumps the same way an in-task one
+      // does. It has no heading fragment: markdown links are resolved
+      // against the task, never against an arbitrary absolute path.
+      revealAt: data.type === "edit" || data.type === "external" ? data.revealAt : undefined,
       revealHeading: data.type === "edit" ? data.revealHeading : undefined,
       remoteImagesUnblocked: undefined as boolean | undefined,
       // Diff-side scope (GH #122) is part of the tab's identity: recycling
@@ -2018,7 +2154,7 @@ export const useApp = create<AppState>((set, get) => ({
     // openPreviewTab call for the same file lands first).
     const withNewRevealOnly = (existing: Tab) => {
       const patch: { revealAt?: unknown; revealHeading?: unknown } = {};
-      if (data.type === "edit" && data.revealAt !== undefined) patch.revealAt = data.revealAt;
+      if ((data.type === "edit" || data.type === "external") && data.revealAt !== undefined) patch.revealAt = data.revealAt;
       if (data.type === "edit" && data.revealHeading !== undefined) patch.revealHeading = data.revealHeading;
       if (Object.keys(patch).length === 0) return list; // nothing new — leave any pending reveal alone
       return list.map(t => t.id === existing.id ? { ...t, ...patch } as Tab : t);
@@ -2051,6 +2187,11 @@ export const useApp = create<AppState>((set, get) => ({
         const next = list.map(t => t.id === previewTab.id ? {
           ...t, type: data.type, path: data.path, title: data.title,
           liveTitle: undefined, customTitle: false, dirty: false, preview: true,
+        // The recycled slot is now a DIFFERENT file: a syntax the user set
+        // on the previous occupant (or one sniffed from its content) must
+        // not carry over, or a preview tab silently mislabels every file
+        // that lands in it afterwards.
+        syntax: undefined, syntaxAuto: undefined,
           ...revealPatch,
         } as Tab : t);
         const newTree = setLeafActiveTabId(tree, activePaneLeaf.id, previewTab.id);
@@ -2088,6 +2229,11 @@ export const useApp = create<AppState>((set, get) => ({
       const next = list.map(t => t.id === previewTab.id ? {
         ...t, type: data.type, path: data.path, title: data.title,
         liveTitle: undefined, customTitle: false, dirty: false, preview: true,
+        // The recycled slot is now a DIFFERENT file: a syntax the user set
+        // on the previous occupant (or one sniffed from its content) must
+        // not carry over, or a preview tab silently mislabels every file
+        // that lands in it afterwards.
+        syntax: undefined, syntaxAuto: undefined,
         ...revealPatch,
       } as Tab : t);
       return { tabs: { ...s.tabs, [taskId]: next }, ...setActive(previewTab.id) };
@@ -2135,6 +2281,15 @@ export const useApp = create<AppState>((set, get) => ({
 
   setTabLiveTitle: (taskId, tabId, liveTitle) => set(s => {
     const list = s.tabs[taskId] || [];
+    // Bail on a write that changes nothing, the way setWorkState and
+    // setWorkProgress already do. xterm fires onTitleChange for EVERY OSC 0/2
+    // without comparing it to the previous value (InputHandler.setTitle), and
+    // an agent TUI re-emits its unchanged title while it sits at the prompt —
+    // so without this, an idle agent still allocated a tab object, a tabs
+    // array and a tabs record, then woke every store subscriber, several times
+    // a second, per terminal, forever.
+    const cur = list.find(t => t.id === tabId);
+    if (!cur || cur.customTitle || (cur as TerminalTab).liveTitle === liveTitle) return s;
     const next = list.map(t => {
       if (t.id !== tabId) return t;
       // Locked tab: drop the agent's title entirely (user picked one).

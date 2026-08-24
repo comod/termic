@@ -18,6 +18,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { attachCmdClickLinkOpener } from "@/lib/termLinkOpener";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { openWebUrl, browserCommandForTask } from "@/lib/previewBrowser";
 import { loadTerminalRenderer, awaitTerminalFonts } from "@/lib/terminalRenderer";
 import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
@@ -34,7 +35,7 @@ import { IS_MAC, bindingMatches } from "@/lib/shortcuts";
 // `currentTerminalTheme()` picks the matching palette at mount; the
 // themeMode effect below pushes updates into live instances.
 
-export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onTitle }: { taskId?: string; taskPath: string; active: boolean; autoFocus?: boolean; onExited?: () => void; onTitle?: (title: string) => void }) {
+export function AuxTerminal({ taskId, tabId, taskPath, active, autoFocus, onExited, onTitle }: { taskId?: string; tabId?: string; taskPath: string; active: boolean; autoFocus?: boolean; onExited?: () => void; onTitle?: (title: string) => void }) {
   // Keep the latest onTitle in a ref so the long-lived spawn effect's
   // onTitleChange handler always calls the current callback without
   // re-running (and respawning the PTY) when the parent re-renders.
@@ -89,6 +90,10 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
     // selects. Routes through `open_path` for the system browser (#14).
     const openLink = (via: string) => (uri: string) => {
       ipc.logLine(`[link] scratch activate via=${via} uri=${uri}`).catch(() => {});
+      // GH #245, same rule as TerminalPane: configured browser or the
+      // untouched pre-#245 default path.
+      const browser = browserCommandForTask(taskId);
+      if (browser) { void openWebUrl(uri, browser); return; }
       openUrl(uri)
         .then(() => ipc.logLine("[link] scratch open ok").catch(() => {}))
         .catch((e) => ipc.logLine(`[link] scratch open FAILED: ${e}`).catch(() => {}));
@@ -225,11 +230,17 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
           // `role` is the sandbox-neutral identity that keeps the shell
           // reachable for `termic attach --shell` / `logs --shell`.
           role: taskId ? { task_id: taskId, kind: "aux" as const } : undefined,
+          // Reporting only (Activity monitor). Safe to set even where
+          // `task_id` above must stay unset: nothing branches on it.
+          owner: { task_id: taskId, tab_id: tabId, kind: "aux" as const },
           rows: Math.max(8, term.rows), cols: Math.max(40, term.cols),
         });
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }
         ptyRef.current = ptyId;
         unlistenData = await ipc.onPtyData(ptyId, u8 => term.write(u8));
+        // Output is held Rust-side until this lands: anything emitted before
+        // the listener exists is dropped (see ipc.ptyAttached).
+        ipc.ptyAttached(ptyId).catch(() => {});
         unlistenExit = await ipc.onPtyExit(ptyId, () => {
           ptyRef.current = null;
           // Bottom-split shells: parent passes onExited to close the

@@ -45,7 +45,14 @@ export async function snap(name: string): Promise<void> {
  * the shapes from src/store/* as you need them in a given spec.
  */
 export interface TermicApi {
-  useApp: { getState: () => any; setState: (p: any) => void };
+  useApp: {
+    getState: () => any;
+    setState: (p: any) => void;
+    /** Zustand's own subscribe, for watching a value CHANGE rather than
+     *  sampling it: a poll cannot see a state that is restored before the
+     *  next tick, and "when did it change" is often the whole question. */
+    subscribe: (fn: (s: any, prev: any) => void) => () => void;
+  };
   useUI: { getState: () => any; setState: (p: any) => void };
   usePrefs: { getState: () => any };
   useRace: { getState: () => any };
@@ -63,6 +70,22 @@ export interface TermicApi {
     resetSignalLog: (agentId?: string) => void;
     observationsFor: (agentId: string) => Array<{ title: string; seen: number }>;
   };
+  /** `termic://` deep links (GH #192). `handleDeepLink` takes the raw URL
+   *  string Rust would have queued — WebDriver cannot ask macOS to open a
+   *  URL scheme, so specs enter at the parse step instead. */
+  deepLink: {
+    handleDeepLink: (url: string) => void;
+    MAX_PROMPT_CHARS: number;
+  };
+  /** GH #245: configurable browser for preview URLs + terminal links. */
+  previewBrowser: {
+    openWebUrl: (url: string, browser: string) => Promise<void>;
+    openWebUrlForProject: (
+      url: string, globalCmd: string | undefined,
+      project: { preview_browser?: string } | null | undefined,
+    ) => Promise<void>;
+    resolveBrowserCommand: (g: string | undefined, p: string | undefined) => string;
+  };
   agentRace: {
     startRace: (opts: {
       projectId: string;
@@ -74,6 +97,18 @@ export interface TermicApi {
       yolo?: boolean;
     }) => Promise<string[]>;
   };
+  /** Tasks mid-creation (GH #242 — non-blocking worktree create). Seeding an
+   *  entry directly lets specs catch PendingTaskRow / CreatingTaskPane in
+   *  their "creating" state without racing the fixture repo's near-instant
+   *  real worktree add. */
+  usePendingTasks: { getState: () => any };
+  /** Tasks mid-archive (GH #246 — non-blocking archive). Same trick as
+   *  usePendingTasks: the fixture repo's archive is far too fast to catch the
+   *  "Archiving…" row by racing a real one. */
+  useArchivingTasks: { getState: () => any };
+  /** CodeMirror's indentation facet, for asserting what a file was detected
+   *  as (lib/detectIndent). */
+  cm: { indentUnit: unknown };
 }
 
 declare global {
@@ -138,9 +173,32 @@ export async function waitForAppShell(timeout = 30_000): Promise<void> {
 }
 
 /**
+ * Open one of the right panel's tabs.
+ *
+ * By test id, never by text: the tab renders its change count INSIDE the
+ * button, so "Git" reads as "Git29" the moment the checkout is dirty, and
+ * clickByText matches exact text. That made every spec that opens the Git tab
+ * depend on a clean fixture repo, which is not something a spec running tenth
+ * in a suite can assume: the whole "git dirty tree" block failed with "no
+ * clickable element with text: Git" whenever an earlier spec left a file
+ * behind, and passed when git.e2e ran alone.
+ */
+export async function openRightTab(label: "All files" | "Git"): Promise<void> {
+  await browser.execute((l) => {
+    const el = document.querySelector(
+      `[data-testid="right-tab"][data-tab="${l}"]`,
+    ) as HTMLElement | null;
+    if (!el) throw new Error(`no right-panel tab: ${l}`);
+    el.click();
+  }, label);
+}
+
+/**
  * Click a control by its exact visible text (semantic, resilient to markup
  * and class churn). Throws if nothing matches, so a broken selector fails
  * loudly instead of silently no-op'ing.
+ *
+ * Not for anything that can grow a badge or a count: see openRightTab.
  */
 export async function clickByText(text: string): Promise<void> {
   await browser.execute((t) => {
@@ -165,6 +223,120 @@ export async function clickMenuItem(text: string): Promise<void> {
     if (!el) throw new Error(`no menu item with text: ${t}`);
     (el as HTMLElement).click();
   }, text);
+}
+
+/**
+ * Click a menu entry and keep clicking it until the menu actually reacts.
+ *
+ * Radix remounts a menu's content whenever what it renders changes (the "+"
+ * menu's Worktree / Main checkout flip is the one that bites here), and a
+ * click dispatched into that remount lands on a node React is replacing: it
+ * does nothing, the menu stays open, and the spec then waits out its timeout
+ * on a prompt nobody opened. Settling the menu first narrows that window but
+ * cannot close it, because the read and the click are two separate round
+ * trips and the remount can start between them.
+ *
+ * Retrying is what closes it. `doneSelector` is what the click is supposed to
+ * produce (the inline name input, a dialog); once it is there, or once the
+ * item is gone because the menu closed, this stops clicking, so a landed
+ * click is never repeated into a second task.
+ */
+export async function clickMenuItemUntil(
+  text: string,
+  doneSelector: string,
+  timeout = 15_000,
+): Promise<void> {
+  try {
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (t, sel) => {
+            const done = document.querySelector(sel) as HTMLElement | null;
+            if (done) {
+              const r = done.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) return true;
+            }
+            const el = [...document.querySelectorAll("[role='menuitem']")].find(
+              (e) =>
+                e.textContent?.trim() === t &&
+                e.getBoundingClientRect().width > 0,
+            );
+            // No item and no result yet: the menu is mid-remount, or the click
+            // landed and its result has not painted. Either way, wait.
+            if (el) (el as HTMLElement).click();
+            return false;
+          },
+          text,
+          doneSelector,
+        ),
+      { timeout, interval: 250, timeoutMsg: `menu item "${text}" never produced ${doneSelector}` },
+    );
+  } catch (e) {
+    // The click going nowhere and the click landing on a prompt that never
+    // painted look identical from the timeout alone, and this only reproduces
+    // on CI — so report the DOM that produced it rather than the deadline.
+    const state = await browser.execute(
+      (t, sel) => {
+        const box = (el: Element) => {
+          const r = el.getBoundingClientRect();
+          return `${Math.round(r.width)}x${Math.round(r.height)}`;
+        };
+        return {
+          menus: [...document.querySelectorAll('[role="menu"]')].map(
+            (m) => `${box(m)} state=${m.getAttribute("data-state")}`,
+          ),
+          items: [...document.querySelectorAll('[role="menuitem"]')]
+            .filter((e) => e.textContent?.trim() === t)
+            .map((e) => `${box(e)} state=${e.closest('[role="menu"]')?.getAttribute("data-state")}`),
+          done: [...document.querySelectorAll(sel)].map(box),
+          dialogs: [...document.querySelectorAll('[role="dialog"]')].map(
+            (d) => `${box(d)} state=${d.getAttribute("data-state")}`,
+          ),
+        };
+      },
+      text,
+      doneSelector,
+    );
+    throw new Error(`${(e as Error).message}\n  DOM at timeout: ${JSON.stringify(state)}`);
+  }
+}
+
+/** Wait until the app's PATH detection for the agent registry has landed.
+ *
+ *  App.tsx kicks `refreshClis` off at startup, and it takes SECONDS (one
+ *  login-shell probe per configured agent). Any CLI verb that opens a tab
+ *  hydrates the registry inline if it is still empty, inside the CLI's own
+ *  10s "did the UI answer?" deadline — so a spec that drives `termic tab`
+ *  during the first few seconds of app life fails with "the Termic UI did not
+ *  answer within 10000ms" on a slow machine, while passing on a fast one.
+ *  Wait for the detection the app is already doing instead of racing it.
+ */
+export async function waitForClisDetected(timeout = 30_000): Promise<void> {
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        () => Object.keys(window.__termic!.useApp.getState().detectedClis).length > 0,
+      ),
+    { timeout, timeoutMsg: "the agent registry never finished PATH detection" },
+  );
+}
+
+/** Focus `selector`, then send a real key to it.
+ *
+ *  Inline inputs autofocus through a `requestAnimationFrame` chain, and rAF is
+ *  FROZEN while the window is occluded (another window on top, another Space).
+ *  A bare `browser.keys` then goes to whatever still holds focus, the row never
+ *  commits, and it stays open to block the next spec's menu — a failure that
+ *  only ever reproduces on a backgrounded window. Focusing explicitly keeps the
+ *  keystroke real without depending on the app's rAF landing first.
+ */
+export async function keysIn(selector: string, key: string): Promise<void> {
+  await browser.execute((sel) => {
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (!el) throw new Error(`no element to focus: ${sel}`);
+    el.focus();
+  }, selector);
+  await browser.keys(key);
 }
 
 /** Wait until the given substring is present in the visible body text. */
@@ -782,4 +954,41 @@ export async function requireTermicApi(): Promise<void> {
       "window.__termic missing — rebuild with `make e2e` (VITE_E2E=1). See the e2e skill.",
     );
   }
+}
+
+/**
+ * Run CodeMirror's pending layout measurement NOW, and report how many editors
+ * were flushed.
+ *
+ * CM schedules that measurement with `requestAnimationFrame`, and WebKit
+ * freezes rAF in an occluded window — which the harness window permanently is
+ * (`document.hidden` is true for the whole suite; the Activity spec leans on
+ * the same fact for its back-off case). Until the measurement runs, CM's
+ * height map keeps its UNMEASURED default of 14px per line while the rendered
+ * lines are really 20, so every gutter number sits 6px above its code and the
+ * gap grows down the file. That is the exact shape of the bug an alignment
+ * spec is looking for, manufactured by the harness rather than by the code
+ * under test, and no amount of waiting clears it: the frame never comes.
+ *
+ * `coordsAtPos` is the public read that flushes a pending measure (through
+ * CM's internal `readMeasured`), so ask for a position and drop the answer. A
+ * visible window gets all of this for free on the next frame.
+ *
+ * Call it before reading any geometry OUT of a CodeMirror editor. The count
+ * comes back so a CM upgrade that renames the view handle cannot quietly turn
+ * this into a no-op that reintroduces the drift.
+ */
+export function flushEditorMeasure(): Promise<number> {
+  return browser.execute(() => {
+    let flushed = 0;
+    for (const ed of [...document.querySelectorAll(".cm-editor")]) {
+      if (!(ed as HTMLElement).getBoundingClientRect().height) continue;
+      // EditorView.findFromDOM's own route to the view (@codemirror/view 6.43).
+      const view = (ed.querySelector(".cm-content") as any)?.cmTile?.root?.view;
+      if (typeof view?.coordsAtPos !== "function") continue;
+      view.coordsAtPos(0);
+      flushed++;
+    }
+    return flushed;
+  }) as Promise<number>;
 }

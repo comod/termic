@@ -279,6 +279,9 @@ unknown project or agent, duplicate task), 3 agent stopped needing input, \
         #[arg(long, value_name = "SESSION_ID")]
         resume: Option<String>,
         /// Sandbox mode for the task. Default: the project's sandbox seeds.
+        /// `enforce` / `enforce-fs` also deny the new agent the control
+        /// plane, so it can never report back to you: ask it for a file in
+        /// its worktree instead. `monitor` reaches the CLI by contract.
         #[arg(long, value_parser = ["off", "monitor", "enforce", "enforce-fs"])]
         sandbox: Option<String>,
         /// Skip agent permission prompts (the agent's YOLO flag).
@@ -292,6 +295,9 @@ unknown project or agent, duplicate task), 3 agent stopped needing input, \
         open: bool,
         /// Block until the injected prompt's turn settles (delivery
         /// confirmed), or until the agent is quiescent without a prompt.
+        /// Settle detection is a heuristic and you can do nothing while
+        /// blocked: to coordinate with the new agent, prefer asking it in
+        /// the prompt to report back with `termic send <your task id>`.
         #[arg(long)]
         wait: bool,
         /// Give up waiting after this long (exit 7). E.g. 90, 30s, 5m, 1h.
@@ -300,6 +306,8 @@ unknown project or agent, duplicate task), 3 agent stopped needing input, \
     },
 
     /// Block until the task's agent is quiescent (settled, empty queue).
+    /// Coordinating two agents is better done with prompts than with this:
+    /// see the notes under `send`.
     #[command(
         after_help = "Quiescent means the agent settled AND its message queue is empty, so a \
 prompt queued behind the current turn still counts as running. Without \
@@ -365,6 +373,30 @@ prompt's turn, a very short turn can take up to 30s extra to report done; \
 size --timeout accordingly. Each --fresh adds a NEW agent tab to the task \
 (none are reused or closed). Ctrl-C stops watching only.
 
+COORDINATING TWO AGENTS: prompt each other, do not wait on each other. \
+--wait ties you to a work-done heuristic (a settled terminal is a guess, not \
+a finished job) and you can do nothing else while it blocks. Instead end \
+every prompt you send with the command you want run when that work is done, \
+and let the receiving agent choose the moment:
+
+  termic send <task> -p \"<your prompt here: what you want it to do>. When \
+done: termic send $TERMIC_TASK_ID -p 'done: <what you did>'\"
+
+The outer DOUBLE quotes are load-bearing: YOUR shell expands \
+$TERMIC_TASK_ID at send time, so the other agent is handed a literal \
+address it can just run. Single quotes there would block expansion and \
+leave it guessing. A prompt arriving in your terminal IS that report. With \
+no task of your own to be prompted back at, ask for a file instead and \
+read it when you next have a reason to.
+
+A task sandboxed in `enforce` / `enforce-fs` CANNOT take part: the cage \
+denies it the control plane outright, so it can neither be asked to report \
+back nor do so. That is deliberate and will not change - a cage with a \
+text channel to an uncaged agent is not a cage - so do not wire a \
+report-back for one. Ask it for a file in its own worktree and read that \
+yourself, or run the task in `monitor` (which reaches the CLI by contract) \
+or uncaged. `--sandbox` on `new` is where that is chosen.
+
 Prints the delivery mode (or the wait outcome) on stdout. With \
 --output-format json, one object: {\"task_id\", \"mode\": \
 \"delivered\"|\"queued\"|\"spawned\", \"capable\", \"wait\": {\"outcome\", \
@@ -401,7 +433,10 @@ stopped needing input, 4 app not running, 5 CLI disabled, 6 refused, \
         #[arg(long, conflicts_with = "resume")]
         fresh: bool,
         /// Block until the prompt is confirmed delivered and its turn
-        /// settles (or the agent asks for input).
+        /// settles (or the agent asks for input). Settle detection is a
+        /// heuristic and you can do nothing while blocked: to coordinate
+        /// with the agent, prefer ending the prompt with an instruction to
+        /// report back via `termic send <your task id>`.
         #[arg(long)]
         wait: bool,
         /// Give up waiting after this long (exit 7). E.g. 90, 30s, 5m, 1h.
@@ -1053,7 +1088,11 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     ) {
         return Err(CliError::new(
             exit_code::REFUSED,
-            "this shell is inside a sandboxed termic task, the control plane is unavailable",
+            "this shell is inside a sandboxed termic task, the control plane is unavailable. \
+This is by design and permanent, not a misconfiguration: a cage with a channel to an \
+uncaged agent is not a cage. To report your work, write a file in your own task \
+directory and say so in your final message; whoever is waiting on you reads it from \
+outside.",
         ));
     }
 

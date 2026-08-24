@@ -6,7 +6,6 @@ import { useUI } from "@/store/ui";
 import { settingsLoad } from "@/lib/ipc";
 import { NewProjectDialog } from "./NewProjectDialog";
 import { NewTaskDialog } from "./NewTaskDialog";
-import { QuickCreateProgressDialog } from "./QuickCreateProgressDialog";
 import { CustomCommandDialog } from "./CustomCommandDialog";
 import { EditCommandDialog } from "./EditCommandDialog";
 import { RunCommandsDialog } from "./RunCommandsDialog";
@@ -27,6 +26,9 @@ import { ProjectPickerDialog } from "./ProjectPickerDialog";
 import { CommandPalette } from "./CommandPalette";
 import { PromptDestinationDialog } from "./PromptDestinationDialog";
 import { PromptPalette } from "./PromptPalette";
+import { SyntaxPalette } from "./SyntaxPalette";
+import { ScratchCloseDialog } from "./ScratchCloseDialog";
+import { ScratchSaveDialog } from "./ScratchSaveDialog";
 import { Loader2 } from "lucide-react";
 
 export function Dialogs() {
@@ -42,7 +44,6 @@ export function Dialogs() {
     <>
       <NewProjectDialog />
       <NewTaskDialog />
-      <QuickCreateProgressDialog />
       <CustomCommandDialog />
       <EditCommandDialog />
       <RunCommandsDialog />
@@ -63,11 +64,14 @@ export function Dialogs() {
       <CommandPalette />
       <PromptDestinationDialog />
       <PromptPalette />
+      <SyntaxPalette />
+      <ScratchCloseDialog />
+      <ScratchSaveDialog />
       {/* Blocking work overlay: shown while a slow IPC call is in flight
           (archive task, etc.). Click-blocks the whole window so users
           don't fire the action twice mid-wait. */}
       {busyMessage && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55">
+        <div data-testid="busy-overlay" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55">
           <div className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-1)] px-4 py-3 text-[13px] shadow-2xl">
             <Loader2 className="h-4 w-4 animate-spin text-[var(--color-accent)]" />
             <span>{busyMessage}</span>

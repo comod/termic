@@ -1,6 +1,13 @@
-// Right panel: tab between All Files (filesystem list) and Git (Fork-style
-// staging). Click a file → opens an Editor tab in the main area. Click a
-// change → diff tab.
+// Right panel: tabs for All files (filesystem list) and Git (Fork-style
+// staging of the working tree, with the commit graph as a collapsible Graph
+// section at its foot). Click a file → opens an Editor tab in the main area.
+// Click a change, or a file inside a commit → diff tab.
+//
+// History was its own third tab when #199 landed it. It is inside this one now
+// (GH #208): the graph and the working tree answer halves of one question,
+// "what is in this branch", and a tab switch made comparing them impossible.
+// The tab was renamed "Commit" by #199 because two git surfaces made "Git"
+// ambiguous; folding them back together makes "Git" right again.
 
 import React, { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -8,9 +15,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useApp, useActiveTask } from "@/store/app";
 import { useUI } from "@/store/ui";
 import {
-  taskGitStatus, taskRunScriptStream, openPath, repoConfigLoad, repoConfigLoadAt,
+  taskGitStatus, taskRunScriptStream, repoConfigLoad, repoConfigLoadAt,
   taskSpotlightResync,
 } from "@/lib/ipc";
+import { openWebUrlForProject } from "@/lib/previewBrowser";
 import { startSpotlight, stopSpotlight } from "@/lib/spotlight";
 import { launchRunTabs, expandPreviewUrl } from "@/lib/runTabs";
 import type { GitStatus, Task, TaskMember, Project, TerminalTab } from "@/lib/types";
@@ -54,6 +62,23 @@ export function RightPanel() {
   // A reveal-in-tree request (editor breadcrumb / locate button) forces the
   // "All files" view so the tree is on screen for FileTree to expand/scroll.
   const revealFile = useApp(s => s.revealFile);
+  // "Show this commit in History" from the editor's blame popup. Same shape as
+  // revealFile above: force the tab that can honour it, and un-hide the panel,
+  // because revealing into a collapsed panel reads as a dead button.
+  const commitReveal = useUI(s => s.commitReveal);
+  // Which request has already been acted on. `task?.id` is a dependency below
+  // (the panel has to know whose commit it is), so without this the effect
+  // re-runs on every task switch and re-applies an old request, which pinned
+  // the panel to the Git tab for the rest of the session.
+  const seenRevealAt = useRef(0);
+  useEffect(() => {
+    if (!commitReveal || !task || commitReveal.taskId !== task.id) return;
+    if (commitReveal.at === seenRevealAt.current) return;
+    seenRevealAt.current = commitReveal.at;
+    setView("changes");
+    if (useApp.getState().rightPanelHidden) useApp.getState().toggleRightPanel();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commitReveal, task?.id]);
   useEffect(() => {
     if (revealFile && task && revealFile.taskId === task.id) setView("files");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -499,6 +524,15 @@ export function RightPanel() {
             task={task}
             status={gitStatus}
             refresh={refreshGit}
+            // Same signals the Git status poll rides: the manual refresh, an
+            // agent settling, and the lighter git-only tick a commit bumps.
+            reloadToken={fileTreeReload + fsRevision + gitRevision}
+            onOpenCommitDiff={(path, sha, title) =>
+              useApp.getState().openPreviewTab(task.id, { type: "diff", path, scope: `commit:${sha}`, title })}
+            // `base:` not `commit:`: the compare diff's right side is the live
+            // file, which is what keeps mark-as-viewed and inline comments on.
+            onOpenCompareDiff={(path, sha, title) =>
+              useApp.getState().openPreviewTab(task.id, { type: "diff", path, scope: `base:${sha}`, title })}
             onOpenDiff={(path, pane) => useApp.getState().openPreviewTab(task.id, { type: "diff", path, scope: pane, title: `Δ ${path.split("/").pop()}` })}
             onDoubleClickDiff={(path) => {
               const currentTabs = useApp.getState().tabs[task.id] || [];
@@ -675,7 +709,10 @@ export function RightPanel() {
                   zIndex: footTab === "term" ? 1 : 0,
                 }}
               >
-                <AuxTerminal taskId={task.id} taskPath={task.path} active={footTab === "term"} />
+                {/* Synthetic tab id: the footer shell has no entry in
+                    `bottomTabs`, but the Activity monitor still needs to
+                    tell it apart from the split shells. */}
+                <AuxTerminal taskId={task.id} tabId="right-footer" taskPath={task.path} active={footTab === "term"} />
               </div>
             )}
           </div>
@@ -726,6 +763,8 @@ function RunToolbar({ task, project, yamlPreviewUrl = "", compact }: {
   compact?: boolean;
 }) {
   const url = expandPreviewUrl(project, task, yamlPreviewUrl);
+  // GH #245: honour the configured browser (project override, else app-wide).
+  const previewBrowser = useApp(s => s.previewBrowser);
   const btnCls = compact ? "h-6 w-6 p-0" : "h-6 gap-1 px-1.5 text-[12px]";
   // In compact (icon-only) mode the inline label is gone, so the action name
   // moves to an INSTANT app tooltip (Tip, delay 0) instead of a slow native
@@ -737,7 +776,7 @@ function RunToolbar({ task, project, yamlPreviewUrl = "", compact }: {
       {url && tipWrap(`Open ${url}`,
         <Button
           size="sm" variant="secondary"
-          onClick={() => openPath(url).catch(err => console.error("open failed:", err))}
+          onClick={() => { void openWebUrlForProject(url, previewBrowser, project); }}
           title={!compact ? url : undefined}
           className={btnCls}
         >
@@ -791,7 +830,7 @@ function stripAnsi(s: string): string {
     .replace(/[PX^_][\s\S]*?\\/g, "")
     // Stray control bytes (NUL, BEL, BS, SO, SI, etc.) except
     // tab / LF / CR which the renderer wants to preserve.
-    .replace(/[ --]/g, "");
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
 }
 
 /** Stream pane: shows live captured stdout/stderr with auto-scroll-to-bottom

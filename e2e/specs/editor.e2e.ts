@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { archiveTask, cliRpc, ensureActiveTask, openTask, requireTermicApi, snap, waitForAgentReady, waitForAppShell } from "../helpers";
+import { archiveTask, cliRpc, ensureActiveTask, openTask, requireTermicApi, snap, waitForAgentReady, waitForAppShell, waitVisible } from "../helpers";
 
 declare global {
   interface Window {
@@ -15,7 +15,7 @@ declare global {
 // PREVIEW tab (italic, recyclable) with the file's real contents; double-click
 // PERSISTS it. Saving has its own spec (editor-save.e2e.ts).
 describe("editor open", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
   });
@@ -78,7 +78,7 @@ describe("editor open", () => {
 
   // NOTE: CodeMirror's OWN ⌘F search panel is keyboard-shortcut-only and does
   // not route reliably across window-focus states in this harness (see the
-  // environment-limited list in docs/plans/e2e-coverage.md), so it stays a
+  // environment-limited list in docs/e2e-coverage.md), so it stays a
   // manual check. The markdown preview's ⌘F is a plain window listener and IS
   // covered — see "find in markdown preview" at the bottom of this file.
 
@@ -130,7 +130,7 @@ describe("editor open", () => {
 // Cmd+S -> taskFileWrite path (termic never auto-saves). Restores README on
 // teardown so the fixture repo stays clean for the git specs.
 describe("editor save", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   let original: string | undefined;
 
   after(async () => {
@@ -230,7 +230,7 @@ describe("editor save", () => {
 const fixture = process.env.E2E_FIXTURE ?? path.join(process.cwd(), ".e2e", "fixture-repo");
 
 describe("code editor", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
     try {
@@ -329,6 +329,200 @@ describe("code editor", () => {
     await snap("code-editor-elixir.png");
   });
 
+  const tokenSpans = () =>
+    browser.execute(
+      () => document.querySelectorAll(".cm-content .cm-line span[class]").length,
+    );
+
+  // Open a file WITHOUT waiting for highlight tokens — for the plain-text
+  // cases, where "no tokens" is the thing being asserted.
+  const openPlain = async (name: string, source: string, marker: string) => {
+    writeFileSync(path.join(fixture, name), source);
+    await browser.execute(
+      (id) => window.__termic!.useApp.getState().bumpFsRevision(id),
+      taskId,
+    );
+    const sel = `[data-path="${name}"]`;
+    await browser.waitUntil(
+      () => browser.execute((s) => !!document.querySelector(s), sel),
+      { timeout: 10_000, timeoutMsg: `${name} never appeared in the tree` },
+    );
+    await browser.execute((s) => {
+      (document.querySelector(s) as HTMLElement).click();
+    }, sel);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (m) => (document.querySelector(".cm-content")?.textContent ?? "").includes(m),
+          marker,
+        ),
+      { timeout: 10_000, timeoutMsg: `CodeMirror never loaded ${name}` },
+    );
+  };
+
+  // The breadcrumb's language button, which is also what the palette's
+  // "Set syntax…" row opens.
+  const syntaxLabel = () =>
+    browser.execute(
+      (id) =>
+        (
+          document.querySelector(
+            `[data-task-id="${id}"] [data-testid="syntax-button"]`,
+          ) as HTMLElement | null
+        )?.textContent ?? null,
+      taskId,
+    );
+
+  // Issue #244. `@codemirror/legacy-modes` has no Makefile grammar, so this
+  // one is hand-written (src/lib/makeMode.ts) and the tab-means-recipe rule
+  // is the part worth guarding in the real editor.
+  it("highlights a Makefile, which has no upstream grammar at all", async () => {
+    await openHighlighted(
+      "Makefile",
+      "CARGO := cargo\n\n.PHONY: build\nbuild: ## comment\n\t@$(CARGO) build --release\n",
+      "CARGO",
+    );
+
+    const styled = await browser.execute(() =>
+      [...document.querySelectorAll(".cm-content .cm-line span[class]")].map(
+        (s) => s.textContent ?? "",
+      ),
+    );
+    // Two tokens the mode has to get right, and that every editor theme
+    // colours: the special target, and the comment after the recipe's `:`.
+    expect(styled).toContain(".PHONY");
+    expect(styled.some((t) => t.includes("## comment"))).toBe(true);
+    expect(await syntaxLabel()).toBe("Makefile");
+
+    await snap("code-editor-makefile.png");
+  });
+
+  // The whole point of sourcing languages from @codemirror/language-data:
+  // there is no PHP entry anywhere in termic, no import, no case in a switch.
+  // Highlighting it proves the registry lookup, the async grammar load and the
+  // compartment all reach CodeMirror on a language nobody here registered.
+  it("highlights a language termic never registered", async () => {
+    await openHighlighted(
+      "hello.php",
+      "<?php\nfunction greet(string $name): string {\n    return \"hi $name\";\n}\n",
+      "greet",
+    );
+
+    const styled = await browser.execute(() =>
+      [...document.querySelectorAll(".cm-content .cm-line span[class]")].map(
+        (s) => s.textContent ?? "",
+      ),
+    );
+    expect(styled).toContain("function");
+    expect(await syntaxLabel()).toBe("PHP");
+
+    await snap("code-editor-php.png");
+  });
+
+  // The two extensions this repo is mostly made of. They are the ones a
+  // regression would be noticed on first and the ones the suite never opened
+  // before the registry swap, which is how a broken .ts shipped once.
+  it("highlights TypeScript and JavaScript", async () => {
+    await openHighlighted(
+      "hello.ts",
+      "export const greet = (name: string): string => `hi ${name}`;\n",
+      "greet",
+    );
+    expect(await syntaxLabel()).toBe("TypeScript");
+
+    await openHighlighted(
+      "hello.js",
+      "export const greet = (name) => `hi ${name}`;\n",
+      "greet",
+    );
+    expect(await syntaxLabel()).toBe("JavaScript");
+
+    await openHighlighted(
+      "App.tsx",
+      "export const App = () => <div className=\"x\">hi</div>;\n",
+      "App",
+    );
+    // The registry splits JSX/TSX out of TypeScript. Same grammar, own name.
+    expect(await syntaxLabel()).toBe("TSX");
+  });
+
+  it("names the syntax it picked from the extension", async () => {
+    await openHighlighted("typed.py", "x = 1\n", "x = 1");
+    expect(await syntaxLabel()).toBe("Python");
+  });
+
+  it("guesses the syntax from the content when the name says nothing", async () => {
+    // No extension at all: only the content can say this is JSON, and the
+    // button must agree with what the buffer is actually highlighted as.
+    await openHighlighted(
+      "config-blob",
+      '{\n  "name": "termic",\n  "port": 1420\n}\n',
+      "termic",
+    );
+    expect(await syntaxLabel()).toBe("JSON");
+  });
+
+  it("overrides the guess when the user sets the syntax by hand", async () => {
+    // One `key: value` line is not enough for the sniffer to call it YAML
+    // (it wants at least two), and `.txt` claims nothing — so this starts
+    // life as plain text, with no grammar and therefore no token spans.
+    await openPlain("notes.txt", "server: 8080\n", "8080");
+    expect(await syntaxLabel()).toBe("Plain Text");
+    expect(await tokenSpans()).toBe(0);
+
+    await browser.execute((id) => {
+      (
+        document.querySelector(
+          `[data-task-id="${id}"] [data-testid="syntax-button"]`,
+        ) as HTMLElement
+      ).click();
+    }, taskId);
+
+    // Existence, not `waitForDisplayed`: the panel fades in via a CSS
+    // animation, and animations are frozen while the window is occluded — a
+    // visibility wait then times out on a palette that is perfectly usable.
+    // The row's key is CodeMirror's registry NAME, which is also the label.
+    const rowSel = '[data-testid="syntax-palette"] [data-lang="YAML"]';
+    await browser.waitUntil(
+      () => browser.execute((sel) => !!document.querySelector(sel), rowSel),
+      { timeout: 8_000, timeoutMsg: "the syntax palette never listed YAML" },
+    );
+    await browser.execute((sel) => {
+      (document.querySelector(sel) as HTMLElement).click();
+    }, rowSel);
+
+    await browser.waitUntil(async () => (await syntaxLabel()) === "YAML", {
+      timeout: 5000,
+      timeoutMsg: "the syntax button never switched to YAML",
+    });
+    // The pick must actually reach CodeMirror, not just the label: the
+    // language compartment is reconfigured in place, so the buffer that had
+    // no token spans at all now has them.
+    await browser.waitUntil(async () => (await tokenSpans()) > 0, {
+      timeout: 5000,
+      timeoutMsg: "no syntax tokens after setting the syntax to YAML",
+    });
+    // …and the content survived the switch (a view REBUILD would also
+    // produce tokens, while quietly discarding undo history and the cursor).
+    const text = await browser.execute(
+      () => document.querySelector(".cm-content")?.textContent ?? "",
+    );
+    expect(text).toContain("server: 8080");
+
+    // Picking closes the palette. Radix defers the unmount until the closing
+    // animation ends, and animations are frozen on an occluded window, so the
+    // node itself can linger — `data-state` is the signal, not presence.
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const el = document.querySelector('[data-testid="syntax-palette"]');
+          return !el || el.getAttribute("data-state") === "closed";
+        }),
+      { timeout: 8_000, timeoutMsg: "the syntax palette stayed open after a pick" },
+    );
+    await snap("code-editor-set-syntax.png");
+  });
+
   // Issue #161. The gutter is `position: sticky` (z-index 200) inside the
   // scroller, so a long line slides UNDER the line numbers as you scroll right,
   // and a see-through gutter shows it. Nothing in the DOM says "overlap", so the
@@ -405,7 +599,7 @@ describe("code editor", () => {
 // case that actually pins the split is the last one: editing the dark pref
 // while the app is light must change nothing on screen.
 describe("editor theme per app mode", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   let originals: { mode: string; dark: string; light: string } | undefined;
 
   after(async () => {
@@ -626,7 +820,7 @@ function twoPagePdf(pad = ""): string {
 //      still does.
 // The page number itself is a manual check.
 describe("pdf preview", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   const pdfName = "e2e-report.pdf";
   const pdfPath = path.join(fixture, pdfName);
 
@@ -904,7 +1098,7 @@ describe("pdf preview", () => {
 // row opens as an ordinary edit tab; a folder with no README shows the list
 // alone with no error.
 describe("directory links", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   after(async () => {
     if (taskId) await archiveTask(taskId);
     try {
@@ -1094,7 +1288,7 @@ describe("directory links", () => {
     const survivor = await browser.execute(
       (id, lid) => (window.__termic!.useApp.getState().tabs[id] ?? []).find((t: any) => t.id === lid),
       taskId,
-      listing.id,
+      listing.id as string,
     );
     expect(survivor).toMatchObject({ type: "dir", path: "e2e-docs", preview: false });
   });
@@ -1161,7 +1355,7 @@ describe("directory links", () => {
     const survivor = await browser.execute(
       (id, lid) => (window.__termic!.useApp.getState().tabs[id] ?? []).find((t: any) => t.id === lid),
       taskId,
-      listing.id,
+      listing.id as string,
     );
     expect(survivor).toMatchObject({ type: "dir", path: "e2e-docs", preview: false });
 
@@ -1533,7 +1727,7 @@ const pressCmdF = () =>
 /** Type one character at a time, the way a person does: React sees N input
  *  events, and each re-runs the search. A single value assignment would skip
  *  every intermediate state. */
-const typeFind = async (q: string) => {
+const typeFind = async (q: string, taskId?: string) => {
   for (let i = 1; i <= q.length; i++) {
     await browser.execute((v, inputSel) => {
       const shown = (el: Element) => el.getBoundingClientRect().width > 0;
@@ -1544,6 +1738,21 @@ const typeFind = async (q: string) => {
       el.dispatchEvent(new Event("input", { bubbles: true }));
     }, q.slice(0, i), FIND_INPUT);
   }
+  // Every prefix runs its own search and paints its own marks, so a wait that
+  // only COUNTS marks can be satisfied mid-word: "need" matches the same three
+  // places "needle" does, and the reading then belongs to the prefix (this is
+  // how the split-view ⌘F case failed on CI, asserting ["needle" x3] against
+  // three "need"s). Hand control back only once no mark is still showing a
+  // prefix. Zero marks passes on purpose: a query that stops matching is a
+  // real case, and the callers that expect marks wait for their count next.
+  // Whitespace-insensitive on purpose: markdown-it keeps the source newline of
+  // a hard-wrapped paragraph inside the text node, so a mark for a phrase the
+  // reader sees on one line reads "wrapped phrase\nspans".
+  const norm = (t: string) => t.replace(/\s+/g, " ").toLowerCase();
+  await browser.waitUntil(
+    async () => (await readFind(taskId)).texts.every(t => norm(t) === norm(q)),
+    { timeout: 8_000, timeoutMsg: `find marks never settled on the whole query "${q}"` },
+  );
 };
 
 const pressInFind = (key: string, shift = false) =>
@@ -1563,7 +1772,7 @@ const findBarCount = () =>
   }, FIND_INPUT);
 
 describe("find in markdown preview", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   const DOC = "find-doc.md";
 
   before(async () => {
@@ -1748,8 +1957,8 @@ describe("find in markdown preview", () => {
 // keystroke — no shared registry left to fight over.
 
 describe("⌘F ownership across previews", () => {
-  let taskA: string | undefined;
-  let taskB: string | undefined;
+  let taskA!: string;
+  let taskB!: string;
   let tabA = "";
   const DOC = "own-a.md";
   const DOC_B = "own-b.md";
@@ -1837,7 +2046,7 @@ describe("⌘F ownership across previews", () => {
 
     // Terminal into its own pane, and focus that pane. The preview is still on
     // screen in main, but the keyboard now belongs to the terminal.
-    const termId = await browser.execute((id) => {
+    const termId: string = await browser.execute((id) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const t = window.__termic!.useApp.getState().tabs[id].find((x: any) => x.type === "terminal");
       return t.id as string;
@@ -2078,7 +2287,7 @@ describe("⌘F ownership across previews", () => {
       await pressCmdF();
       await browser.waitUntil(async () => (await bars()).visible === 1,
         { timeout: 8_000, timeoutMsg: "the preview never claimed ⌘F after the click" });
-      await typeFind("needle");
+      await typeFind("needle", taskA);
       const p = await waitFind((x) => x.texts.length === 3, "split preview never marked", taskA);
       expect(p.texts).toEqual(["needle", "needle", "needle"]);
       expect(p.parents).toEqual(["P", "P", "P"]);
@@ -2096,7 +2305,7 @@ describe("⌘F ownership across previews", () => {
 // both entry points (selection tooltip, ⇧⌘L), the queue accumulating across
 // lines, and the batch actually landing in the agent's PTY.
 describe("comment on an editor selection for the agent", () => {
-  let taskId: string | undefined;
+  let taskId!: string;
   let editTabId: string | undefined;
   let agentTabId: string | undefined;
   const TASK = "e2e-send-ref";
@@ -2430,5 +2639,663 @@ describe("comment on an editor selection for the agent", () => {
     expect(await browser.execute(() =>
       !!document.querySelector('[data-testid="review-comments-pill"]'))).toBe(false);
     await snap("editor-selection-comments.png");
+  });
+});
+
+// Cursor-line inline git blame (VS Code's `git.blame.editorDecoration`).
+//
+// The three regressions worth catching are all "shows the WRONG thing" rather
+// than "crashes": annotating every line (a performance regression, see
+// inlineBlameExt.ts on height-relevant decorations), keeping an author on a
+// line the user just edited, and the pref/palette toggle not reaching the live
+// view. The unit spec (src/components/task/inlineBlameExt.test.ts) covers the
+// line-mapping algebra against a fake payload; this one runs REAL `git blame`.
+//
+// It blames the seeded README, which is committed as "init fixture" by `e2e`,
+// and it MUTATES NOTHING. Committing a nicer multi-line fixture was the obvious
+// alternative and is a trap twice over: the spec then fails its own second run
+// with "nothing to commit", and one extra commit in the shared fixture history
+// is enough to break `git.e2e.ts`'s first-parent case (verified, not guessed).
+// The README is a single line, so the cursor is armed by COLUMN rather than by
+// moving to another line, which is the same code path.
+// Indentation is read off the file, not assumed: the editor hard-coded two
+// spaces for everything, which is wrong for most of what an agent writes.
+describe("indentation, detected per file", () => {
+  let taskId!: string;
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("e2e-indent");
+  });
+
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  /** Open a file we wrote into the task, and read back what CodeMirror
+   *  decided one level of indentation is. */
+  const indentOf = async (name: string, body: string) => {
+    const root = await browser.execute(
+      (id) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === id)?.path as string,
+      taskId,
+    ) as string;
+    writeFileSync(path.join(root, name), body);
+    await browser.execute((id, p) => {
+      window.__termic!.useApp.getState().openPreviewTab(id, { type: "edit", path: p, title: p });
+    }, taskId, name);
+    await waitVisible(`[data-task-id="${taskId}"] .cm-editor`);
+    return await browser.waitUntil(async () => {
+      const got = await browser.execute((id) => {
+        const dom = document.querySelector(`[data-task-id="${id}"] .cm-editor`) as
+          (HTMLElement & { __cmView?: any }) | null;
+        const view = dom?.__cmView;
+        if (!view) return null;
+        // The two halves CodeMirror keeps separately: what Tab inserts, and
+        // how wide an existing tab renders.
+        return { unit: view.state.facet(window.__termic!.cm.indentUnit), tab: view.state.tabSize };
+      }, taskId) as { unit: string; tab: number } | null;
+      return got && got.unit !== undefined ? got : false;
+    }, { timeout: 10_000, timeoutMsg: `${name} never reported its indentation` }) as
+      { unit: string; tab: number };
+  };
+
+  it("reads four spaces off a Python file", async () => {
+    const py = "def sync(x: int) -> None:\n    if x:\n        print(x)\n    return None\n";
+    const got = await indentOf("indent_demo.py", py);
+    expect(got.unit).toBe("    ");
+    expect(got.tab).toBe(4);
+  });
+
+  it("reads tabs off a Go file, where they are the format", async () => {
+    const go = "package main\n\nfunc main() {\n\tif true {\n\t\tprintln(1)\n\t}\n}\n";
+    const got = await indentOf("indent_demo.go", go);
+    expect(got.unit).toBe("\t");
+  });
+
+  it("keeps two spaces for a file that uses them", async () => {
+    const ts = "export function f(x: number) {\n  if (x) {\n    return x;\n  }\n  return 0;\n}\n";
+    const got = await indentOf("indent_demo.ts", ts);
+    expect(got.unit).toBe("  ");
+    expect(got.tab).toBe(2);
+  });
+});
+
+describe("inline git blame", () => {
+  let taskId!: string;
+
+  let gitViewBefore: string | null | undefined;
+
+  // The fixture README: "# e2e fixture", committed by scripts/e2e-seed.mjs.
+  const AUTHOR = "e2e";
+  const SUBJECT = "init fixture";
+
+  after(async () => {
+    // The window is REUSED across spec files, and RightPanel's tab is component
+    // state, so "Show in History" leaves the panel parked on Git for every
+    // later spec. files.e2e.ts waits on file-tree rows and hung for 15s×12 on
+    // a panel that was showing the commit graph. Put the tab back by clicking
+    // it, the same way a user would.
+    await browser.execute(() => {
+      const tab = Array.from(document.querySelectorAll("button"))
+        .find(b => b.textContent?.trim() === "All files");
+      (tab as HTMLElement | undefined)?.click();
+    });
+    // "Show in History" switches the Git panel's sub-view and that choice is
+    // PERSISTED (`gitPanelView` in localStorage), which outlives both the app
+    // instance and the .e2e fixture. Put it back, or every later spec file runs
+    // with the Git tab parked on the Graph.
+    await browser.execute((v) => {
+      if (v === null) localStorage.removeItem("gitPanelView");
+      else localStorage.setItem("gitPanelView", v);
+    }, gitViewBefore ?? null);
+    // Back to the app DEFAULT (off), not to whatever this machine happened to
+    // have. Prefs live in localStorage, which outlives the .e2e fixture and is
+    // shared with every later spec file, so "restore what I found" quietly
+    // leaves blame enabled for the rest of the suite on any machine where it was
+    // already on. Later specs then run with an extra `git blame` per opened
+    // file, which is not the app they mean to test.
+    await browser.execute(() =>
+      window.__termic!.usePrefs.getState().setInlineBlame(false),
+    );
+    if (taskId) await archiveTask(taskId);
+  });
+
+  /** The blame annotations VISIBLE in the active task's editor.
+   *
+   *  Visibility is part of the assertion, not a detail: a .md tab defaults to
+   *  the markdown Preview, whose editor stays mounted behind it, and an earlier
+   *  version of this spec passed entirely against that hidden editor. A rect
+   *  check is what makes it about what the reader sees. */
+  const annotations = () =>
+    browser.execute((id) =>
+      Array.from(
+        document.querySelectorAll(
+          `[data-task-id="${id}"] .cm-editor .cm-inline-blame`,
+        ),
+      )
+        .filter((el) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        })
+        .map((el) => el.textContent ?? ""),
+      taskId,
+    );
+
+  /** Put the cursor at a document offset through CodeMirror's own API (the
+   *  `__cmView` handle the e2e build exposes), for the same reason the save
+   *  spec does: synthetic key events don't route to a contenteditable
+   *  reliably in WKWebView. The annotation is still asserted from the DOM.
+   *
+   *  Offset, not line: blame is deliberately not fetched while the cursor is
+   *  still at position 0 (a file nobody has looked at), and the fixture README
+   *  has only one real line to be on. */
+  const cursorTo = (offset: number) =>
+    browser.execute((id, n) => {
+      const dom = document.querySelector(
+        `[data-task-id="${id}"] .cm-editor`,
+      ) as (HTMLElement & { __cmView?: any }) | null;
+      const view = dom?.__cmView;
+      if (!view) throw new Error("no CodeMirror view on the active task");
+      view.dispatch({ selection: { anchor: n } });
+    }, taskId, offset);
+
+  const waitForOneAnnotation = async (msg: string) => {
+    await browser.waitUntil(async () => (await annotations()).length === 1, {
+      timeout: 10_000,
+      timeoutMsg: msg,
+    });
+    return (await annotations())[0];
+  };
+
+  it("annotates the cursor's line with the commit that last touched it", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("e2e-blame");
+    await browser.execute(() =>
+      window.__termic!.usePrefs.getState().setInlineBlame(true),
+    );
+    gitViewBefore = await browser.execute(() => localStorage.getItem("gitPanelView"));
+
+    const sel = '[data-path="README.md"]';
+    await browser.waitUntil(
+      () => browser.execute((s) => !!document.querySelector(s), sel),
+      { timeout: 15_000, timeoutMsg: "README row never appeared" },
+    );
+    await browser.execute((s) => {
+      (document.querySelector(s) as HTMLElement).click();
+    }, sel);
+    // Every visited task stays mounted, so both of these are scoped to THIS
+    // task: an unscoped `.cm-content` can match a hidden earlier task's editor,
+    // which is 0x0 and never becomes visible.
+    await browser.waitUntil(
+      () =>
+        browser.execute((id) =>
+          (
+            document.querySelector(`[data-task-id="${id}"] .cm-content`)
+              ?.textContent ?? ""
+          ).includes("e2e fixture"),
+          taskId,
+        ),
+      { timeout: 10_000, timeoutMsg: "CodeMirror never loaded README" },
+    );
+
+    // A .md tab can come up in the markdown Preview (the pref, or whatever an
+    // earlier case left behind), which leaves the editor mounted but hidden.
+    // Blame annotates the editor, so put the editor on screen.
+    await browser.execute((id) => {
+      const scope = document.querySelector(`[data-task-id="${id}"]`) ?? document;
+      const btn = Array.from(scope.querySelectorAll("button")).find(
+        (b) => b.textContent?.trim() === "Editor",
+      );
+      if (!btn) throw new Error("Editor toggle not found");
+      (btn as HTMLElement).click();
+    }, taskId);
+    await browser.waitUntil(
+      () =>
+        browser.execute((id) => {
+          const el = document.querySelector(
+            `[data-task-id="${id}"] .cm-content`,
+          ) as HTMLElement | null;
+          return !!el && el.getBoundingClientRect().height > 0;
+        }, taskId),
+      { timeout: 8_000, timeoutMsg: "the source editor never became visible" },
+    );
+
+    // Nothing yet: blame is deliberately not fetched until the cursor leaves
+    // the start of the document, so opening a file never waits on git.
+    expect(await annotations()).toEqual([]);
+
+    await cursorTo(3);
+    const text = await waitForOneAnnotation(
+      "no blame annotation on the cursor line",
+    );
+    // Real git output: the fixture's first commit, by its seeded author.
+    expect(text).toContain(AUTHOR);
+    expect(text).toContain(SUBJECT);
+    await snap("inline-blame.png");
+  });
+
+  it("annotates one line at a time", async () => {
+    await cursorTo(5);
+    await browser.waitUntil(
+      async () => {
+        const a = await annotations();
+        return a.length === 1 && a[0].includes(SUBJECT);
+      },
+      { timeout: 8_000, timeoutMsg: "annotation did not follow the cursor" },
+    );
+    // Exactly one: a blame column on every line is the shape this feature
+    // deliberately does not have. The phantom line a trailing newline creates
+    // must not carry one either (it belongs to no commit and never will).
+    expect((await annotations()).length).toBe(1);
+  });
+
+  it("leaves a blank line alone", async () => {
+    // The widget is anchored at `line.to`, which on an empty line is column 0:
+    // it lands where the code would start and reads as broken indentation,
+    // sharing its spot with the caret. There is also nothing to attribute.
+    await cursorTo(3);
+    await waitForOneAnnotation("no annotation to start from");
+    const blankAt = await browser.execute((id) => {
+      const dom = document.querySelector(`[data-task-id="${id}"] .cm-editor`) as
+        (HTMLElement & { __cmView?: any }) | null;
+      const view = dom!.__cmView;
+      const end = view.state.doc.length;
+      view.dispatch({ changes: { from: end, insert: "\n\n" }, selection: { anchor: end + 1 } });
+      return view.state.selection.main.head as number;
+    }, taskId) as number;
+    expect(blankAt).toBeGreaterThan(0);
+    await browser.waitUntil(async () => (await annotations()).length === 0, {
+      timeout: 8_000,
+      timeoutMsg: "a blank line was annotated",
+    });
+  });
+
+  it("gets out of the way while typing, and returns at the end of the line", async () => {
+    // Two things this pins. It HIDES on a change, because an annotation that
+    // shuffles along beside the caret on every keystroke is what people mean
+    // by intrusive. And when it returns it is anchored past the text: a plugin
+    // owns its decorations, so nothing maps them through an edit for us, and
+    // unmapped the widget kept its pre-edit offset and rendered inside the
+    // word being typed ("StorePag" + the annotation + "e").
+    await cursorTo(3);
+    await waitForOneAnnotation("no annotation to start from");
+
+    // Type somewhere ELSE, so the annotated line stays committed and keeps its
+    // author. Editing the annotated line is the case below.
+    await browser.execute((id) => {
+      const dom = document.querySelector(`[data-task-id="${id}"] .cm-editor`) as
+        (HTMLElement & { __cmView?: any }) | null;
+      const view = dom!.__cmView;
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "trailing" } });
+    }, taskId);
+    await browser.waitUntil(async () => (await annotations()).length === 0, {
+      timeout: 4_000,
+      timeoutMsg: "the annotation stayed up while the document was changing",
+    });
+    await browser.waitUntil(async () => (await annotations()).length === 1, {
+      timeout: 8_000,
+      timeoutMsg: "the annotation never came back after typing stopped",
+    });
+
+    // Measured in the DOM: "renders in the wrong place" is exactly the class
+    // of bug a state assertion cannot see.
+    const placed = await browser.execute((id) => {
+      const editor = document.querySelector(`[data-task-id="${id}"] .cm-editor`) as HTMLElement;
+      const widget = editor.querySelector(".cm-inline-blame") as HTMLElement | null;
+      if (!widget) return { ok: false, why: "no annotation" };
+      const line = widget.closest(".cm-line") as HTMLElement | null;
+      if (!line) return { ok: false, why: "annotation outside a line" };
+      const wLeft = widget.getBoundingClientRect().left;
+      const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+      let worst = 0;
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (widget.contains(n)) continue;
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        worst = Math.max(worst, range.getBoundingClientRect().right);
+      }
+      return { ok: worst <= wLeft + 1, why: `text ends at ${worst}, widget starts at ${wLeft}` };
+    }, taskId) as { ok: boolean; why: string };
+    if (!placed.ok) throw new Error(`the annotation is not at the end of the line: ${placed.why}`);
+  });
+
+  it("stops attributing a line once it is edited, and says nothing instead", async () => {
+    // Two rules at once. An edited line must never keep its old author, which
+    // would be a confident lie. And what replaces it is NOTHING: "Not
+    // committed yet" beside your own caret, on a line you just wrote, is the
+    // noise that made this feature feel intrusive.
+    await cursorTo(3);
+    await waitForOneAnnotation("no annotation before the edit");
+
+    await browser.execute((id) => {
+      const dom = document.querySelector(
+        `[data-task-id="${id}"] .cm-editor`,
+      ) as (HTMLElement & { __cmView?: any }) | null;
+      dom!.__cmView.dispatch({ changes: { from: 2, insert: "edited " } });
+    }, taskId);
+
+    await browser.waitUntil(async () => (await annotations()).length === 0, {
+      timeout: 8_000,
+      timeoutMsg: "an edited line kept an annotation",
+    });
+  });
+
+  it("disappears when the pref is off and comes back when it is on", async () => {
+    await browser.execute(() =>
+      window.__termic!.usePrefs.getState().setInlineBlame(false),
+    );
+    await browser.waitUntil(async () => (await annotations()).length === 0, {
+      timeout: 8_000,
+      timeoutMsg: "annotation survived turning the pref off",
+    });
+
+    // Back on with the cursor already parked on a line: the annotation must
+    // appear without waiting for the next keystroke.
+    await browser.execute(() =>
+      window.__termic!.usePrefs.getState().setInlineBlame(true),
+    );
+    await waitForOneAnnotation(
+      "annotation did not return when the pref went back on",
+    );
+  });
+
+  it("opens a hover card with the commit, and its two actions work", async () => {
+    await cursorTo(3);
+    await waitForOneAnnotation("no annotation to hover");
+
+    // Rest the pointer on the annotation. WebDriver's own hover is unreliable
+    // over a contenteditable, so the pointer events go in directly; the DELAY
+    // is the extension's own timer, which is what this waits out.
+    await browser.execute((id) => {
+      const el = document.querySelector(
+        `[data-task-id="${id}"] .cm-editor .cm-inline-blame`,
+      ) as HTMLElement;
+      el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));
+    }, taskId);
+
+    const cardText = () =>
+      browser.execute(() => {
+        const el = document.querySelector(".cm-blame-card") as HTMLElement | null;
+        return el ? el.innerText : "";
+      });
+    await browser.waitUntil(async () => (await cardText()).includes(SUBJECT), {
+      timeout: 8_000,
+      timeoutMsg: "the hover card never appeared with the commit",
+    });
+    const text = await cardText();
+    expect(text).toContain(AUTHOR);
+    expect(text).toContain("ago");
+    await snap("inline-blame-card.png");
+
+    // "Show in History" must reach the right panel: Git tab, Graph view, that
+    // commit selected. This is the cross-panel wiring, so assert the outcome in
+    // the panel rather than the store request that asks for it.
+    await browser.execute(() => {
+      const btn = Array.from(
+        document.querySelectorAll(".cm-blame-card button"),
+      ).find((b) => (b as HTMLElement).innerText.includes("Show in History"));
+      (btn as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    // The Graph is on screen AND the BLAMED commit is the expanded row. Scoped
+    // to the row that actually carries the expanded detail, not to the first row
+    // in the list: the two are only the same commit by luck, and asserting on
+    // row one would pass while the reveal half did nothing.
+    await browser.waitUntil(
+      () =>
+        browser.execute((subject) => {
+          const panel = document.querySelector('[data-testid="history-panel"]');
+          if (!panel) return false;
+          const expanded = Array.from(
+            panel.querySelectorAll('[data-testid="history-commit"][data-sha]'),
+          ).filter(r => r.querySelector('[data-testid="history-commit-detail"]'));
+          if (expanded.length !== 1) return false;
+          return (expanded[0] as HTMLElement).innerText.includes(subject);
+        }, SUBJECT),
+      { timeout: 10_000, timeoutMsg: "Show in History did not expand the blamed commit in the Graph" },
+    );
+
+    // "Open diff" opens the commit-scoped diff tab for this file.
+    await cursorTo(3);
+    await waitForOneAnnotation("annotation gone after the History jump");
+    await browser.execute((id) => {
+      const el = document.querySelector(
+        `[data-task-id="${id}"] .cm-editor .cm-inline-blame`,
+      ) as HTMLElement;
+      el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));
+    }, taskId);
+    await browser.waitUntil(async () => (await cardText()).includes(SUBJECT), {
+      timeout: 8_000, timeoutMsg: "the card did not reopen",
+    });
+    await browser.execute(() => {
+      const btn = Array.from(
+        document.querySelectorAll(".cm-blame-card button"),
+      ).find((b) => (b as HTMLElement).innerText.includes("Open diff"));
+      (btn as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    // A real tab, not the preview slot: the README tab the annotation was
+    // hovered in has to survive, or the button closes the file to show its
+    // history.
+    await browser.waitUntil(
+      async () =>
+        !!(await browser.execute(
+          (id) =>
+            (window.__termic!.useApp.getState().tabs[id] ?? []).some(
+              (t: any) =>
+                t.type === "diff" && String(t.scope ?? "").startsWith("commit:") && !t.preview,
+            ),
+          taskId,
+        )),
+      { timeout: 10_000, timeoutMsg: "Open diff did not open a commit-scoped diff tab" },
+    );
+    // Open diff must not recycle the preview tab and close the file being read.
+    const readmeStillOpen = await browser.execute(
+      (id) =>
+        (window.__termic!.useApp.getState().tabs[id] ?? []).some(
+          (t: any) => t.type === "edit" && t.path === "README.md",
+        ),
+      taskId,
+    );
+    expect(readmeStillOpen).toBe(true);
+  });
+
+  it("does not react to a click on the annotation", async () => {
+    const before = await browser.execute(
+      (id) => (window.__termic!.useApp.getState().tabs[id] ?? []).length,
+      taskId,
+    );
+    await browser.execute((id) => {
+      const el = document.querySelector(
+        `[data-task-id="${id}"] .cm-editor .cm-inline-blame`,
+      ) as HTMLElement | null;
+      el?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      el?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    }, taskId);
+    const after = await browser.execute(
+      (id) => (window.__termic!.useApp.getState().tabs[id] ?? []).length,
+      taskId,
+    );
+    expect(after).toBe(before);
+  });
+
+  it("toggles from the command palette", async () => {
+    const before = await browser.execute(
+      () => window.__termic!.usePrefs.getState().inlineBlame,
+    );
+    await browser.execute(() =>
+      window.__termic!.useUI.getState().openCommandPalette(),
+    );
+    const rowSel = '[data-cmd-id="toggle-inline-blame"]';
+    await browser.waitUntil(
+      () => browser.execute((s) => !!document.querySelector(s), rowSel),
+      { timeout: 8_000, timeoutMsg: "the palette never offered the blame toggle" },
+    );
+    await browser.execute((s) => {
+      (document.querySelector(s) as HTMLElement).click();
+    }, rowSel);
+
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => window.__termic!.usePrefs.getState().inlineBlame,
+        )) !== before,
+      { timeout: 8_000, timeoutMsg: "the palette command did not flip the pref" },
+    );
+    // Drop the Recent entry this click just recorded: recents live in
+    // localStorage, which is shared with every other spec file, and app.e2e.ts
+    // asserts on that list. The pref itself is reset in `after`.
+    await browser.execute(() => {
+      const raw = localStorage.getItem("commandPaletteRecent");
+      if (!raw) return;
+      try {
+        const kept = (JSON.parse(raw) as { id: string }[]).filter(
+          (r) => r.id !== "toggle-inline-blame",
+        );
+        localStorage.setItem("commandPaletteRecent", JSON.stringify(kept));
+      } catch {
+        localStorage.removeItem("commandPaletteRecent");
+      }
+    });
+  });
+});
+
+// GH #247: an SVG used to open as a read-only picture, so changing one meant
+// opening it somewhere else and losing the preview. It now gets the same
+// source / preview / split shell markdown has (SourcePreviewShell), with the
+// preview fed by the editor's LIVE buffer rather than the file on disk.
+describe("svg source/preview toggle", () => {
+  let taskId!: string;
+  let tabId!: string;
+  const SVG = "e2e-icon.svg";
+  // Deliberately carries a `#hex` fill and a non-Latin1 label: both are
+  // ordinary in an SVG and both break a naive data URL (see svgDataUrl).
+  const SVG_SRC =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    + '<rect width="32" height="32" fill="#2f81f7"/><text y="20">café</text></svg>';
+
+  /** The shell's current mode, read off the visible pane of THIS task. Every
+   *  visited task stays mounted, so an unscoped query can match a hidden copy. */
+  const mode = () => browser.execute((id) => {
+    const root = document.querySelector(`[data-task-id="${id}"]`);
+    const el = Array.from(root?.querySelectorAll("[data-testid='source-preview-shell']") ?? [])
+      .find((n) => n.getBoundingClientRect().width > 0);
+    return el?.getAttribute("data-view") ?? null;
+  }, taskId);
+
+  /** `src` of the rendered picture, or null when it isn't on screen. */
+  const previewSrc = () => browser.execute((id) => {
+    const root = document.querySelector(`[data-task-id="${id}"]`);
+    const img = Array.from(root?.querySelectorAll("[data-testid='svg-preview']") ?? [])
+      .find((n) => n.getBoundingClientRect().width > 0) as HTMLImageElement | undefined;
+    return img?.src ?? null;
+  }, taskId);
+
+  /** Is the CodeMirror source pane laid out? */
+  const editorShown = () => browser.execute((id) => {
+    const root = document.querySelector(`[data-task-id="${id}"]`);
+    return Array.from(root?.querySelectorAll(".cm-editor") ?? [])
+      .some((n) => n.getBoundingClientRect().width > 0);
+  }, taskId);
+
+  const clickMode = (m: string) => browser.execute((id, want) => {
+    const root = document.querySelector(`[data-task-id="${id}"]`);
+    const btn = Array.from(root?.querySelectorAll(`[data-view-btn="${want}"]`) ?? [])
+      .find((n) => n.getBoundingClientRect().width > 0) as HTMLElement | undefined;
+    btn?.click();
+  }, taskId, m);
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    writeFileSync(path.join(fixture, SVG), SVG_SRC);
+    taskId = await openTask("e2e-svg");
+    tabId = await browser.execute((id, p) => {
+      const app = window.__termic!.useApp.getState();
+      app.openPreviewTab(id, { type: "edit", path: p, title: p });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tab = app.tabs[id].find((t: any) => t.type === "edit" && t.path === p);
+      app.persistTab(id, tab.id);
+      return tab.id;
+    }, taskId, SVG);
+  });
+
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+    try {
+      execSync(`git -C "${fixture}" clean -fd`);
+    } catch {
+      /* nothing */
+    }
+  });
+
+  it("opens showing the rendered picture, not the source", async () => {
+    // The default stays "preview" so clicking an .svg in the file tree still
+    // shows the image, which is what it has always done.
+    await browser.waitUntil(async () => (await previewSrc())?.startsWith("data:image/svg+xml") === true,
+      { timeout: 15_000, timeoutMsg: "the svg preview never rendered" });
+    expect(await mode()).toBe("preview");
+    expect(await editorShown()).toBe(false);
+  });
+
+  it("switches to the editable source", async () => {
+    await clickMode("source");
+    await browser.waitUntil(async () => await editorShown(),
+      { timeout: 10_000, timeoutMsg: "the source pane never appeared" });
+    expect(await mode()).toBe("source");
+    // It is the real file, not a placeholder.
+    const text = await browser.execute((id) => {
+      const root = document.querySelector(`[data-task-id="${id}"]`);
+      const cm = Array.from(root?.querySelectorAll(".cm-content") ?? [])
+        .find((n) => n.getBoundingClientRect().width > 0) as HTMLElement | undefined;
+      return cm?.textContent ?? "";
+    }, taskId);
+    expect(text).toContain("viewBox");
+  });
+
+  it("shows both panes in split", async () => {
+    await clickMode("split");
+    await browser.waitUntil(
+      async () => await editorShown() && (await previewSrc()) !== null,
+      { timeout: 10_000, timeoutMsg: "split never showed both panes" },
+    );
+    expect(await mode()).toBe("split");
+  });
+
+  it("re-renders the picture from unsaved edits", async () => {
+    // The payoff of feeding the preview from the buffer instead of disk: this
+    // never touches taskFileWrite, so a disk-backed preview could not move.
+    const before = await previewSrc();
+    await browser.execute((id, t) => {
+      window.__termic!.useApp.getState().setActiveTabId(id, t);
+    }, taskId, tabId);
+    // Through CodeMirror's own view API, the same hook the save spec uses. A
+    // synthetic beforeinput does NOT produce a transaction here (see the
+    // "keyboard into CodeMirror" caveat in docs/e2e-coverage.md), and without
+    // a transaction there is no onContent and nothing to assert.
+    await browser.execute((id) => {
+      const root = document.querySelector(`[data-task-id="${id}"]`)!;
+      const el = Array.from(root.querySelectorAll(".cm-editor"))
+        .find((n) => n.getBoundingClientRect().width > 0) as unknown as { __cmView?: any };
+      const view = el?.__cmView;
+      if (!view) throw new Error("CodeMirror e2e hook missing (build with make e2e)");
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "<!-- edited -->" } });
+    }, taskId);
+    await browser.waitUntil(async () => {
+      const now = await previewSrc();
+      return !!now && now !== before && decodeURIComponent(now).includes("edited");
+    }, { timeout: 10_000, timeoutMsg: "the preview never picked up the unsaved edit" });
+    // Nothing was saved: the picture moved off the buffer alone.
+    expect(await browser.execute((id, p) => window.__termic!.ipc.taskFileRead(id, p), taskId, SVG))
+      .not.toContain("edited");
+  });
+
+  it("goes back to the picture, and remembers the last mode for the next svg", async () => {
+    await clickMode("preview");
+    await browser.waitUntil(async () => await mode() === "preview" && !(await editorShown()),
+      { timeout: 10_000, timeoutMsg: "never returned to the preview" });
+    // Toggling writes the global default too, so the next .svg opens the same
+    // way (same contract as markdownDefaultView).
+    expect(await browser.execute(() => localStorage.getItem("svgDefaultView"))).toBe("preview");
   });
 });
